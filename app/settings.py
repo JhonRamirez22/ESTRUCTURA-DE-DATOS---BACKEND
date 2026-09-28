@@ -77,3 +77,81 @@ class Settings(BaseSettings):
     ai_traffic_api_key: SecretStr | None = None
     ai_traffic_model: str | None = None
     ai_traffic_timeout_ms: int = 5_000
+    ai_allow_location_data_sharing: bool = False
+    ai_allow_route_location_sharing: bool = False
+    # Guarda cada medición de TomTom por tramo y hora (tabla traffic_observations). Apagado.
+    traffic_history_enabled: bool = False
+    customer_chat_api_url: str | None = "https://api.groq.com/openai/v1/chat/completions"
+    customer_chat_api_key: SecretStr | None = None
+    customer_chat_model: str | None = "openai/gpt-oss-20b"
+    customer_chat_timeout_ms: int = 5_000
+    notification_smtp_host: str | None = None
+    notification_smtp_port: int = 587
+    notification_smtp_username: str | None = None
+    notification_smtp_password: SecretStr | None = None
+    notification_from_email: str | None = None
+    notification_smtp_timeout_ms: int = Field(default=5_000, gt=0, le=60_000)
+    # El poller infinito solo se habilita en un proceso persistente, nunca por defecto.
+    # El alias /api heredado queda apagado: la API se publica solo bajo /api/v1.
+    legacy_api_alias_enabled: bool = False
+    # Peticiones por minuto y cuenta; frena inundaciones desde un cliente manipulado.
+    account_read_limit_per_minute: int = Field(default=300, ge=10, le=10_000)
+    account_write_limit_per_minute: int = Field(default=90, ge=5, le=10_000)
+    # Avisos al cliente por correo y SMS: apagados en el producto actual.
+    customer_notifications_enabled: bool = False
+    customer_notification_worker_enabled: bool = False
+    customer_notification_poll_seconds: int = Field(default=30, ge=5, le=3_600)
+    notification_sms_twilio_account_sid: str | None = None
+    notification_sms_twilio_auth_token: SecretStr | None = None
+    notification_sms_twilio_from_phone: str | None = None
+    notification_sms_timeout_ms: int = Field(default=5_000, gt=0, le=60_000)
+    next_public_map_default_lat: float = 1.2136
+    next_public_map_default_lng: float = -77.2811
+
+    @field_validator(
+        "next_public_map_default_lat",
+        "next_public_map_default_lng",
+        mode="before",
+    )
+    @classmethod
+    def use_map_default_when_coordinate_is_empty(
+        cls,
+        value: object,
+        info: ValidationInfo,
+    ) -> object:
+        if value != "":
+            return value
+        if info.field_name == "next_public_map_default_lat":
+            return 1.2136
+        return -77.2811
+
+    @property
+    def sqlalchemy_database_url(self) -> URL:
+        database_url = (
+            self.database_url.get_secret_value().strip() if self.database_url is not None else ""
+        )
+        if database_url:
+            url = make_url(database_url)
+        else:
+            required = {
+                "DATABASE_HOST": self.database_host,
+                "DATABASE_NAME": self.database_name,
+                "DATABASE_USERNAME": self.database_username,
+                "DATABASE_PASSWORD": (
+                    self.database_password.get_secret_value()
+                    if self.database_password is not None
+                    else None
+                ),
+            }
+            missing = [name for name, value in required.items() if not value]
+            if missing:
+                raise ValueError(
+                    "Configura DATABASE_URL o las variables separadas de conexión: "
+                    + ", ".join(missing)
+                )
+
+            url = URL.create(
+                drivername="postgresql+asyncpg",
+                username=self.database_username,
+                password=(
+                    self.database_password.get_secret_value()
