@@ -53,3 +53,57 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     notification_stop = asyncio.Event()
     notification_worker: asyncio.Task[None] | None = None
     _app.state.customer_notification_worker_task = None
+    settings = get_settings()
+    problems = settings.startup_problems()
+    if problems:
+        raise RuntimeError("Configuración inválida: " + " ".join(problems))
+    if (
+        settings.customer_notification_worker_enabled
+        and os.environ.get("VERCEL") != "1"
+        and any_customer_notification_delivery_configured(settings)
+    ):
+        notification_worker = asyncio.create_task(
+            run_customer_notification_worker(
+                get_session_factory(),
+                notification_stop,
+                poll_interval_seconds=settings.customer_notification_poll_seconds,
+            ),
+            name="customer-notification-outbox",
+        )
+        _app.state.customer_notification_worker_task = notification_worker
+    try:
+        yield
+    finally:
+        if notification_worker is not None:
+            notification_stop.set()
+            await notification_worker
+        _app.state.customer_notification_worker_task = None
+        await get_location_event_queue().wait_until_idle()
+        await close_routing_clients()
+        await close_traffic_service()
+        await dispose_engine()
+
+
+app = FastAPI(
+    title="Rutas Pasto API",
+    version="0.1.0",
+    openapi_url=None,
+    docs_url=None,
+    redoc_url=None,
+    lifespan=lifespan,
+)
+app.add_middleware(HttpSecurityMiddleware)
+for router in (
+    health_router, auth_router, addresses_router, notifications_router, customer_chat_router,
+    geocoding_router, analytics_router, couriers_router, orders_router,
+    assignments_router, routes_router, tracking_router, traffic_router, traffic_tiles_router,
+    optimizations_router, order_requests_router, intelligence_router,
+    audit_router, demo_router, history_router,
+):
+    app.include_router(router, prefix="/api/v1")
+    if get_settings().legacy_api_alias_enabled:
+        # Solo para pruebas o migraciones: mismas dependencias y permisos que /api/v1.
+        app.include_router(router, prefix="/api", include_in_schema=False)
+if not get_settings().legacy_api_alias_enabled:
+    # El health check del balanceador consulta /api/health: es lo único que queda sin versión.
+    app.include_router(health_router, prefix="/api", include_in_schema=False)
