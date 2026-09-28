@@ -31,3 +31,36 @@ async def get_analytics(
 ) -> JSONResponse:
     raw_courier_id = request.query_params.get("courierId")
     try:
+        courier_id = UUID(raw_courier_id) if raw_courier_id else None
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail="El identificador del repartidor no es válido.",
+        ) from error
+
+    try:
+        rows = await RouteRepository(session).list_metric_snapshots(courier_id)
+        records = [
+            RouteMetricRecord(
+                status=row.status.value,
+                baseline_duration_minutes=row.baseline_duration_minutes,
+                estimated_duration_minutes=row.estimated_duration_minutes,
+                baseline_distance_meters=row.baseline_distance_meters,
+                estimated_distance_meters=row.estimated_distance_meters,
+            )
+            for row in rows
+        ]
+        metrics = calculate_fleet_metrics(records)
+        payload = AnalyticsResponse(metrics=FleetMetricsResponse(**asdict(metrics)))
+        return JSONResponse(
+            content=payload.model_dump(mode="json", by_alias=True),
+            headers={"Cache-Control": "private, no-store, max-age=0"},
+        )
+    except SQLAlchemyError as error:
+        _LOGGER.error(
+            "No se pudieron calcular las métricas de rutas",
+            extra={"error_type": type(error).__name__},
+        )
+        return JSONResponse(
+            content={"error": "No se pudieron calcular las métricas de rutas."}, status_code=500
+        )
