@@ -23,3 +23,28 @@ async def health(session: Annotated[AsyncSession, Depends(get_session)]) -> Resp
     if _configured_secret(get_settings()) is None:
         # Sin AUTH_SECRET válido nadie puede iniciar sesión: el servicio no está sano.
         return Response(
+            content='{"status":"unavailable","checks":{"database":"unknown","auth":"missing"}}',
+            status_code=503,
+            media_type="application/json",
+            headers=_HEALTH_HEADERS,
+        )
+    try:
+        await session.execute(text("SELECT 1"))
+    except Exception as error:
+        # No se incluye el mensaje del driver porque puede revelar host o credenciales.
+        logger.warning(
+            "La comprobación de disponibilidad de PostgreSQL falló",
+            extra={"error_type": type(error).__name__},
+        )
+        return Response(
+            content='{"status":"unavailable","checks":{"database":"unavailable","auth":"ok"}}',
+            status_code=503,
+            media_type="application/json",
+            headers=_HEALTH_HEADERS,
+        )
+
+    return Response(
+        content='{"status":"ok","checks":{"database":"ok","auth":"ok"}}',
+        media_type="application/json",
+        headers=_HEALTH_HEADERS,
+    )
