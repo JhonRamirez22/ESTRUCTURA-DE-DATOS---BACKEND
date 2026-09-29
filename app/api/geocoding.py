@@ -31,3 +31,35 @@ async def search_address(
     geocoder: Annotated[AddressGeocoder | None, Depends(get_address_geocoder)],
     q: Annotated[str, Query(min_length=3, max_length=160)],
 ) -> JSONResponse:
+    secret = _configured_secret(get_settings())
+    if secret is None:
+        return _error("La búsqueda de direcciones no está configurada en el servidor.", 503)
+    retry_after = await _RATE_LIMITER.retry_after_shared(
+        session, f"address:{_claims['accountId']}", hmac_secret=secret,
+    )
+    if retry_after is not None:
+        return JSONResponse(
+            content={"error": "Demasiadas búsquedas; espera un momento y vuelve a intentar."},
+            status_code=429,
+            headers={**_NO_STORE, "Retry-After": str(retry_after)},
+        )
+    if geocoder is None:
+        return _error("La búsqueda de direcciones no está configurada en el servidor.", 503)
+
+    try:
+        suggestions = await geocoder.search(q)
+    except AddressGeocoderError as error:
+        return _error(str(error), error.status_code)
+
+    return JSONResponse(
+        content={"suggestions": [suggestion.as_dict() for suggestion in suggestions]},
+        headers=_NO_STORE,
+    )
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        content={"error": message},
+        status_code=status_code,
+        headers=_NO_STORE,
+    )
