@@ -77,3 +77,82 @@ class AssignmentProposalRequest(BaseModel):
         validation_alias="deliveryPointIds",
     )
 
+    @model_validator(mode="after")
+    def ensure_unique_ids(self) -> AssignmentProposalRequest:
+        if self.courier_ids is not None and len(set(self.courier_ids)) != len(self.courier_ids):
+            raise ValueError("courierIds no puede contener duplicados.")
+        if (
+            self.delivery_point_ids is not None
+            and len(set(self.delivery_point_ids)) != len(self.delivery_point_ids)
+        ):
+            raise ValueError("deliveryPointIds no puede contener duplicados.")
+        return self
+
+
+class AssignmentItem(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    courier_id: UUID = Field(validation_alias="courierId")
+    delivery_point_ids: list[UUID] = Field(
+        min_length=1,
+        max_length=MAX_ROUTE_STOPS,
+        validation_alias="deliveryPointIds",
+    )
+
+    @model_validator(mode="after")
+    def ensure_unique_stops(self) -> AssignmentItem:
+        if len(set(self.delivery_point_ids)) != len(self.delivery_point_ids):
+            raise ValueError("deliveryPointIds no puede contener duplicados.")
+        return self
+
+
+class ApplyAssignmentsRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    assignments: list[AssignmentItem] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def ensure_unique_targets(self) -> ApplyAssignmentsRequest:
+        courier_ids = [item.courier_id for item in self.assignments]
+        point_ids = [point_id for item in self.assignments for point_id in item.delivery_point_ids]
+        if len(set(courier_ids)) != len(courier_ids):
+            raise ValueError("Cada courier solo puede aparecer una vez en assignments.")
+        if len(set(point_ids)) != len(point_ids):
+            raise ValueError("Un delivery point no puede asignarse a más de un courier.")
+        return self
+
+
+@router.post("")
+async def propose_assignments(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    providers: Annotated[
+        tuple[CachedMatrixProvider, CachedRouteProvider],
+        Depends(get_routing_providers),
+    ],
+) -> JSONResponse:
+    if claims is None:
+        return _error("Debes iniciar sesión para continuar.", 401)
+    if claims["role"] != "dispatcher":
+        return _error("Se requiere una sesión de despacho.", 403)
+    body = await _read_object(request)
+    if isinstance(body, JSONResponse):
+        return body
+    try:
+        data = AssignmentProposalRequest.model_validate(body)
+    except ValidationError as error:
+        return _validation_error(error)
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    fresh_after = now - timedelta(minutes=2)
+    try:
+        couriers = await CourierRepository(session).list_available_for_assignment(
+            fresh_after=fresh_after,
+            as_of=now,
+            courier_ids=data.courier_ids,
+        )
+        raw_points = await DeliveryPointRepository(session).list_pending_unassigned(
+            data.delivery_point_ids
+        )
+        points = [
