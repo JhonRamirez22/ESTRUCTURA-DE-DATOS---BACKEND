@@ -82,3 +82,86 @@ class RecalculateRouteRequest(BaseModel):
 
     delivery_point_ids: list[UUID] | None = Field(
         default=None,
+        min_length=1,
+        max_length=MAX_ROUTE_STOPS,
+        validation_alias="deliveryPointIds",
+    )
+
+
+class RouteStatusRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    status: RouteStatus
+
+
+@router.get("")
+async def list_routes(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> JSONResponse:
+    if claims is None:
+        return _error("Debes iniciar sesión para consultar rutas.", 401)
+    if claims["role"] == "courier":
+        courier_filter = _claim_courier_id(claims)
+        if courier_filter is None:
+            return _error("La sesión de repartidor no es válida.", 403)
+    else:
+        parsed_courier_filter = _parse_query_courier_id(request.query_params.get("courierId"))
+        if isinstance(parsed_courier_filter, JSONResponse):
+            return parsed_courier_filter
+        courier_filter = parsed_courier_filter
+
+    status: RouteStatus | None = None
+    raw_status = request.query_params.get("status")
+    if raw_status is not None:
+        try:
+            status = RouteStatus(raw_status)
+        except ValueError:
+            return _error("status debe ser PLANNED, IN_PROGRESS, COMPLETED o CANCELLED.", 400)
+    try:
+        routes = await RouteRepository(session).list_routes(
+            courier_id=courier_filter,
+            status=status,
+        )
+        dispatcher = claims["role"] == "dispatcher"
+        undoable_route_ids = (
+            await RouteRepository(session).route_ids_with_revisions([route.id for route in routes])
+            if dispatcher
+            else set()
+        )
+        return _json(
+            {
+                "routes": [
+                    _route_json(
+                        route,
+                        dispatcher=dispatcher,
+                        can_undo=route.id in undoable_route_ids,
+                    )
+                    for route in routes
+                ]
+            },
+            headers=_NO_STORE,
+        )
+    except SQLAlchemyError as error:
+        _log_database_error("No se pudieron consultar las rutas", error)
+        return _error("No se pudieron consultar las rutas.", 500)
+
+
+@router.post("", status_code=201)
+async def create_route(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    providers: Annotated[
+        tuple[CachedMatrixProvider, CachedRouteProvider],
+        Depends(get_routing_providers),
+    ],
+    advisor: Annotated[RouteTrafficAdvisor | None, Depends(get_route_traffic_advisor)],
+    traffic: Annotated[TrafficService | None, Depends(get_traffic_service)],
+    order_advisor: Annotated[RouteOrderAdvisor | None, Depends(get_route_order_advisor)],
+) -> JSONResponse:
+    if claims is None:
+        return _error("Debes iniciar sesión para continuar.", 401)
+    if claims["role"] != "dispatcher":
+        return _error("Se requiere una sesión de despacho.", 403)
