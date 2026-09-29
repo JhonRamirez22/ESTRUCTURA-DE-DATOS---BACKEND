@@ -64,3 +64,68 @@ async def list_subjects(
         elif tipo == "account":
             stmt_a = (
                 select(Account).where(Account.role == "dispatcher")
+                .order_by(Account.email.asc()).limit(_SEARCH_LIMIT)
+            )
+            if term:
+                stmt_a = stmt_a.where(Account.email.ilike(_like(term), escape="\\"))
+            rows_a = (await session.scalars(stmt_a)).all()
+            items = [
+                {"id": str(row.id), "label": row.email,
+                 "detail": "Habilitada" if row.enabled else "Deshabilitada"}
+                for row in rows_a
+            ]
+        else:
+            stmt_o = select(DeliveryPoint).order_by(DeliveryPoint.id.desc()).limit(_SEARCH_LIMIT)
+            if term:
+                stmt_o = stmt_o.where(
+                    or_(
+                        DeliveryPoint.order_id.ilike(_like(term), escape="\\"),
+                        DeliveryPoint.address.ilike(_like(term), escape="\\"),
+                    )
+                )
+            rows_o = (await session.scalars(stmt_o)).all()
+            items = [
+                {"id": str(row.id), "label": row.order_id,
+                 "detail": f"{row.status.value} · {row.address[:60]}"
+                 + (f" · {mask_email(row.customer_email)}" if row.customer_email else "")}
+                for row in rows_o
+            ]
+    except SQLAlchemyError:
+        return JSONResponse({"error": "No se pudo buscar."}, status_code=500, headers=_NO_STORE)
+    return JSONResponse({"subjects": items}, headers=_NO_STORE)
+
+
+@router.get("/informe")
+async def download_report(
+    request: Request,
+    claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    tipo: Annotated[Kind, Query()],
+    id: Annotated[UUID, Query()],  # noqa: A002 - nombre público del parámetro
+    desde: Annotated[date, Query()],
+    hasta: Annotated[date, Query()],
+) -> Response:
+    account_raw = claims.get("accountId")
+    requester = UUID(account_raw) if account_raw else None
+    retry = _LIMITER.retry_after(hashlib.sha256((account_raw or "dispatcher").encode()).hexdigest())
+    if retry is not None:
+        return JSONResponse(
+            {"error": "Demasiados informes seguidos. Intenta en unos segundos."},
+            status_code=429, headers={**_NO_STORE, "Retry-After": str(retry)},
+        )
+    try:
+        begin, end = period_bounds(desde, hasta)
+    except AuditPeriodError as error:
+        return JSONResponse({"error": str(error)}, status_code=400, headers=_NO_STORE)
+    try:
+        data: ReportData | None
+        if tipo == "courier":
+            data = await collect_courier_report(session, id, begin, end)
+        elif tipo == "account":
+            data = await collect_account_report(session, id, begin, end)
+        else:
+            data = await collect_order_report(session, id, begin, end)
+        if data is None:
+            return JSONResponse({"error": "El sujeto no existe."}, status_code=404,
+                                headers=_NO_STORE)
+        generated_by = "cuenta de despacho"
