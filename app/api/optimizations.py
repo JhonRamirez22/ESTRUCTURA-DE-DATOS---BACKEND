@@ -56,3 +56,60 @@ async def live_fleet_proposal(
     if not get_settings().live_optimization_enabled:
         return JSONResponse({"enabled": False, "routes": []}, headers=_NO_STORE)
     subject = str(claims.get("accountId") or claims["role"])
+    retry = _LIVE_LIMITER.retry_after(subject)
+    if retry is not None:
+        return JSONResponse(
+            {"error": "Demasiadas consultas de optimización en vivo."},
+            status_code=429,
+            headers={**_NO_STORE, "Retry-After": str(retry)},
+        )
+    matrix_provider, route_provider = providers
+    try:
+        payload = await LiveOptimizationService(matrix_provider, route_provider).snapshot(session)
+    except RoutingClientError:
+        return JSONResponse(
+            {"error": "El proveedor vial no respondió; se conserva el plan actual."},
+            status_code=502,
+            headers=_NO_STORE,
+        )
+    except SQLAlchemyError:
+        return JSONResponse(
+            {"error": "No se pudieron leer las rutas activas."}, status_code=500, headers=_NO_STORE
+        )
+    return JSONResponse(payload, headers=_NO_STORE)
+
+
+@router.get("/recientes")
+async def recent_optimizations(
+    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 30,
+) -> dict[str, object]:
+    current = stats()
+    return {
+        "events": recent_events(limit),
+        "incidents": recent_incidents(10),
+        "stats": {
+            "proposals": current.proposals,
+            "cacheHits": current.cache_hits,
+            "applied": current.applied,
+            "trafficSegments": current.traffic_segments,
+            "savedMinutes": current.saved_minutes,
+        },
+        "summaryCooldownSeconds": round(summary_cooldown_remaining(), 1),
+    }
+
+
+@router.post("/resumen")
+async def summarize_optimizations(
+    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+) -> dict[str, object]:
+    """Pide a Groq un resumen de las optimizaciones; no cambia ninguna ruta."""
+    remaining = summary_cooldown_remaining()
+    if remaining > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Espera {round(remaining)} s antes de pedir otro resumen.",
+            headers=_NO_STORE,
+        )
+    settings = get_settings()
+    key = (
