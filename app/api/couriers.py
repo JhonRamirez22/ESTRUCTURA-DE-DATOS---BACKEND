@@ -83,3 +83,88 @@ async def get_my_courier(
         claims.get("courierId"), "El identificador del repartidor no es válido."
     )
     courier = await CourierRepository(session).get_courier(courier_id)
+    if courier is None:
+        return _error("El repartidor no existe.", 404)
+
+    view = CourierSelfView.model_validate(courier)
+    if not is_courier_location_fresh(courier.last_location_at):
+        view = view.model_copy(update={"current_lat": None, "current_lng": None})
+    return _json(
+        {"courier": view.model_dump(mode="json", by_alias=True)}, headers=_NO_STORE_PRIVATE
+    )
+
+
+@router.post("/me/ubicacion", status_code=201)
+async def post_my_location(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    claims: Annotated[SessionClaims, Depends(require_courier_session)],
+    session_factory: Annotated[
+        async_sessionmaker[AsyncSession], Depends(get_write_session_factory)
+    ],
+    queue: Annotated[LocationQueue, Depends(get_location_event_queue)],
+) -> JSONResponse:
+    courier_id = _parse_uuid(
+        claims.get("courierId"), "El identificador del repartidor no es válido."
+    )
+    return await _post_location(request, courier_id, session_factory, queue, background_tasks)
+
+
+@router.delete("/me/ubicacion")
+async def stop_my_location(
+    claims: Annotated[SessionClaims, Depends(require_courier_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    courier_id = _parse_uuid(
+        claims.get("courierId"), "El identificador del repartidor no es válido."
+    )
+    return await _stop_location(courier_id, session)
+
+
+@router.get("")
+async def list_couriers(
+    request: Request,
+    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    status: CourierStatus | None = None
+    raw_status = request.query_params.get("status")
+    if raw_status is not None:
+        try:
+            status = CourierStatus(raw_status)
+        except ValueError:
+            return _error("status debe ser AVAILABLE, ON_ROUTE u OFFLINE.", 400)
+
+    try:
+        couriers = await CourierRepository(session).list_couriers(status)
+        now = datetime.now(UTC).replace(tzinfo=None)
+        views = [_courier_view(courier, now) for courier in couriers]
+        payload = CourierCollectionResponse(couriers=views)
+        return _json(
+            payload.model_dump(mode="json", by_alias=True),
+            headers=_NO_STORE_PRIVATE,
+        )
+    except SQLAlchemyError as error:
+        _log_db_error("No se pudo consultar la lista de repartidores", error)
+        return _error("No se pudo procesar el repartidor.", 500)
+
+
+@router.post("", status_code=201)
+async def create_courier(
+    request: Request,
+    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    body = await _read_json_object(request)
+    if isinstance(body, JSONResponse):
+        return body
+    if "currentLat" in body or "currentLng" in body:
+        return _error(
+            "La posición no se define al registrar al repartidor; "
+            "debe venir de su GPS autenticado.",
+            400,
+        )
+    if "status" in body and body["status"] != CourierStatus.OFFLINE.value:
+        return _error("Un repartidor nuevo queda fuera de turno hasta que reporte GPS válido.", 400)
+    try:
+        data = CourierCreateRequest.model_validate(body)
