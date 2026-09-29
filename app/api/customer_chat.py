@@ -65,3 +65,70 @@ async def chat_about_order(
         if not isinstance(body, dict):
             return _error("El body debe ser un objeto JSON.", 400)
         data = CustomerChatRequest.model_validate(body)
+    except ClientDisconnect:
+        return _error("La solicitud se interrumpió antes de completarse.", 400)
+    except (ValueError, UnicodeDecodeError, ValidationError):
+        return _error("La guía o los mensajes no tienen un formato válido.", 400)
+
+    if assistant is None:
+        return _error(
+            "El asistente no está configurado. Puedes seguir consultando el pedido con tu guía.",
+            503,
+        )
+
+    settings = get_settings()
+    auth_secret = (
+        settings.auth_secret.get_secret_value()
+        if settings.auth_secret is not None
+        else ""
+    )
+    try:
+        retry_after = await _CHAT_RATE_LIMITER.retry_after_shared(
+            session,
+            data.guide,
+            hmac_secret=auth_secret,
+        )
+    except (SQLAlchemyError, ValueError, RuntimeError) as error:
+        await session.rollback()
+        _LOGGER.warning(
+            "No se pudo aplicar el límite compartido del chat de pedido",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error("El asistente no está disponible temporalmente.", 503)
+
+    if retry_after is not None:
+        return JSONResponse(
+            content={"error": "Has enviado varias preguntas seguidas. Espera un momento."},
+            status_code=429,
+            headers={**_NO_STORE, "Retry-After": str(retry_after)},
+        )
+
+    try:
+        point = await DeliveryPointRepository(session).get_delivery_point_by_tracking_token(
+            data.guide
+        )
+    except SQLAlchemyError as error:
+        _LOGGER.warning(
+            "No se pudo cargar el contexto mínimo para el chat de pedido",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error("El asistente no está disponible temporalmente.", 503)
+
+    if point is None:
+        return _error("No encontramos un pedido con esa guía.", 404)
+
+    estimated_minutes_from_now: float | None = None
+    estimate_basis = "No hay un ETA vial confiable disponible para este pedido."
+    if customer_asks_for_arrival_estimate(data.messages):
+        try:
+            eta_result = await estimate_customer_order_eta(
+                point,
+                routing_providers[0],
+                routing_providers[1],
+                traffic_provider=traffic_provider,
+            )
+            if eta_result is not None:
+                estimated_minutes_from_now = eta_result.estimated_minutes_from_now
+                if eta_result.traffic_applied:
+                    estimate_basis = (
+                        "Se aplicó una señal TomTom parcial solo al primer tramo; los tramos "
