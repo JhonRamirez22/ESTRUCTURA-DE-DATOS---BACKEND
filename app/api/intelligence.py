@@ -74,3 +74,79 @@ async def cached_explanation(key: str, summary: dict[str, Any]) -> dict[str, Any
 @router.get("/agrupaciones")
 async def suggest_order_groups(
     _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    try:
+        pending = await DeliveryPointRepository(session).list_pending_unassigned()
+    except SQLAlchemyError:
+        return JSONResponse({"error": "No se pudieron leer los pendientes."}, status_code=500)
+    locations = [
+        PendingLocation(ident=str(point.id), alias=f"p-{index}", lat=point.lat, lng=point.lng)
+        for index, point in enumerate(pending)
+    ]
+    cache_key = tuple(sorted(f"{loc.ident}:{loc.lat:.5f}:{loc.lng:.5f}" for loc in locations))
+    result = await cached_groups(cache_key, locations)
+    by_alias = {loc.alias: loc.ident for loc in locations}
+    groups = [
+        {
+            "ids": [by_alias[alias] for alias in group["members"]],
+            "spreadMeters": group["spreadMeters"],
+            "source": group["source"],
+            "reason": group["reason"],
+        }
+        for group in result["groups"]
+    ]
+    payload = {"groups": groups, "ai": result["ai"], "cached": result["cached"]}
+    return JSONResponse(payload, headers=_NO_STORE)
+
+
+@router.post("/rutas/{route_id}/explicar")
+async def explain_optimization(
+    route_id: str,
+    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+) -> JSONResponse:
+    try:
+        parsed = UUID(route_id)
+    except ValueError:
+        return JSONResponse({"error": "La ruta no existe."}, status_code=404)
+    summary = get_route_optimization(parsed)
+    if summary is None:
+        return JSONResponse(
+            {"error": "Esta ruta aún no tiene resumen de optimización."}, status_code=404
+        )
+    key = f"{route_id}:{summary.get('computedAt')}"
+    return JSONResponse(await cached_explanation(key, dict(summary)), headers=_NO_STORE)
+
+
+@router.get("/sugerencias")
+async def dispatch_suggestions(
+    claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    if not get_settings().ai_suggestions_enabled:
+        return JSONResponse(
+            {"enabled": False, "suggestions": [], "ai": {"source": "deterministic"}},
+            headers=_NO_STORE,
+        )
+    subject = claims.get("accountId") or claims["role"]
+    retry = _SUGGESTION_LIMITER.retry_after(hashlib.sha256(subject.encode()).hexdigest())
+    if retry is not None:
+        return JSONResponse(
+            {"error": "Demasiadas consultas de sugerencias."},
+            status_code=429,
+            headers={**_NO_STORE, "Retry-After": str(retry)},
+        )
+    try:
+        couriers = await CourierRepository(session).list_couriers()
+        pending = await DeliveryPointRepository(session).list_pending_unassigned()
+    except SQLAlchemyError:
+        return JSONResponse({"error": "No se pudo leer la operación."}, status_code=500)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cards = build_suggestions(
+        [
+            CourierView(
+                str(c.id), c.name, c.status, c.current_lat, c.current_lng, c.last_location_at
+            )
+            for c in couriers
+        ],
+        [PendingView(str(p.id), p.lat, p.lng) for p in pending],
