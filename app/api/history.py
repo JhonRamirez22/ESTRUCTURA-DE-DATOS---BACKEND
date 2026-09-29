@@ -53,3 +53,57 @@ async def list_shipments(
         return JSONResponse({"error": "No se pudo leer el historial."}, status_code=500,
                             headers=_NO_STORE)
     return JSONResponse(
+        {
+            "total": page.total,
+            "page": page.page,
+            "pageSize": page.page_size,
+            "items": [
+                {
+                    "id": str(item.point_id),
+                    "orderId": item.order_ref,
+                    "address": item.address,
+                    "status": item.status,
+                    "courierName": item.courier_name,
+                    "createdAt": iso(item.created_at),
+                    "deliveredAt": iso(item.delivered_at),
+                    "scheduledFor": iso(item.scheduled_for),
+                    "events": item.events,
+                    "lastEventAt": iso(item.last_event_at),
+                }
+                for item in page.items
+            ],
+        },
+        headers=_NO_STORE,
+    )
+
+
+@router.get("/envios/{point_id}/eventos")
+async def shipment_timeline(
+    point_id: UUID,
+    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    try:
+        entries = await DeliveryHistoryReader(session).timeline(point_id)
+    except SQLAlchemyError:
+        return JSONResponse({"error": "No se pudo leer el historial."}, status_code=500,
+                            headers=_NO_STORE)
+    if entries is None:
+        return JSONResponse({"error": "El envío no existe."}, status_code=404, headers=_NO_STORE)
+    return JSONResponse(
+        {
+            "events": [
+                {
+                    "type": e.event_type,
+                    "at": iso(e.occurred_at),
+                    "fromStatus": e.from_status,
+                    "toStatus": e.to_status,
+                    "actor": e.actor_role,
+                    "courierName": e.courier_name,
+                    "detail": e.detail,
+                }
+                for e in entries
+            ]
+        },
+        headers=_NO_STORE,
+    )
