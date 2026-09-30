@@ -69,3 +69,74 @@ async def get_tracking(
         ).get_delivery_point_by_tracking_token(normalized_guide)
     except SQLAlchemyError as error:
         _LOGGER.warning(
+            "No se pudo consultar el seguimiento en la base de datos",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error(
+            "El seguimiento no está disponible temporalmente. Intenta de nuevo más tarde.",
+            503,
+        )
+
+    if delivery_point is None:
+        return _error("No encontramos un pedido con esa guía.", 404)
+
+    try:
+        milestones = await DeliveryHistoryReader(session).customer_milestones(delivery_point.id)
+    except SQLAlchemyError:
+        milestones = []  # the history is an extra: tracking still answers without it
+    scheduled_for = delivery_point.scheduled_for
+    base_tracking: dict[str, object] = {
+        "guide": delivery_point.tracking_token,
+        "status": delivery_point.status.value,
+        "address": delivery_point.address,
+        "coordinates": {"lat": delivery_point.lat, "lng": delivery_point.lng},
+        # Moments only: never who handled the shipment or where it was.
+        "milestones": [
+            {"type": kind, "at": when.isoformat(timespec="seconds") + "Z"}
+            for kind, when in milestones
+        ],
+        "scheduledFor": (
+            scheduled_for.isoformat(timespec="seconds") + "Z" if scheduled_for else None
+        ),
+    }
+    route = delivery_point.route
+    if route is None:
+        return _json({"tracking": {**base_tracking, "route": None}})
+
+    ordered_points = sorted(
+        route.delivery_points,
+        key=lambda point: (
+            point.sequence_index if point.sequence_index is not None else 2**31
+        ),
+    )
+    remaining_points = [
+        point for point in ordered_points if point.status not in _TERMINAL_POINT_STATUSES
+    ]
+    now = datetime.now(UTC).replace(tzinfo=None)
+    courier = route.courier
+    precise_position = None
+    if (
+        courier.current_lat is not None
+        and courier.current_lng is not None
+        and is_courier_location_fresh(courier.last_location_at, now)
+        and is_within_pasto_service_area(courier.current_lat, courier.current_lng)
+    ):
+        precise_position = (courier.current_lat, courier.current_lng)
+
+    is_next_stop = bool(remaining_points) and remaining_points[0].id == delivery_point.id
+    target_is_active = any(point.id == delivery_point.id for point in remaining_points)
+    route_is_active = route.status in _ACTIVE_ROUTE_STATUSES
+    may_show_courier = target_is_active and route_is_active
+    shared_position = (
+        (_round_coordinate(precise_position[0]), _round_coordinate(precise_position[1]))
+        if precise_position is not None and may_show_courier
+        else None
+    )
+
+    matrix_result: MatrixProviderResult | None = None
+    stop_etas: list[StopEta] = []
+    estimate_warning: str | None = None
+    if shared_position is not None and remaining_points:
+        try:
+            matrix_result = await matrix_provider.get_duration_matrix(
+                [
