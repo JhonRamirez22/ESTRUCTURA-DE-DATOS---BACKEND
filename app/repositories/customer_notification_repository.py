@@ -36,3 +36,41 @@ class CustomerNotificationRepository:
             select(
                 CustomerNotificationOutbox.channel,
                 CustomerNotificationOutbox.status,
+                func.count(CustomerNotificationOutbox.id),
+            )
+            .where(
+                CustomerNotificationOutbox.status.in_(
+                    (
+                        CustomerNotificationStatus.PENDING,
+                        CustomerNotificationStatus.PROCESSING,
+                        CustomerNotificationStatus.FAILED,
+                    )
+                )
+            )
+            .group_by(
+                CustomerNotificationOutbox.channel,
+                CustomerNotificationOutbox.status,
+            )
+        )
+        for channel, status, count in rows:
+            if status is CustomerNotificationStatus.PENDING:
+                counts[channel]["pending"] = count
+            elif status is CustomerNotificationStatus.PROCESSING:
+                counts[channel]["processing"] = count
+            elif status is CustomerNotificationStatus.FAILED:
+                counts[channel]["failed"] = count
+
+        retry_rows = await self._session.execute(
+            select(
+                CustomerNotificationOutbox.channel,
+                func.count(CustomerNotificationOutbox.id),
+            )
+            .where(
+                CustomerNotificationOutbox.status == CustomerNotificationStatus.PENDING,
+                CustomerNotificationOutbox.last_error_code.is_not(None),
+            )
+            .group_by(CustomerNotificationOutbox.channel)
+        )
+        for channel, count in retry_rows:
+            counts[channel]["retrying"] = count
+        return counts
