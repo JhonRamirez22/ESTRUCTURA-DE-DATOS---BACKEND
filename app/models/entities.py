@@ -72,3 +72,76 @@ class Courier(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    credential: Mapped[CourierCredential | None] = relationship(
+        back_populates="courier",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        uselist=False,
+    )
+
+
+class CourierCredential(Base):
+    __tablename__ = "courier_credentials"
+
+    courier_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("couriers.id", ondelete="CASCADE", onupdate="CASCADE"),
+        primary_key=True,
+    )
+    access_code_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        default=func.now(),
+        onupdate=func.now(),
+    )
+
+    courier: Mapped[Courier] = relationship(back_populates="credential")
+
+
+class DeliveryPoint(Base):
+    __tablename__ = "delivery_points"
+    __table_args__ = (
+        UniqueConstraint("order_id", name="delivery_points_order_id_key"),
+        UniqueConstraint("tracking_token", name="delivery_points_tracking_token_key"),
+        UniqueConstraint(
+            "route_id",
+            "sequence_index",
+            name="delivery_points_route_sequence_idx",
+        ),
+        CheckConstraint("priority BETWEEN 1 AND 3", name="delivery_points_priority_range"),
+        Index("delivery_points_scheduled_for_idx", "scheduled_for"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    address: Mapped[str] = mapped_column(Text, nullable=False)
+    lat: Mapped[float] = mapped_column(Float, nullable=False)
+    lng: Mapped[float] = mapped_column(Float, nullable=False)
+    time_window: Mapped[object | None] = mapped_column(_JSON_COLUMN_TYPE)
+    status: Mapped[DeliveryPointStatus] = mapped_column(
+        _enum_type(DeliveryPointStatus, "delivery_point_status"),
+        nullable=False,
+        default=DeliveryPointStatus.PENDING,
+    )
+    order_id: Mapped[str] = mapped_column(Text, nullable=False)
+    customer_email: Mapped[str | None] = mapped_column(String(320))
+    email_notifications_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    customer_phone: Mapped[str | None] = mapped_column(String(20))
+    sms_notifications_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    tracking_token: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default=lambda: str(uuid.uuid4()),
+    )
+    route_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("routes.id", ondelete="SET NULL", onupdate="CASCADE"),
+    )
+    sequence_index: Mapped[int | None] = mapped_column(Integer)
+    # 1 normal, 2 alta, 3 urgente: pesa el retraso al ordenar con ventanas horarias.
+    priority: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=1, server_default="1"
