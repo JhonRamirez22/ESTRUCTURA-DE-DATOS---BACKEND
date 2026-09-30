@@ -54,3 +54,59 @@ async def traffic_status(
         "coverage": "partial-or-unknown",
         "refreshSeconds": TRAFFIC_CACHE_TTL_SECONDS,
     }
+
+
+@router.get("/tiles/{z}/{x}/{y}.png")
+async def traffic_tile(
+    z: int,
+    x: int,
+    y: int,
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    service: Annotated[TrafficService | None, Depends(get_traffic_service)],
+    t: Annotated[int | None, Query(ge=0)] = None,
+) -> Response:
+    identity = _authorize(claims)
+    try:
+        validate_traffic_tile(z, x, y)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    secret = _configured_secret(get_settings())
+    if service is None or secret is None:
+        raise HTTPException(503, "TomTom Traffic no está configurado.")
+    retry = await _LIMITER.retry_after_shared(
+        session,
+        f"traffic-tiles:{identity['accountId']}",
+        hmac_secret=secret,
+    )
+    if retry is not None:
+        raise HTTPException(
+            429, "Límite temporal de consultas de tráfico.", headers={"Retry-After": str(retry)}
+        )
+    try:
+        current_bucket = int(datetime.now(UTC).timestamp() // TRAFFIC_CACHE_TTL_SECONDS)
+        # Tolera un reloj cliente ligeramente desfasado sin permitir claves de caché arbitrarias.
+        bucket = t if t is not None and abs(t - current_bucket) <= 1 else current_bucket
+        tile = await service.get_flow_tile(z, x, y, refresh_bucket=bucket)
+    except TrafficNoCoverageError as error:
+        raise HTTPException(404, "Sin cobertura de tráfico para esta área.") from error
+    except TrafficRateLimitError as error:
+        raise HTTPException(
+            429, "TomTom alcanzó su límite.", headers={"Retry-After": "90"}
+        ) from error
+    except TrafficTimeoutError as error:
+        raise HTTPException(504, "TomTom tardó demasiado al consultar el mapa.") from error
+    except TrafficServiceError as error:
+        raise HTTPException(502, "La capa de tráfico no está disponible temporalmente.") from error
+    age = (datetime.now(UTC) - tile.observed_at).total_seconds()
+    max_age = max(0, int(TRAFFIC_CACHE_TTL_SECONDS - age)) if tile.cache_status == "FRESH" else 0
+    return Response(
+        tile.content,
+        media_type="image/png",
+        headers={
+            "Cache-Control": f"private, max-age={max_age}",
+            "X-Traffic-Observed-At": tile.observed_at.isoformat(),
+            "X-Traffic-Cache": tile.cache_status,
+            "X-Traffic-Coverage": "partial-or-unknown",
+        },
+    )
