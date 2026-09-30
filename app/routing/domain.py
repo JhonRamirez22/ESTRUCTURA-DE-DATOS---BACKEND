@@ -58,3 +58,62 @@ class Route:
         return tuple(stop.stop_id for stop in self.stops)
 
     @property
+    def locked_count(self) -> int:
+        return sum(1 for stop in self.stops if stop.locked)
+
+    def with_stops(self, stops: Iterable[Stop]) -> Route:
+        return Route(self.route_id, self.courier, stops)
+
+    def __len__(self) -> int:
+        return len(self.stops)
+
+
+@dataclass(frozen=True, slots=True)
+class FleetIndex:
+    """Maps couriers and stops to rows of the shared cost matrix.
+
+    Rows ``0..R-1`` are the couriers (in route order) and the rest are the stops of every
+    route, so a single road-matrix call serves the whole fleet.
+    """
+
+    points: tuple[GeoPoint, ...]
+    courier_node: dict[str, int]
+    stop_node: dict[str, int]
+
+
+class Fleet:
+    """A set of routes optimised together."""
+
+    def __init__(self, routes: Sequence[Route]) -> None:
+        ids = [route.route_id for route in routes]
+        if len(set(ids)) != len(ids):
+            raise ValueError("Fleet routes must have unique ids.")
+        seen: set[str] = set()
+        for route in routes:
+            for stop_id in route.stop_ids:
+                if stop_id in seen:
+                    raise ValueError(f"Stop {stop_id} appears in more than one route.")
+                seen.add(stop_id)
+        self.routes: tuple[Route, ...] = tuple(routes)
+
+    def index(self) -> FleetIndex:
+        points: list[GeoPoint] = []
+        courier_node: dict[str, int] = {}
+        stop_node: dict[str, int] = {}
+        for route in self.routes:
+            courier_node[route.route_id] = len(points)
+            points.append(route.courier.location)
+        for route in self.routes:
+            for stop in route.stops:
+                stop_node[stop.stop_id] = len(points)
+                points.append(stop.location)
+        return FleetIndex(tuple(points), courier_node, stop_node)
+
+    def route(self, route_id: str) -> Route:
+        for route in self.routes:
+            if route.route_id == route_id:
+                return route
+        raise KeyError(route_id)
+
+    def __len__(self) -> int:
+        return len(self.routes)
