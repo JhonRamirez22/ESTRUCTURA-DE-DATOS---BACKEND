@@ -68,3 +68,73 @@ def verify_courier_access_code(access_code: str, encoded_hash: str) -> bool:
             r=SCRYPT_R,
             p=SCRYPT_P,
             dklen=SCRYPT_KEY_LENGTH,
+        )
+        return hmac.compare_digest(actual_digest, expected_digest)
+    except (ValueError, TypeError):
+        return False
+
+
+def matches_access_code(input_code: str, expected_code: str) -> bool:
+    return hmac.compare_digest(input_code.encode("utf-8"), expected_code.encode("utf-8"))
+
+
+def create_session_token(
+    role: SessionRole,
+    expires_at: int,
+    secret: str,
+    courier_id: str | None = None,
+) -> str:
+    """Firma JSON compacto con HMAC-SHA256 en el mismo formato que Next.js."""
+    if len(secret.encode("utf-8")) < 32:
+        raise ValueError("AUTH_SECRET debe contener al menos 32 bytes")
+    claims: dict[str, str | int] = {"role": role}
+    if courier_id is not None:
+        claims["courierId"] = courier_id
+    claims["expiresAt"] = expires_at
+    payload = _encode_base64url(
+        json.dumps(claims, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+    signature = hmac.new(secret.encode("utf-8"), payload.encode("ascii"), hashlib.sha256)
+    return f"{payload}.{_encode_base64url(signature.digest())}"
+
+
+def verify_session_token(
+    token: str | None,
+    secret: str | None,
+    now_seconds: int | None = None,
+) -> SessionClaims | None:
+    if not token or not secret or len(secret.encode("utf-8")) < 32:
+        return None
+
+    parts = token.split(".")
+    if len(parts) != 2 or not all(parts):
+        return None
+
+    payload, encoded_signature = parts
+    try:
+        signature = _decode_base64url(encoded_signature)
+        expected_signature = hmac.new(
+            secret.encode("utf-8"), payload.encode("ascii"), hashlib.sha256
+        ).digest()
+        if not hmac.compare_digest(signature, expected_signature):
+            return None
+
+        value: object = json.loads(_decode_base64url(payload))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(value, dict):
+        return None
+    role = value.get("role")
+    expires_at = value.get("expiresAt")
+    if role not in {"dispatcher", "courier"} or type(expires_at) is not int:
+        return None
+    current_time = int(time.time()) if now_seconds is None else now_seconds
+    if expires_at <= current_time:
+        return None
+    courier_id = value.get("courierId")
+    if role == "courier" and (not isinstance(courier_id, str) or not courier_id):
+        return None
+
+    return cast(SessionClaims, value)
+
