@@ -47,3 +47,51 @@ class CourierRepository:
         as_of: datetime,
         courier_ids: Sequence[UUID] | None,
     ) -> list[Courier]:
+        statement = select(Courier).where(
+            Courier.status == CourierStatus.AVAILABLE,
+            Courier.current_lat.is_not(None),
+            Courier.current_lng.is_not(None),
+            Courier.last_location_at >= fresh_after,
+            Courier.last_location_at <= as_of,
+        )
+        if courier_ids is not None:
+            statement = statement.where(Courier.id.in_(courier_ids))
+        couriers = await self._session.scalars(statement.order_by(Courier.id.asc()))
+        return list(couriers.all())
+
+    async def has_routes(self, courier_id: UUID) -> bool:
+        route_id = await self._session.scalar(
+            select(Route.id).where(Route.courier_id == courier_id).limit(1)
+        )
+        return route_id is not None
+
+    async def get_credential(self, courier_id: UUID) -> CourierCredential | None:
+        return await self._session.get(CourierCredential, courier_id)
+
+    def add_courier(self, courier: Courier) -> None:
+        self._session.add(courier)
+
+    async def refresh_courier(self, courier: Courier) -> None:
+        await self._session.refresh(courier)
+
+    def add_credential(self, credential: CourierCredential) -> None:
+        self._session.add(credential)
+
+    async def delete_courier(self, courier: Courier) -> None:
+        await self._session.delete(courier)
+
+    async def get_active_route_id(self, courier_id: UUID) -> UUID | None:
+        return await self._session.scalar(
+            select(Route.id)
+            .where(
+                Route.courier_id == courier_id,
+                Route.status.in_([RouteStatus.PLANNED, RouteStatus.IN_PROGRESS]),
+            )
+            .limit(1)
+        )
+
+    async def get_next_delivery_point_for_route(self, courier_id: UUID) -> DeliveryPoint | None:
+        return await self._session.scalar(
+            select(DeliveryPoint)
+            .join(Route, Route.id == DeliveryPoint.route_id)
+            .where(
