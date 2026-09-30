@@ -54,3 +54,58 @@ class DeliveryPointRepository:
             statement = statement.options(selectinload(DeliveryPoint.route))
         return await self._session.scalar(statement)
 
+    async def get_delivery_point_by_tracking_token(self, token: str) -> DeliveryPoint | None:
+        statement = (
+            select(DeliveryPoint)
+            .where(DeliveryPoint.tracking_token == token)
+            .options(
+                selectinload(DeliveryPoint.route).joinedload(Route.courier),
+                selectinload(DeliveryPoint.route).selectinload(Route.delivery_points),
+            )
+        )
+        return await self._session.scalar(statement)
+
+    def add(self, point: DeliveryPoint) -> None:
+        self._session.add(point)
+
+    async def refresh(self, point: DeliveryPoint) -> None:
+        await self._session.refresh(point)
+
+    async def try_update_delivery_point(
+        self,
+        *,
+        point_id: UUID,
+        expected_status: DeliveryPointStatus,
+        expected_route_id: UUID | None,
+        updates: Mapping[str, object],
+        courier_id: UUID | None = None,
+    ) -> bool:
+        conditions = [
+            DeliveryPoint.id == point_id,
+            DeliveryPoint.status == expected_status,
+            DeliveryPoint.route_id == expected_route_id,
+        ]
+        if courier_id is not None:
+            conditions.append(
+                DeliveryPoint.route_id.in_(
+                    select(Route.id).where(
+                        Route.courier_id == courier_id,
+                        Route.status == RouteStatus.IN_PROGRESS,
+                    )
+                )
+            )
+        result = await self._session.execute(
+            update(DeliveryPoint)
+            .where(*conditions)
+            .values(**updates)
+            .returning(DeliveryPoint.id)
+        )
+        return result.scalar_one_or_none() == point_id
+
+    async def active_points_near(
+        self, lat: float, lng: float, lat_delta: float, lng_delta: float
+    ) -> list[DeliveryPoint]:
+        """Paradas pendientes o en ruta dentro de un recuadro; el llamador mide la distancia."""
+        result = await self._session.scalars(
+            select(DeliveryPoint).where(
+                DeliveryPoint.status.in_(
