@@ -25,3 +25,30 @@ from app.models.enums import (
     RouteStatus,
 )
 from app.models.history import DeliveryEvent
+from app.models.security import AccessSession, SecurityAuditEvent
+
+__all__ = [
+    "Account",
+    "TrafficObservation",
+    "AccessSession",
+    "SecurityAuditEvent",
+    "Courier",
+    "CourierCredential",
+    "CustomerChatRateLimitWindow",
+    "CustomerNotificationChannel",
+    "CustomerNotificationEvent",
+    "CustomerNotificationOutbox",
+    "CustomerNotificationStatus",
+    "CourierStatus",
+    "DeliveryEvent",
+    "DeliveryEventType",
+    "DeliveryPoint",
+    "DeliveryPointStatus",
+    "LocationEvent",
+    "Notification",
+    "NotificationKind",
+    "Route",
+    "RouteRevision",
+    "RouteGeometryProvider",
+    "RouteStatus",
+]
