@@ -63,3 +63,67 @@ class ScenarioGenerator:
 
         def uniform() -> GeoPoint:
             return GeoPoint(rng.uniform(lat_min, lat_max), rng.uniform(lng_min, lng_max))
+
+        def clustered() -> GeoPoint:
+            lat, lng = rng.choice(_BARRIOS)
+            return GeoPoint(
+                min(lat_max, max(lat_min, rng.gauss(lat, 0.004))),
+                min(lng_max, max(lng_min, rng.gauss(lng, 0.004))),
+            )
+
+        make = clustered if layout == "clustered" else uniform
+        return Scenario(
+            f"{couriers}c-{stops}s-{layout}",
+            layout,
+            tuple(uniform() for _ in range(couriers)),
+            tuple(make() for _ in range(stops)),
+        )
+
+
+def street_matrix(points: list[GeoPoint]) -> CostMatrix:
+    """Minutes through a street grid: Manhattan distance at a typical city speed."""
+    ref_cos = math.cos(math.radians(1.21))
+
+    def minutes(a: GeoPoint, b: GeoPoint) -> float:
+        dy = abs(a.lat - b.lat) * 111_320.0
+        dx = abs(a.lng - b.lng) * 111_320.0 * ref_cos
+        return (dx + dy) / STREET_SPEED_M_PER_MIN
+
+    return CostMatrix([[0.0 if a is b else minutes(a, b) for b in points] for a in points])
+
+
+@dataclass(frozen=True, slots=True)
+class BenchmarkRow:
+    scenario: str
+    baseline: PlanScore
+    reoptimized: PlanScore
+
+    @property
+    def objective_gain(self) -> float:
+        return self.baseline.objective() - self.reoptimized.objective()
+
+
+class BaselinePlanner:
+    """The dispatch pipeline as it is today, run on a synthetic scenario."""
+
+    def plan(self, scenario: Scenario) -> tuple[Fleet, CostMatrix]:
+        points = [*scenario.couriers, *scenario.stops]
+        matrix = street_matrix(points)
+        c_count = len(scenario.couriers)
+        courier_ids = [f"c{i}" for i in range(c_count)]
+        stop_ids = [f"s{i}" for i in range(len(scenario.stops))]
+        travel = {
+            (courier_ids[c], stop_ids[s]): matrix.cost(c, c_count + s)
+            for c in range(c_count)
+            for s in range(len(stop_ids))
+        }
+        assigned = assign_orders(
+            [
+                CourierPosition(cid, Coordinates(p.lat, p.lng))
+                for cid, p in zip(courier_ids, scenario.couriers, strict=True)
+            ],
+            [
+                OrderPoint(sid, Coordinates(p.lat, p.lng))
+                for sid, p in zip(stop_ids, scenario.stops, strict=True)
+            ],
+            AssignOrdersOptions(travel_costs_minutes=travel),
