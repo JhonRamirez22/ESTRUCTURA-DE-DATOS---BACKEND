@@ -52,3 +52,57 @@ class TwoOptSolver(RouteSolver):
     name = "2-opt"
 
     def improve(self, matrix: CostMatrix, order: Sequence[int]) -> list[int]:
+        nodes = list(order)
+        sub = matrix.submatrix(nodes)
+        return [nodes[i] for i in two_opt(sub.rows, list(range(len(nodes))))]
+
+
+class OrOptSolver(RouteSolver):
+    name = "or-opt"
+
+    def improve(self, matrix: CostMatrix, order: Sequence[int]) -> list[int]:
+        nodes = list(order)
+        sub = matrix.submatrix(nodes)
+        return [nodes[i] for i in or_opt(sub.rows, list(range(len(nodes))))]
+
+
+class RefinementSolver(RouteSolver):
+    """Held-Karp when small enough to be exact, iterated local search otherwise."""
+
+    name = "refine"
+
+    def improve(self, matrix: CostMatrix, order: Sequence[int]) -> list[int]:
+        nodes = list(order)
+        sub = matrix.submatrix(nodes)
+        return [nodes[i] for i in refine_route(sub.rows, list(range(len(nodes)))).route]
+
+
+class RoutePipeline:
+    """Runs solvers in order, keeping the best order found and never regressing."""
+
+    def __init__(self, solvers: Sequence[RouteSolver]) -> None:
+        if not solvers:
+            raise ValueError("A pipeline needs at least one solver.")
+        self._solvers = tuple(solvers)
+
+    @classmethod
+    def standard(cls) -> RoutePipeline:
+        return cls([TwoOptSolver(), OrOptSolver(), RefinementSolver()])
+
+    def improve(self, matrix: CostMatrix, order: Sequence[int]) -> SolverResult:
+        start = list(order)
+        best = SolverResult(start, matrix.path_cost(start), "current")
+        if len(start) < 3:
+            return best
+        seeds: list[tuple[str, list[int]]] = [
+            ("current", start),
+            ("nearest-neighbor", NearestNeighborSolver().improve(matrix, start)),
+        ]
+        for seed_name, seed in seeds:
+            candidate = list(seed)
+            for solver in self._solvers:
+                candidate = solver.improve(matrix, candidate)
+            cost = matrix.path_cost(candidate)
+            if cost < best.cost - 1e-9:
+                best = SolverResult(candidate, cost, f"{seed_name} → {self._solvers[-1].name}")
+        return best
