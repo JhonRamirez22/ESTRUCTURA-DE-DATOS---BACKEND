@@ -51,3 +51,56 @@ class CustomerChatRateLimiter:
         cutoff = now - self._window_seconds
         guide_digest = hashlib.sha256(guide.encode("utf-8")).digest()
         requests = self._requests.setdefault(guide_digest, deque())
+        while requests and requests[0] <= cutoff:
+            requests.popleft()
+
+        if len(requests) >= self._max_requests:
+            return max(1, math.ceil(requests[0] + self._window_seconds - now))
+
+        requests.append(now)
+        self._checks_since_cleanup += 1
+        if (
+            self._checks_since_cleanup >= _CLEANUP_EVERY_CHECKS
+            or len(self._requests) > _MAX_TRACKED_GUIDES
+        ):
+            self._remove_expired(cutoff)
+            self._checks_since_cleanup = 0
+        return None
+
+    async def retry_after_shared(
+        self,
+        session: AsyncSession,
+        guide: str,
+        *,
+        hmac_secret: str,
+        now: datetime | None = None,
+    ) -> int | None:
+        """Registra el turno en PostgreSQL/SQLite con UPSERT atómico compartido.
+
+        HMAC evita persistir la guía y evita que una filtración de la tabla permita
+        comprobar guías candidatas sin conocer el secreto de autenticación.
+        """
+        if not hmac_secret:
+            raise ValueError("AUTH_SECRET debe configurarse para limitar el chat.")
+
+        instant = _as_naive_utc(now or datetime.now(UTC))
+        cutoff = instant - timedelta(seconds=self._window_seconds)
+        guide_digest = hmac.new(
+            hmac_secret.encode("utf-8"),
+            guide.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        dialect_name = session.get_bind().dialect.name
+        insert_statement: Any
+        if dialect_name == "postgresql":
+            insert_statement = postgres_insert(CustomerChatRateLimitWindow)
+        elif dialect_name == "sqlite":
+            insert_statement = sqlite_insert(CustomerChatRateLimitWindow)
+        else:
+            raise RuntimeError("El límite compartido requiere PostgreSQL o SQLite.")
+
+        expired = CustomerChatRateLimitWindow.window_started_at <= cutoff
+        statement = (
+            insert_statement.values(
+                guide_hash=guide_digest,
+                window_started_at=instant,
