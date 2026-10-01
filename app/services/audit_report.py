@@ -82,3 +82,87 @@ def mask_email(value: str | None) -> str:
 def mask_phone(value: str | None) -> str:
     if not value:
         return "—"
+    return f"***{value[-3:]}" if len(value) > 3 else "***"
+
+
+def _cap(rows: list[list[str]], total: int) -> tuple[list[list[str]], str | None]:
+    if total <= MAX_ROWS:
+        return rows, None
+    return rows[:MAX_ROWS], f"Se muestran {MAX_ROWS} de {total} registros (los más recientes)."
+
+
+def _distance_km(events: Sequence[LocationEvent]) -> float:
+    total = 0.0
+    for before, after in zip(events, events[1:], strict=False):
+        step = haversine_m(before.lat, before.lng, after.lat, after.lng)
+        if step <= GPS_GAP_BREAK_M:
+            total += step
+    return total / 1000.0
+
+
+async def _security_section(
+    session: AsyncSession, account_id: UUID, begin: datetime, end: datetime
+) -> Section:
+    rows = (
+        await session.scalars(
+            select(SecurityAuditEvent)
+            .where(
+                SecurityAuditEvent.account_id == account_id,
+                SecurityAuditEvent.created_at >= begin,
+                SecurityAuditEvent.created_at < end,
+            )
+            .order_by(SecurityAuditEvent.created_at.desc())
+            .limit(MAX_ROWS + 1)
+        )
+    ).all()
+    total = len(rows)
+    table = [
+        [local(e.created_at), e.action, e.outcome, e.request_id[:8]] for e in rows[:MAX_ROWS]
+    ]
+    note = f"Se muestran los {MAX_ROWS} más recientes." if total > MAX_ROWS else None
+    return Section(
+        "Eventos de seguridad", ["Fecha (Bogotá)", "Acción", "Resultado", "Solicitud"],
+        table, [3, 4, 2, 2], note,
+    )
+
+
+async def _sessions_section(
+    session: AsyncSession, account_id: UUID, begin: datetime, end: datetime
+) -> Section:
+    rows = (
+        await session.scalars(
+            select(AccessSession)
+            .where(
+                AccessSession.account_id == account_id,
+                AccessSession.created_at >= begin,
+                AccessSession.created_at < end,
+            )
+            .order_by(AccessSession.created_at.desc())
+            .limit(MAX_ROWS)
+        )
+    ).all()
+    table = [
+        [local(s.created_at), local(s.last_seen_at), local(s.expires_at),
+         "Revocada " + local(s.revoked_at) if s.revoked_at else "—"]
+        for s in rows
+    ]
+    return Section(
+        "Sesiones de acceso", ["Inicio", "Última actividad", "Vence", "Revocación"],
+        table, [3, 3, 3, 3],
+    )
+
+
+async def collect_courier_report(
+    session: AsyncSession, courier_id: UUID, begin: datetime, end: datetime
+) -> ReportData | None:
+    courier = await session.get(Courier, courier_id)
+    if courier is None:
+        return None
+    account = await session.scalar(select(Account).where(Account.courier_id == courier_id))
+    events = (
+        await session.scalars(
+            select(LocationEvent)
+            .where(
+                LocationEvent.courier_id == courier_id,
+                LocationEvent.recorded_at >= begin,
+                LocationEvent.recorded_at < end,
