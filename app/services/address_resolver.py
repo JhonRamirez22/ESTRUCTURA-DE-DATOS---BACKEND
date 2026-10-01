@@ -34,3 +34,38 @@ async def resolve_address(
                 not re.search(rf"\b{direction}\b", normalized, re.I)
                 or re.search(rf"\b{direction}\b", proposed, re.I)
                 for direction in ("sur", "norte", "este", "oeste")
+            )
+            if (
+                len(proposed) <= 160
+                and interpretation.is_in_pasto and interpretation.city.casefold() == "pasto"
+                and interpretation.confidence >= 0.75 and numbers_match and directions_match
+                and not contains_foreign_city_reference(proposed)
+            ):
+                candidates = await geocoder.search(_street_number_query(proposed))
+                normalized, source = proposed, "ai+tomtom"
+            else:
+                warning = "La interpretación no es suficientemente fiable; completa la dirección."
+        except AddressAiError:
+            warning = "La IA no respondió; conserva el texto y completa la dirección o usa el mapa."
+    if not candidates and warning is None:
+        warning = "No hay coincidencias verificadas; completa la dirección o selecciona en el mapa."
+    full_number = re.search(r"#\s*\d+\w*\s*(?:sur|norte)?\s*[- ]\s*\d+", normalized, re.I)
+    if not full_number:
+        candidates = [
+            replace(item, precision="approximate") if item.precision == "address" else item
+            for item in candidates
+        ]
+    if candidates and any(item.precision != "address" for item in candidates):
+        warning = "Ubicación aproximada o intersección: confirma el punto antes de guardar."
+    return {
+        "candidates": [item.as_dict() for item in candidates], "source": source,
+        "normalizedAddress": normalized, "warning": warning,
+    }
+
+
+def _street_number_query(address: str) -> str:
+    # TomTom entiende mejor la numeración colombiana cuando se explicita el guion de placa.
+    return re.sub(
+        r"(#\s*\d+[a-z]?\s*(?:(?:sur|norte)\s*)?)\s+(\d+[a-z]?)(?=\s*(?:,|$))",
+        r"\1-\2", address, flags=re.I,
+    )
