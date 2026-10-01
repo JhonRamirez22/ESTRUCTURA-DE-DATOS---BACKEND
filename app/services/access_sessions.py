@@ -46,3 +46,51 @@ def csrf_token(token: str, secret: str) -> str:
     return hmac.new(
         secret.encode("utf-8"), b"csrf:v1:" + token.encode(), hashlib.sha256
     ).hexdigest()
+
+
+def csrf_matches(token: str, supplied: str | None, secret: str) -> bool:
+    return (
+        isinstance(supplied, str)
+        and re.fullmatch(r"[0-9a-f]{64}", supplied) is not None
+        and hmac.compare_digest(csrf_token(token, secret), supplied)
+    )
+
+
+async def create_access_session(
+    session: AsyncSession,
+    *,
+    account_id: UUID | None = None,
+    delivery_point_id: UUID | None = None,
+    now: datetime | None = None,
+) -> str:
+    if (account_id is None) == (delivery_point_id is None):
+        raise ValueError("Una sesión debe pertenecer a una cuenta o a un único pedido")
+    instant = now or utc_now()
+    raw_token = secrets.token_urlsafe(32)
+    session.add(
+        AccessSession(
+            token_digest=token_digest(raw_token),
+            account_id=account_id,
+            delivery_point_id=delivery_point_id,
+            created_at=instant,
+            expires_at=instant + (
+                STAFF_SESSION_LIFETIME if account_id else TRACKING_SESSION_LIFETIME
+            ),
+            last_seen_at=instant,
+        )
+    )
+    await session.flush()
+    return raw_token
+
+
+async def resolve_access_session(
+    session: AsyncSession,
+    token: str | None,
+    *,
+    tracking: bool = False,
+    now: datetime | None = None,
+) -> SessionIdentity | None:
+    if not token or not _TOKEN_PATTERN.fullmatch(token):
+        return None
+    result = await session.execute(
+        select(AccessSession, Account)
