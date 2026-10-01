@@ -58,3 +58,63 @@ async def estimate_first_leg_with_traffic(
     route_id: UUID,
     next_stop_id: UUID,
     start: Coordinate,
+    end: Coordinate,
+    base_duration_minutes: float | None,
+    base_distance_meters: float | None,
+    route_provider: RouteProvider,
+    traffic_provider: TrafficProvider | None,
+    road_route: RouteResult | None = None,
+    require_road_route: bool = False,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> FirstLegTrafficEstimate:
+    """Use TomTom on one verified leg; preserve base road ETA on provider failures."""
+    needs_geometry = traffic_provider is not None or require_road_route
+    if road_route is None and needs_geometry:
+        try:
+            candidate = await route_provider.get_route([start, end])
+            if candidate["geometry_provider"] in {"OSRM", "ORS"}:
+                road_route = candidate
+        except Exception as error:
+            _LOGGER.warning(
+                "No se pudo obtener geometría vial para el ETA del cliente",
+                extra={"error_type": type(error).__name__},
+            )
+
+    duration = (
+        road_route["duration_minutes"] if road_route is not None else base_duration_minutes
+    )
+    distance = road_route["distance_meters"] if road_route is not None else base_distance_meters
+
+    if traffic_provider is None:
+        return FirstLegTrafficEstimate(
+            duration,
+            distance,
+            road_route,
+            configured=False,
+            applied=False,
+            closed=False,
+            status="NOT_CONFIGURED",
+            warning="TomTom no está configurado; el ETA usa tiempos viales base.",
+        )
+    if road_route is None:
+        return _unavailable_estimate(
+            duration,
+            distance,
+            None,
+            "No se pudo verificar el primer tramo; se conserva el ETA vial base.",
+        )
+
+    samples = sample_route_leg_points(road_route["geometry"], [start, end])
+    if len(samples) != 1:
+        return _unavailable_estimate(
+            duration,
+            distance,
+            road_route,
+            "No se pudo ubicar un punto de tráfico en el primer tramo; "
+            "se conserva el ETA vial base.",
+        )
+
+    try:
+        traffic = await _get_flow(
+            route_id,
+            next_stop_id,
