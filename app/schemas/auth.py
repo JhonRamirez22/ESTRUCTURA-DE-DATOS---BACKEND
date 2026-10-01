@@ -39,3 +39,43 @@ class EmailLoginRequest(BaseModel):
         return AccountCredentials.normalize_email(value)
 
 
+class PasswordChangeRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    current_password: SecretStr = Field(alias="currentPassword", min_length=1, max_length=128)
+    new_password: SecretStr = Field(alias="newPassword", min_length=15, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def reject_common_password(cls, value: SecretStr) -> SecretStr:
+        return AccountCredentials.reject_common_password(value)
+
+
+class CourierAccountRequest(AccountCredentials):
+    courier_id: str = Field(alias="courierId")
+
+
+class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    access_code: str = Field(alias="accessCode", min_length=1, max_length=512)
+    return_to: str | None = Field(default=None, alias="returnTo")
+
+
+class LoginResponse(BaseModel):
+    authenticated: bool
+    redirect_to: str = Field(serialization_alias="redirectTo")
+    access_token: str | None = Field(default=None, serialization_alias="accessToken")
+
+
+class SessionResponse(BaseModel):
+    authenticated: bool
+
+
+class PageAccessResponse(BaseModel):
+    allowed: bool
+    redirect_to: str | None = Field(default=None, serialization_alias="redirectTo")
+
+
+class LogoutResponse(BaseModel):
+    ok: bool
