@@ -64,3 +64,68 @@ class CourierResponse(BaseModel):
     courier: CourierView
 
 
+class CourierCreatedResponse(BaseModel):
+    courier: CourierView
+    access_code: str | None = Field(default=None, serialization_alias="accessCode")
+
+
+class CourierLocationInput(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    lat: float = Field(strict=True, ge=-90, le=90)
+    lng: float = Field(strict=True, ge=-180, le=180)
+    recorded_at: str | None = Field(default=None, validation_alias="recordedAt")
+
+
+class LocationEventView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    courier_id: UUID = Field(serialization_alias="courierId")
+    lat: float
+    lng: float
+    recorded_at: datetime = Field(serialization_alias="recordedAt")
+
+    @field_serializer("recorded_at")
+    def serialize_recorded_at(self, value: datetime) -> str:
+        result = _serialize_utc(value)
+        if result is None:
+            raise ValueError("recordedAt no puede ser nulo")
+        return result
+
+
+class LocationEventResponse(BaseModel):
+    location_event: LocationEventView = Field(serialization_alias="locationEvent")
+    accepted: bool
+
+
+class CourierSelfView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    status: CourierStatus
+    current_lat: float | None = Field(serialization_alias="currentLat")
+    current_lng: float | None = Field(serialization_alias="currentLng")
+    last_location_at: datetime | None = Field(serialization_alias="lastLocationAt")
+
+    @field_serializer("last_location_at")
+    def serialize_last_location(self, value: datetime | None) -> str | None:
+        return _serialize_utc(value)
+
+
+class CourierSelfResponse(BaseModel):
+    courier: CourierSelfView
+
+
+class CourierStoppedResponse(BaseModel):
+    courier: CourierSelfView
+
+
+class ErrorResponse(BaseModel):
+    error: str
+
+
+def _serialize_utc(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return normalized.isoformat(timespec="milliseconds").replace("+00:00", "Z")
