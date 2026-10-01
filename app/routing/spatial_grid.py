@@ -49,3 +49,53 @@ class SpatialGrid[Id: Hashable]:
         del bucket[item_id]
         if not bucket:
             del self._cells[cell]
+
+    def __len__(self) -> int:
+        return len(self._where)
+
+    def __contains__(self, item_id: object) -> bool:
+        return item_id in self._where
+
+    def nearest(
+        self,
+        point: GeoPoint,
+        k: int,
+        *,
+        max_metres: float = math.inf,
+        exclude: Id | None = None,
+    ) -> list[tuple[Id, float]]:
+        """Up to ``k`` closest items as ``(id, metres)`` sorted by distance, then by id."""
+        if k < 1 or not self._where:
+            return []
+        origin = self._cell_of(point)
+        found: list[tuple[float, str, Id]] = []
+        max_ring = int(min(max_metres / self._cell, 10_000)) + 1
+        ring = 0
+        while ring <= max_ring:
+            for cell in self._ring_cells(origin, ring):
+                for item_id, item_point in self._cells.get(cell, {}).items():
+                    if item_id == exclude:
+                        continue
+                    distance = point.distance_to(item_point)
+                    if distance <= max_metres:
+                        found.append((distance, repr(item_id), item_id))
+            found.sort(key=lambda entry: (entry[0], entry[1]))
+            del found[k:]
+            # Anything in the next ring is at least ``ring * cell`` metres away.
+            if len(found) == k and found[-1][0] <= ring * self._cell:
+                break
+            if len(found) >= len(self._where) - (1 if exclude in self._where else 0):
+                break
+            ring += 1
+        return [(item_id, distance) for distance, _, item_id in found]
+
+    @staticmethod
+    def _ring_cells(origin: tuple[int, int], ring: int) -> list[tuple[int, int]]:
+        ox, oy = origin
+        if ring == 0:
+            return [origin]
+        cells = [(ox + dx, oy - ring) for dx in range(-ring, ring + 1)]
+        cells += [(ox + dx, oy + ring) for dx in range(-ring, ring + 1)]
+        cells += [(ox - ring, oy + dy) for dy in range(-ring + 1, ring)]
+        cells += [(ox + ring, oy + dy) for dy in range(-ring + 1, ring)]
+        return cells
