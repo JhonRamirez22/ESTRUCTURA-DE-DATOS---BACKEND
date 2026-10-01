@@ -61,3 +61,65 @@ class AddressGeocoder:
         if timeout_ms <= 0:
             raise ValueError("El timeout de geocodificación debe ser positivo.")
         self._api_key = api_key.strip()
+        self._timeout_seconds = timeout_ms / 1_000
+        self._transport = transport
+
+    async def search(self, address: str) -> list[AddressSuggestion]:
+        query = normalize_pasto_address(address)
+        if len(query) < 3:
+            return []
+        if contains_foreign_city_reference(query):
+            return []
+        if not re.search(r"\bpasto\b", query, flags=re.IGNORECASE):
+            query = f"{query}, Pasto, Nariño, Colombia"
+
+        params = {
+            "key": self._api_key,
+            "countrySet": "CO",
+            "topLeft": f"{MAX_LATITUDE},{MIN_LONGITUDE}",
+            "btmRight": f"{MIN_LATITUDE},{MAX_LONGITUDE}",
+            "limit": str(MAX_ADDRESS_RESULTS),
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._timeout_seconds,
+                transport=self._transport,
+            ) as client:
+                response = await client.get(
+                    f"{TOMTOM_GEOCODE_URL}/{quote(query, safe='')}.json",
+                    params=params,
+                )
+        except httpx.TimeoutException as error:
+            raise AddressGeocoderError(
+                "La búsqueda de dirección excedió el tiempo límite.", 504
+            ) from error
+        except httpx.HTTPError as error:
+            raise AddressGeocoderError(
+                "No se pudo conectar con el servicio de direcciones."
+            ) from error
+
+        if response.status_code == 429:
+            raise AddressGeocoderError(
+                "TomTom alcanzó su límite de búsquedas; inténtalo luego.", 429
+            )
+        if not response.is_success:
+            raise AddressGeocoderError(
+                f"El servicio de direcciones respondió HTTP {response.status_code}."
+            )
+
+        try:
+            payload: object = response.json()
+        except ValueError as error:
+            raise AddressGeocoderError(
+                "El servicio de direcciones devolvió una respuesta inválida."
+            ) from error
+        return self._parse_suggestions(payload)
+
+    @staticmethod
+    def _parse_suggestions(payload: object) -> list[AddressSuggestion]:
+        if not isinstance(payload, Mapping):
+            raise AddressGeocoderError(
+                "El servicio de direcciones devolvió una respuesta inválida."
+            )
+        results = payload.get("results")
+        if not isinstance(results, list):
