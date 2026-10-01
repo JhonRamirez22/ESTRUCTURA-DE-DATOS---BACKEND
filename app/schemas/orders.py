@@ -65,3 +65,69 @@ class OrderCreateRequest(BaseModel):
     customer_email: str | None = Field(
         default=None, max_length=320, validation_alias="customerEmail"
     )
+    email_notifications_enabled: bool = Field(
+        default=False, validation_alias="emailNotificationsEnabled"
+    )
+    customer_phone: str | None = Field(
+        default=None, max_length=30, validation_alias="customerPhone"
+    )
+    sms_notifications_enabled: bool = Field(
+        default=False, validation_alias="smsNotificationsEnabled"
+    )
+
+    @field_validator("address")
+    @classmethod
+    def _address_text(cls, value: str | None) -> str | None:
+        return _check_text(value, "address", MAX_ADDRESS_LENGTH)
+
+    @field_validator("order_id")
+    @classmethod
+    def _order_id_text(cls, value: str | None) -> str | None:
+        return _check_text(value, "orderId", MAX_ORDER_ID_LENGTH)
+
+    @field_validator("time_window")
+    @classmethod
+    def _time_window_size(cls, value: JsonValue | None) -> JsonValue | None:
+        return _check_time_window(value)
+
+    @field_validator("scheduled_for")
+    @classmethod
+    def _schedule_in_range(cls, value: datetime | None) -> datetime | None:
+        return DeliverySchedule().parse(value)
+
+    @model_validator(mode="after")
+    def validate_email_consent(self) -> OrderCreateRequest:
+        if self.customer_email is not None:
+            self.customer_email = normalize_email(self.customer_email)
+        if self.email_notifications_enabled and self.customer_email is None:
+            raise ValueError("Se requiere customerEmail para activar avisos por correo.")
+        if not self.email_notifications_enabled:
+            # No retenemos datos de contacto que el cliente no autorizó usar.
+            self.customer_email = None
+        if self.sms_notifications_enabled:
+            if self.customer_phone is None:
+                raise ValueError("Se requiere customerPhone para activar avisos por SMS.")
+            self.customer_phone = _normalize_colombian_mobile(self.customer_phone)
+        else:
+            # El backend no retiene un teléfono si el cliente no autorizó SMS.
+            self.customer_phone = None
+        return self
+
+
+class OrderRequestCreate(BaseModel):
+    """Solicitud pública de un cliente: solo dirección y punto; ningún dato personal."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    address: str = Field(min_length=5, max_length=MAX_ADDRESS_LENGTH)
+    lat: _Latitude
+    lng: _Longitude
+
+    @field_validator("address")
+    @classmethod
+    def _address_text(cls, value: str) -> str:
+        text = plain_text(value, max_length=MAX_ADDRESS_LENGTH, field="address")
+        # Entrada anónima: una dirección nunca necesita marcado.
+        if "<" in text or ">" in text:
+            raise ValueError("address contiene caracteres no permitidos.")
+        return text
