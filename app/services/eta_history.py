@@ -47,3 +47,51 @@ def _build(rows: Sequence[TrafficObservation]) -> tuple[HourlyProfile, dict[str,
     result = backtest(observations)
     simulated = sum(r.from_stop.startswith(SIMULATED_PREFIX) for r in rows)
     meta = {
+        "observations": len(rows),
+        "simulatedShare": round(simulated / len(rows), 2) if rows else 0.0,
+        "backtest": {
+            "tested": result.tested,
+            "maeProfile": round(result.mae_profile, 3),
+            "maeFreeFlow": round(result.mae_free_flow, 3),
+            "improves": result.improves,
+        },
+    }
+    return HourlyProfile(observations), meta
+
+
+async def historical_eta(
+    repository: Any, stops: Sequence[StopForEta], now: datetime
+) -> dict[str, Any] | None:
+    """Predicción por parada, o ``None`` si no hay historial utilizable."""
+    global _CACHE  # noqa: PLW0603 - caché del perfil por proceso, con vencimiento
+    clock = time.monotonic()
+    if _CACHE is None or clock - _CACHE.built_at > PROFILE_TTL_SECONDS:
+        rows = await repository.list_recent_traffic_observations(
+            now - timedelta(days=HISTORY_DAYS)
+        )
+        if not rows:
+            return None
+        profile, meta = _build(rows)
+        _CACHE = _Cached(clock, profile, meta)
+    profile, meta = _CACHE.profile, _CACHE.meta
+    per_stop: dict[str, dict[str, Any]] = {}
+    for stop in stops:
+        if stop.base_minutes is None:
+            continue
+        minutes, prediction = profile.predict_minutes(stop.base_minutes, stop.lat, stop.lng, now)
+        if prediction.level == "none":
+            continue
+        per_stop[stop.stop_id] = {
+            "minutes": round(minutes, 1),
+            "multiplier": round(prediction.multiplier, 2),
+            "level": prediction.level,
+            "samples": prediction.samples,
+        }
+    if not per_stop:
+        return None
+    return {"summary": meta, "perStop": per_stop}
+
+
+def reset_cache() -> None:
+    global _CACHE  # noqa: PLW0603
+    _CACHE = None
