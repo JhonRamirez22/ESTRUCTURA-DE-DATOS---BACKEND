@@ -85,3 +85,89 @@ class SmtpEmailSender:
         email_message["From"] = settings.notification_from_email or ""
         email_message["To"] = message.recipient
         email_message["Subject"] = message.subject
+        email_message.set_content(message.text_body)
+        timeout = settings.notification_smtp_timeout_ms / 1_000
+        context = ssl.create_default_context()
+
+        if settings.notification_smtp_port == 465:
+            with smtplib.SMTP_SSL(
+                host,
+                settings.notification_smtp_port,
+                timeout=timeout,
+                context=context,
+            ) as client:
+                self._authenticate(client)
+                client.send_message(email_message)
+            return
+
+        with smtplib.SMTP(
+            host,
+            settings.notification_smtp_port,
+            timeout=timeout,
+        ) as client:
+            client.starttls(context=context)
+            self._authenticate(client)
+            client.send_message(email_message)
+
+    def _authenticate(self, client: smtplib.SMTP) -> None:
+        username = (self._settings.notification_smtp_username or "").strip()
+        password = self._settings.notification_smtp_password
+        if username and password is not None:
+            client.login(username, password.get_secret_value())
+
+
+class TwilioSmsSender:
+    """Envía SMS mediante HTTPS; el número solo llega al proveedor con opt-in."""
+
+    _API_ROOT = "https://api.twilio.com/2010-04-01/Accounts"
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self._settings = settings
+        self._transport = transport
+
+    def send(self, message: CustomerSms) -> None:
+        settings = self._settings
+        account_sid = (settings.notification_sms_twilio_account_sid or "").strip()
+        auth_token = settings.notification_sms_twilio_auth_token
+        from_phone = (settings.notification_sms_twilio_from_phone or "").strip()
+        if not customer_sms_delivery_configured(settings):
+            raise ValueError("La configuración SMS de Twilio está incompleta.")
+        if not _E164_PATTERN.fullmatch(message.recipient):
+            raise ValueError("El teléfono destinatario no está en formato E.164.")
+
+        with httpx.Client(
+            timeout=settings.notification_sms_timeout_ms / 1_000,
+            transport=self._transport,
+            follow_redirects=False,
+        ) as client:
+            response = client.post(
+                f"{self._API_ROOT}/{account_sid}/Messages.json",
+                auth=(account_sid, auth_token.get_secret_value() if auth_token else ""),
+                data={"From": from_phone, "To": message.recipient, "Body": message.text_body},
+            )
+        response.raise_for_status()
+
+
+def customer_email_delivery_configured(settings: Settings | None = None) -> bool:
+    active_settings = settings or get_settings()
+    host = (active_settings.notification_smtp_host or "").strip()
+    sender = (active_settings.notification_from_email or "").strip()
+    username = (active_settings.notification_smtp_username or "").strip()
+    password = active_settings.notification_smtp_password
+    has_password = password is not None and bool(password.get_secret_value())
+    return bool(
+        host
+        and sender
+        and "\r" not in sender
+        and "\n" not in sender
+        and 1 <= active_settings.notification_smtp_port <= 65_535
+        and active_settings.notification_smtp_timeout_ms > 0
+        and bool(username) == has_password
+    )
+
+
