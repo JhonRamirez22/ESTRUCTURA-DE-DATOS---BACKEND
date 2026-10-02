@@ -58,3 +58,62 @@ class CourierView:
 class PendingView:
     ident: str
     lat: float
+    lng: float
+
+
+def _minutes_since(moment: datetime | None, now: datetime) -> float | None:
+    if moment is None:
+        return None
+    return max(0.0, (now - moment).total_seconds() / 60.0)
+
+
+def build_suggestions(
+    couriers: Sequence[CourierView], pending: Sequence[PendingView], now: datetime
+) -> list[dict[str, Any]]:
+    """Sugerencias deterministas, las más urgentes primero. No llama a ningún servicio."""
+    found: list[tuple[int, dict[str, Any]]] = []
+    for courier in couriers:
+        age = _minutes_since(courier.last_location_at, now)
+        has_position = courier.lat is not None and courier.lng is not None
+        if courier.status == CourierStatus.ON_ROUTE and (
+            age is None or age >= STALE_ON_ROUTE_MINUTES
+        ):
+            minutes = None if age is None else round(age)
+            text = (
+                f"{courier.name} va en ruta pero no ha enviado ubicación."
+                if minutes is None
+                else f"{courier.name} va en ruta y no envía ubicación hace {minutes} min."
+            )
+            found.append((0, _card(courier, "stale_gps", "warning", text, {"minutes": minutes})))
+        elif courier.status == CourierStatus.AVAILABLE and (
+            not has_position or age is None or age > FRESH_MINUTES
+        ):
+            if pending:
+                found.append((
+                    2,
+                    _card(
+                        courier,
+                        "no_position",
+                        "info",
+                        f"{courier.name} está libre pero sin ubicación reciente: "
+                        "no entrará en el reparto.",
+                        {},
+                    ),
+                ))
+        elif courier.status == CourierStatus.AVAILABLE and has_position and pending:
+            lat, lng = courier.lat or 0.0, courier.lng or 0.0
+            ranked = sorted(
+                ((haversine_m(lat, lng, p.lat, p.lng), p) for p in pending), key=lambda x: x[0]
+            )
+            near = [item for item in ranked if item[0] <= NEARBY_RADIUS_M][:MAX_ORDERS_PER_ACTION]
+            if near:
+                nearest = round(near[0][0])
+                text = (
+                    f"{courier.name} está libre y tiene {len(near)} "
+                    f"{'pedido' if len(near) == 1 else 'pedidos'} cerca "
+                    f"(el más próximo a {nearest} m)."
+                )
+                card = _card(
+                    courier, "idle_courier", "action", text,
+                    {"orders": len(near), "nearestMeters": nearest},
+                )
