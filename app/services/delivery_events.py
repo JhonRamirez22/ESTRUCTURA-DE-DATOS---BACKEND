@@ -48,3 +48,53 @@ _STATUS_EVENT = {
 
 class DeliveryEventRecorder:
     """Adds :class:`DeliveryEvent` rows for the shipments a request touches."""
+
+    def __init__(self, session: AsyncSession, clock: Callable[[], datetime] = utc_now) -> None:
+        self._session = session
+        self._clock = clock
+
+    def record(
+        self,
+        point: DeliveryPoint,
+        event_type: DeliveryEventType,
+        actor: EventActor = SYSTEM_ACTOR,
+        *,
+        from_status: str | None = None,
+        to_status: str | None = None,
+        route_id: UUID | None = None,
+        courier_id: UUID | None = None,
+        detail: str | None = None,
+        keep_link: bool = True,
+    ) -> DeliveryEvent:
+        event = DeliveryEvent(
+            delivery_point_id=point.id if keep_link else None,
+            order_ref=point.order_id,
+            event_type=event_type.value,
+            from_status=from_status,
+            to_status=to_status,
+            route_id=route_id if route_id is not None else point.route_id,
+            courier_id=courier_id,
+            actor_role=actor.role,
+            actor_account_id=actor.account_id,
+            detail=detail[:200] if detail else None,
+            occurred_at=self._clock(),
+        )
+        self._session.add(event)
+        return event
+
+    def created(self, point: DeliveryPoint, actor: EventActor) -> None:
+        self.record(point, DeliveryEventType.CREATED, actor, to_status=point.status.value)
+        if point.scheduled_for is not None:
+            self.record(
+                point, DeliveryEventType.SCHEDULED, actor, detail=_when(point.scheduled_for)
+            )
+
+    def status_changed(
+        self,
+        point: DeliveryPoint,
+        previous: str,
+        new: str,
+        actor: EventActor,
+        *,
+        courier_id: UUID | None = None,
+    ) -> None:
