@@ -64,3 +64,68 @@ _OPERATIONAL_TABLES = (
     CustomerNotificationOutbox,
     Notification,
     LocationEvent,
+    RouteRevision,
+    DeliveryPoint,
+    Route,
+    Courier,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SeedSummary:
+    couriers: int
+    orders_created: int
+    accounts: int
+
+
+def demo_id(name: str) -> uuid.UUID:
+    return uuid.uuid5(DEMO_NAMESPACE, name)
+
+
+async def seed_demo(
+    session: AsyncSession,
+    *,
+    now: datetime,
+    dispatcher_password: str | None = None,
+    courier_password: str | None = None,
+) -> SeedSummary:
+    """Crea o refresca los datos de demo. Es idempotente: no duplica ni pisa rutas existentes."""
+    for _name, _phone, lat, lng in DEMO_COURIERS:
+        _require_inside_pasto(lat, lng)
+    for _address, lat, lng in DEMO_ORDERS:
+        _require_inside_pasto(lat, lng)
+
+    for name, phone, lat, lng in DEMO_COURIERS:
+        courier = await session.get(Courier, demo_id(f"courier:{name}"))
+        if courier is None:
+            session.add(
+                Courier(
+                    id=demo_id(f"courier:{name}"), name=name, phone=phone,
+                    status=CourierStatus.AVAILABLE, current_lat=lat, current_lng=lng,
+                    last_location_at=now,
+                )
+            )
+        elif courier.status == CourierStatus.AVAILABLE:
+            # Reejecutar el script renueva el GPS vencido para la demostración.
+            courier.current_lat, courier.current_lng, courier.last_location_at = lat, lng, now
+
+    created = 0
+    for index, (address, lat, lng) in enumerate(DEMO_ORDERS, start=1):
+        order_id = f"DEMO-{index:03d}"
+        exists = await session.scalar(
+            select(DeliveryPoint.id).where(DeliveryPoint.order_id == order_id)
+        )
+        if exists is None:
+            session.add(
+                DeliveryPoint(
+                    id=demo_id(f"order:{order_id}"), address=address, lat=lat, lng=lng,
+                    status=DeliveryPointStatus.PENDING, order_id=order_id,
+                )
+            )
+            created += 1
+    await session.flush()
+
+    accounts = 0
+    if dispatcher_password:
+        accounts += await _upsert_account(
+            session, DISPATCHER_EMAIL, dispatcher_password, "dispatcher", None
