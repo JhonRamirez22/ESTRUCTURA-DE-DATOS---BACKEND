@@ -73,3 +73,78 @@ class FleetSnapshotBuilder:
             here = GeoPoint(courier.current_lat, courier.current_lng)
             locked_first = record.status == RouteStatus.IN_PROGRESS
             stops = [
+                Stop(str(p.id), GeoPoint(p.lat, p.lng), locked=locked_first and i == 0)
+                for i, p in enumerate(open_points)
+            ]
+            built.append(
+                Route(str(record.id), CourierState(str(courier.id), here), stops)
+            )
+        return _FleetSnapshot(Fleet(built), skipped)
+
+
+class LiveOptimizationService:
+    """Computes (and briefly caches) a :class:`FleetProposal` for the active routes."""
+
+    def __init__(
+        self,
+        matrix_provider: MatrixProvider,
+        route_provider: GeometryProvider,
+        *,
+        cache: TtlCache[str, dict[str, Any]] | None = None,
+    ) -> None:
+        self._matrix_provider = matrix_provider
+        self._route_provider = route_provider
+        self._cache = cache if cache is not None else _SHARED_CACHE
+        self._builder = FleetSnapshotBuilder()
+
+    async def snapshot(self, session: AsyncSession) -> dict[str, Any]:
+        records = await RouteRepository(session).list_routes(courier_id=None, status=None)
+        built = self._builder.build(records)
+        fleet = built.fleet
+        if len(fleet) == 0:
+            return self._envelope(None, [], built.skipped, "none", cached=False)
+        key = self._state_key(fleet)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return {**cached, "cached": True, "skippedRoutes": built.skipped}
+        index = fleet.index()
+        coordinates: list[Coordinate] = [point.as_lng_lat() for point in index.points]
+        started = datetime.now(UTC)
+        result = await self._matrix_provider.get_duration_matrix(coordinates)
+        matrix = CostMatrix(result["durations_minutes"])
+        proposal = await asyncio.to_thread(LiveFleetReoptimizer(fleet, matrix).propose)
+        geometries = await self._geometries(fleet, proposal)
+        payload = self._envelope(
+            proposal, geometries, built.skipped, str(result.get("source", "osrm")), cached=False
+        )
+        payload["computeMs"] = round((datetime.now(UTC) - started).total_seconds() * 1000)
+        self._cache.put(key, payload)
+        return payload
+
+    @staticmethod
+    def _state_key(fleet: Fleet) -> str:
+        parts = [
+            [
+                route.route_id,
+                [round(route.courier.location.lat, 3), round(route.courier.location.lng, 3)],
+                route.stop_ids,
+                route.locked_count,
+            ]
+            for route in fleet.routes
+        ]
+        return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
+
+    async def _geometries(
+        self, fleet: Fleet, proposal: FleetProposal
+    ) -> list[GeoJsonLineString | None]:
+        stops = {stop.stop_id: stop for route in fleet.routes for stop in route.stops}
+        out: list[GeoJsonLineString | None] = []
+        drawn = 0
+        for route_proposal in proposal.routes:
+            worth = route_proposal.changed and (
+                route_proposal.saved_minutes >= MIN_GEOMETRY_GAIN_MINUTES
+                or route_proposal.moved_in
+                or route_proposal.moved_out
+            )
+            if not worth or drawn >= MAX_GEOMETRY_ROUTES:
+                out.append(None)
