@@ -51,3 +51,55 @@ async def estimate_customer_order_eta(
     now: datetime | None = None,
 ) -> CustomerEtaResult | None:
     """Return this order ETA and its partial-traffic provenance, never a guessed ETA."""
+    route = delivery_point.route
+    if (
+        route is None
+        or route.status not in _ACTIVE_ROUTE_STATUSES
+        or delivery_point.status in _TERMINAL_POINT_STATUSES
+    ):
+        return None
+
+    current_time = now or datetime.now(UTC)
+    if current_time.tzinfo is not None:
+        current_time = current_time.astimezone(UTC).replace(tzinfo=None)
+    courier = route.courier
+    if (
+        courier.current_lat is None
+        or courier.current_lng is None
+        or not is_courier_location_fresh(courier.last_location_at, current_time)
+        or not is_within_pasto_service_area(courier.current_lat, courier.current_lng)
+    ):
+        return None
+
+    shared_position = (
+        _round_coordinate(courier.current_lng),
+        _round_coordinate(courier.current_lat),
+    )
+    remaining_points = sorted(
+        (
+            point
+            for point in route.delivery_points
+            if point.status not in _TERMINAL_POINT_STATUSES
+        ),
+        key=lambda point: (
+            point.sequence_index if point.sequence_index is not None else 2**31
+        ),
+    )
+    target_index = next(
+        (index for index, point in enumerate(remaining_points) if point.id == delivery_point.id),
+        None,
+    )
+    if target_index is None:
+        return None
+
+    coordinates: list[Coordinate] = [shared_position]
+    coordinates.extend((point.lng, point.lat) for point in remaining_points)
+    matrix_result = await matrix_provider.get_duration_matrix(coordinates)
+    durations = [list(row) for row in matrix_result["durations_minutes"]]
+    distances = matrix_result.get("distances_meters")
+    copied_distances = [list(row) for row in distances] if distances is not None else None
+    first_point = remaining_points[0]
+    first_leg = await estimate_first_leg_with_traffic(
+        route_id=route.id,
+        next_stop_id=first_point.id,
+        start=shared_position,
