@@ -62,3 +62,67 @@ class FleetReportBuilder:
             )).all()
         )
         events = dict(
+            (await self._session.execute(
+                select(DeliveryEvent.event_type, func.count())
+                .where(DeliveryEvent.occurred_at >= begin, DeliveryEvent.occurred_at < end)
+                .group_by(DeliveryEvent.event_type)
+            )).all()
+        )
+        routes = (
+            await self._session.scalars(
+                select(Route).where(Route.created_at >= begin, Route.created_at < end)
+            )
+        ).all()
+        with_base = [r for r in routes if r.baseline_duration_minutes is not None]
+        saved_min = sum(
+            max(0.0, (r.baseline_duration_minutes or 0) - r.estimated_duration_minutes)
+            for r in with_base if r.status != RouteStatus.CANCELLED
+        )
+        saved_km = sum(
+            max(0.0, (r.baseline_distance_meters or 0) - r.estimated_distance_meters) / 1000
+            for r in with_base if r.status != RouteStatus.CANCELLED
+        )
+        delivered = events.get(DeliveryEventType.DELIVERED.value, 0)
+        failed = events.get(DeliveryEventType.FAILED.value, 0)
+        rate = f"{100 * delivered / (delivered + failed):.0f} %" if delivered + failed else "—"
+        data = ReportData(
+            "Resumen de operación",
+            [
+                ("Envíos creados", str(sum(statuses.values()))),
+                ("Entregados / fallidos", f"{delivered} / {failed}"),
+                ("Tasa de éxito", rate),
+                ("Rutas creadas", str(len(routes))),
+                ("Ahorro por optimización", f"{saved_min:.0f} min · {saved_km:.1f} km"),
+            ],
+        )
+        data.sections.append(Section(
+            "Envíos creados por estado", ["Estado", "Envíos"],
+            [[s.value, str(statuses.get(s, 0))] for s in DeliveryPointStatus], [4, 2],
+        ))
+        data.sections.append(Section(
+            "Eventos del periodo", ["Evento", "Cantidad"],
+            [[k, str(v)] for k, v in sorted(events.items(), key=lambda kv: -kv[1])], [4, 2],
+        ))
+        data.sections.append(Section(
+            "Rutas del periodo", ["Creada", "Estado", "Est. min", "Base min", "Ahorro min"],
+            [
+                [local(r.created_at), r.status.value, _minutes(r.estimated_duration_minutes),
+                 _minutes(r.baseline_duration_minutes),
+                 _minutes(None if r.baseline_duration_minutes is None
+                          else r.baseline_duration_minutes - r.estimated_duration_minutes)]
+                for r in sorted(routes, key=lambda r: r.created_at, reverse=True)[:MAX_ROWS]
+            ],
+            [3, 3, 2, 2, 2],
+            f"Se muestran {MAX_ROWS} de {len(routes)} rutas." if len(routes) > MAX_ROWS else None,
+        ))
+        return data
+
+    # ---- courier performance ------------------------------------------------------------
+
+    async def couriers(self, begin: datetime, end: datetime) -> ReportData:
+        couriers = (await self._session.scalars(select(Courier).order_by(Courier.name))).all()
+        by_courier: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        rows = (await self._session.execute(
+            select(DeliveryEvent.courier_id, DeliveryEvent.event_type, func.count())
+            .where(DeliveryEvent.occurred_at >= begin, DeliveryEvent.occurred_at < end,
+                   DeliveryEvent.courier_id.is_not(None))
