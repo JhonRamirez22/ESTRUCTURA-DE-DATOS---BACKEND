@@ -57,3 +57,61 @@ class LocationEventQueue:
             self._jobs.enqueue(_Job(run=run_as_object, result=future))
             if not self._processing:
                 self._processing = True
+                # Se conserva la referencia: el bucle solo guarda referencias débiles a las tareas.
+                self._drain_task = loop.create_task(self._drain())
+        return cast(T, await future)
+
+    async def wait_until_idle(self) -> None:
+        """Espera a que terminen las escrituras aceptadas antes de cerrar PostgreSQL."""
+        await self._idle.wait()
+
+    async def _drain(self) -> None:
+        while True:
+            async with self._guard:
+                job = self._jobs.dequeue()
+                if job is None:
+                    self._processing = False
+                    self._idle.set()
+                    return
+            try:
+                result = await job.run()
+            except Exception as error:
+                if not job.result.done():
+                    job.result.set_exception(error)
+            else:
+                if not job.result.done():
+                    job.result.set_result(result)
+            finally:
+                async with self._guard:
+                    self._pending -= 1
+
+
+class ShardedLocationQueue:
+    """Varias colas FIFO: cada repartidor cae siempre en el mismo carril.
+
+    Solo hace falta ordenar las ubicaciones de un mismo repartidor entre sí; serializar a todos
+    en una única cola limitaba el servicio a lo que un solo escritor aguanta (≈250 GPS/s) y
+    respondía 503 por encima. Con carriles el rendimiento sube con las conexiones disponibles
+    y la contrapresión sigue siendo por carril.
+    """
+
+    def __init__(self, lanes: int = 8, max_pending_per_lane: int = DEFAULT_LOCATION_QUEUE_LIMIT):
+        if lanes < 1:
+            raise ValueError("lanes debe ser un entero positivo")
+        self._lanes = [LocationEventQueue(max_pending_per_lane) for _ in range(lanes)]
+
+    def lane_of(self, key: str) -> int:
+        # hash() de str cambia entre procesos, pero un repartidor solo necesita coherencia
+        # dentro del proceso que lo atiende.
+        return hash(key) % len(self._lanes)
+
+    @property
+    def pending_count(self) -> int:
+        return sum(lane.pending_count for lane in self._lanes)
+
+    async def enqueue[T](self, run: Callable[[], Awaitable[T]], key: str | None = None) -> T:
+        lane = self._lanes[self.lane_of(key) if key is not None else 0]
+        return await lane.enqueue(run)
+
+    async def wait_until_idle(self) -> None:
+        await asyncio.gather(*(lane.wait_until_idle() for lane in self._lanes))
