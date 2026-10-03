@@ -72,3 +72,77 @@ def _settings_credentials() -> tuple[str, str, str, int] | None:
     if not api_url or not api_key or not model:
         return None
     return api_url, api_key, model, settings.ai_traffic_timeout_ms
+
+
+def _text_credentials() -> tuple[str, str, str, int] | None:
+    """Groq solo para redactar: exige su permiso propio, no el de compartir ubicaciones."""
+    settings = get_settings()
+    if not settings.ai_text_phrasing_enabled:
+        return None
+    key = settings.customer_chat_api_key
+    api_url = (settings.customer_chat_api_url or "").strip()
+    model = (settings.customer_chat_model or "").strip()
+    api_key = key.get_secret_value().strip() if key is not None else ""
+    if not api_url or not api_key or not model:
+        return None
+    return api_url, api_key, model, settings.ai_traffic_timeout_ms
+
+
+async def _chat_json(
+    system: str,
+    payload: Mapping[str, Any],
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    text_only: bool = False,
+) -> dict[str, Any]:
+    credentials = _text_credentials() if text_only else _settings_credentials()
+    if credentials is None:
+        raise IntelligenceUnavailable("La IA no está configurada o no tiene permiso de datos.")
+    api_url, api_key, model, timeout_ms = credentials
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        "temperature": 0.1,
+        # Los modelos que razonan gastan parte del tope pensando: con poco margen la respuesta
+        # llega cortada y deja de ser JSON. El modo texto redacta varias frases a la vez.
+        "max_tokens": TEXT_MAX_TOKENS if text_only else 500,
+        "stream": False,
+    }
+    if text_only and "gpt-oss" in model:
+        body["reasoning_effort"] = "low"
+    try:
+        async with httpx.AsyncClient(timeout=timeout_ms / 1000, transport=transport) as client:
+            response = await client.post(
+                api_url, headers={"Authorization": f"Bearer {api_key}"}, json=body
+            )
+    except httpx.HTTPError as error:
+        record_incident("groq", "inteligencia:red")
+        raise IntelligenceUnavailable("No se pudo consultar a la IA.") from error
+    if not response.is_success:
+        record_incident("groq", f"inteligencia:http-{response.status_code}")
+        raise IntelligenceUnavailable(f"La IA respondió HTTP {response.status_code}.")
+    try:
+        content = str(response.json()["choices"][0]["message"]["content"]).strip()
+        if content.startswith("```"):
+            content = content.strip("`").removeprefix("json").strip()
+        parsed = json.loads(content)
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise IntelligenceUnavailable("La respuesta de la IA no es JSON válido.") from error
+    if not isinstance(parsed, dict):
+        raise IntelligenceUnavailable("La respuesta de la IA no es un objeto.")
+    return parsed
+
+
+def build_groups(pending: Sequence[PendingLocation]) -> list[dict[str, Any]]:
+    """Grupos candidatos deterministas, con distancias entre miembros en metros."""
+    pending = list(pending)[:MAX_GROUP_INPUT]
+    located = [Located(point.alias, point.lat, point.lng) for point in pending]
+    by_alias = {point.alias: point for point in pending}
+    groups = cluster_by_radius(located, GROUP_RADIUS_M, MAX_GROUP_SIZE)
+    result: list[dict[str, Any]] = []
+    for members in groups:
+        points = [by_alias[alias] for alias in members]
+        spread = max(
