@@ -56,3 +56,61 @@ def record_proposal(route_id: UUID, body: dict[str, object], *, cached: bool) ->
     if improvement_minutes is not None and improvement_minutes > 0 and body.get("changed") is True:
         _SAVED_MINUTES.append(improvement_minutes)
     _push_event(
+        {
+            "at": _now(),
+            "kind": "propuesta",
+            "routeAlias": route_alias(route_id),
+            "changed": body.get("changed") is True,
+            "improvementMinutes": improvement_minutes,
+            "trafficSegments": segments,
+            "aiApplied": _ai_applied(body),
+            "aiOrderAccepted": _ai_order(body, "accepted") is True,
+            "aiOrderSavingMinutes": _ai_order(body, "savingMinutes") or 0.0,
+        }
+    )
+
+
+def record_applied(route_id: UUID, body: dict[str, object]) -> None:
+    _COUNTERS["applied"] += 1
+    _push_event(
+        {
+            "at": _now(),
+            "kind": "aplicada",
+            "routeAlias": route_alias(route_id),
+            "changed": True,
+            "improvementMinutes": None,
+            "trafficSegments": _traffic_segments(body),
+            "aiApplied": _ai_applied(body),
+            "aiOrderAccepted": False,
+            "aiOrderSavingMinutes": 0.0,
+        }
+    )
+
+
+def recent_events(limit: int) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    for event in _EVENTS:
+        if len(events) >= limit:
+            break
+        events.append(event)
+    return events
+
+
+def record_incident(provider: str, kind: str) -> None:
+    """Guarda que un proveedor falló o se degradó; descarta lo más antiguo al llenarse."""
+    _COUNTERS["incidents"] = _COUNTERS.get("incidents", 0) + 1
+    _INCIDENTS.enqueue({"at": _now(), "provider": provider, "kind": kind})
+    while len(_INCIDENTS) > MAX_INCIDENTS:
+        _INCIDENTS.dequeue()
+
+
+def recent_incidents(limit: int) -> list[dict[str, object]]:
+    snapshot: list[dict[str, object]] = []
+    for _ in range(len(_INCIDENTS)):
+        item = _INCIDENTS.dequeue()
+        if item is not None:
+            snapshot.append(item)
+            _INCIDENTS.enqueue(item)
+    return list(reversed(snapshot))[:limit]
+
+
