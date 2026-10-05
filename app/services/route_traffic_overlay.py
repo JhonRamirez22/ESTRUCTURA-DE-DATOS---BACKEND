@@ -43,3 +43,47 @@ async def sample_route_traffic_overlay(
         return {
             "source": "tomtom",
             "configured": False,
+            "available": False,
+            "requestedSegments": 0,
+            "sampledSegments": 0,
+            "observations": [],
+            "warning": "TomTom Traffic no está configurado.",
+        }
+
+    responses = await asyncio.gather(
+        *(provider.get_flow_segment(coordinate) for coordinate in coordinates),
+        return_exceptions=True,
+    )
+    observations: list[dict[str, object]] = []
+    error_count = 0
+    low_confidence_count = 0
+    for coordinate, response in zip(coordinates, responses, strict=True):
+        if isinstance(response, BaseException):
+            if isinstance(response, asyncio.CancelledError):
+                raise response
+            if not isinstance(response, Exception):
+                raise response
+            error_count += 1
+            continue
+        if response.confidence < MIN_TRAFFIC_CONFIDENCE and not response.road_closure:
+            low_confidence_count += 1
+            continue
+        observations.append(traffic_observation_json(coordinate, response))
+
+    warning_parts = ["TomTom muestra puntos muestreados de esta ruta, no cobertura de toda Pasto."]
+    if error_count:
+        warning_parts.append(f"{error_count} muestras no respondieron.")
+    if low_confidence_count:
+        warning_parts.append(f"Se omitieron {low_confidence_count} muestras de baja confianza.")
+    if not observations:
+        warning_parts.append("No hay observaciones confiables para mostrar ahora.")
+
+    return {
+        "source": "tomtom",
+        "configured": True,
+        "available": bool(observations),
+        "requestedSegments": len(coordinates),
+        "sampledSegments": len(observations),
+        "observations": observations,
+        "warning": " ".join(warning_parts),
+    }
