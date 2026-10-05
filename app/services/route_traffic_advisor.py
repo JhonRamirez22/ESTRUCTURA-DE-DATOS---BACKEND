@@ -60,3 +60,64 @@ class RouteTrafficAdvisor(Protocol):
 
 class AssignmentTrafficAdvisor(Protocol):
     async def get_assignment_advice(
+        self, request: AssignmentTrafficRequest
+    ) -> AssignmentTrafficAdvice: ...
+
+
+class RouteTrafficAiError(RuntimeError):
+    """Error seguro que no conserva ni registra payloads con coordenadas."""
+
+
+class HttpRouteTrafficAdvisor:
+    def __init__(
+        self,
+        *,
+        api_url: str,
+        api_key: str | None,
+        model: str | None,
+        timeout_ms: int,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        if not api_url.strip():
+            raise ValueError("AI_TRAFFIC_API_URL no puede estar vacío.")
+        if timeout_ms <= 0:
+            raise ValueError("AI_TRAFFIC_TIMEOUT_MS debe ser positivo.")
+        self._api_url = api_url
+        self._api_key = api_key
+        self._model = model
+        self._timeout_seconds = timeout_ms / 1_000
+        self._protocol = "openai-chat" if "/chat/completions" in api_url else "json"
+        self._transport = transport
+        if self._protocol == "openai-chat" and not model:
+            raise ValueError("AI_TRAFFIC_MODEL es obligatorio para Chat Completions.")
+
+    async def get_route_advice(self, request: RouteTrafficAiRequest) -> RouteTrafficAdvice:
+        try:
+            payload = await self._post(request.as_payload())
+            if not isinstance(payload, Mapping):
+                raise ValueError("La respuesta debe ser un objeto JSON.")
+            return parse_route_traffic_response(payload)
+        except (ValueError, TypeError, KeyError) as error:
+            raise RouteTrafficAiError(
+                "La respuesta de IA no cumple el contrato de tráfico."
+            ) from error
+
+    async def get_assignment_advice(
+        self,
+        request: AssignmentTrafficRequest,
+    ) -> AssignmentTrafficAdvice:
+        try:
+            payload = await self._post(request.as_payload())
+            if not isinstance(payload, Mapping):
+                raise ValueError("La respuesta debe ser un objeto JSON.")
+            return parse_assignment_traffic_response(payload)
+        except (ValueError, TypeError, KeyError) as error:
+            raise RouteTrafficAiError(
+                "La respuesta de IA no cumple el contrato de asignación."
+            ) from error
+
+    def _request_body(self, request: RouteTrafficAiRequest) -> dict[str, object]:
+        return self._request_body_from(request.as_payload())
+
+    def _request_body_from(self, payload: dict[str, object]) -> dict[str, object]:
+        if self._protocol == "openai-chat":
