@@ -31,3 +31,36 @@ class DeliverySchedule:
         lead_minutes: int = DEFAULT_LEAD_MINUTES,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
+        self._lead = timedelta(minutes=lead_minutes)
+        self._clock = clock
+
+    def parse(self, value: datetime | None) -> datetime | None:
+        """A naive UTC instant. A value without zone is read as Bogotá local time."""
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            instant = value - BOGOTA_OFFSET
+        else:
+            instant = value.astimezone(UTC).replace(tzinfo=None)
+        now = self._clock()
+        if instant < now - PAST_TOLERANCE:
+            raise ValueError("scheduledFor must not be in the past.")
+        if instant > now + timedelta(days=MAX_DAYS_AHEAD):
+            raise ValueError(f"scheduledFor can be at most {MAX_DAYS_AHEAD} days ahead.")
+        return instant
+
+    def state(self, scheduled_for: datetime | None) -> ScheduleState | None:
+        if scheduled_for is None:
+            return None
+        now = self._clock()
+        if scheduled_for < now:
+            return ScheduleState.OVERDUE
+        if scheduled_for <= now + self._lead:
+            return ScheduleState.DUE_SOON
+        return ScheduleState.SCHEDULED
+
+    @staticmethod
+    def sort_key(state: ScheduleState | None, priority: int, scheduled_for: datetime | None):  # type: ignore[no-untyped-def]
+        """Queue order: overdue first, then due soon, then priority, then the rest by time."""
+        rank = {ScheduleState.OVERDUE: 0, ScheduleState.DUE_SOON: 1}.get(state, 2)  # type: ignore[arg-type]
+        return (rank, -priority, scheduled_for or datetime.max)
