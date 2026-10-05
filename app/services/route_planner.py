@@ -82,3 +82,87 @@ MAX_ROUTE_TRAFFIC_AI_CANDIDATES = 32
 _ACTIVE_ROUTE_STATUSES = (RouteStatus.PLANNED, RouteStatus.IN_PROGRESS)
 _ACTIVE_POINT_STATUSES = (DeliveryPointStatus.PENDING, DeliveryPointStatus.EN_ROUTE)
 _TERMINAL_POINT_STATUSES = (DeliveryPointStatus.DELIVERED, DeliveryPointStatus.FAILED)
+MAX_TOMTOM_ROUTE_SAMPLES = 8
+MIN_TOMTOM_CONFIDENCE = 0.3
+
+
+class MatrixProvider(Protocol):
+    async def get_duration_matrix(
+        self, coordinates: Sequence[Coordinate]
+    ) -> MatrixProviderResult: ...
+
+
+class RouteProvider(Protocol):
+    async def get_route(self, coordinates: Sequence[Coordinate]) -> RouteResult: ...
+
+
+class TrafficProvider(Protocol):
+    async def get_flow_segment(self, coordinate: Coordinate) -> TrafficData: ...
+
+
+class ClosableRoutingClient(Protocol):
+    async def aclose(self) -> None: ...
+
+
+class RoutePlanningError(Exception):
+    def __init__(self, message: str, status_code: int = 409) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class RouteConflictError(RoutePlanningError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message, 409)
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizedRoutePlan:
+    courier_id: UUID
+    planned_courier_location: Coordinate
+    ordered_delivery_point_ids: tuple[UUID, ...]
+    planned_delivery_point_coordinates: tuple[tuple[UUID, Coordinate], ...]
+    estimated_duration_minutes: float
+    estimated_distance_meters: float
+    baseline_duration_minutes: float | None
+    baseline_distance_meters: float | None
+    geometry: GeoJsonLineString
+    geometry_provider: RouteGeometryProvider
+    matrix_source: str
+    warning: str | None
+    traffic_ai: dict[str, object]
+    live_traffic: dict[str, object] = field(default_factory=dict)
+    ai_order: dict[str, object] = field(default_factory=dict)
+    # Cómo se llegó al orden final: escalera de mejoras, tráfico medido e IA verificada.
+    optimization: dict[str, object] = field(default_factory=dict)
+
+
+# Último resumen de optimización por ruta, en memoria del proceso (LRU con lista doble).
+# Al reiniciar se pierde: la ruta conserva sus métricas base y optimizada en la base de datos.
+ROUTE_OPTIMIZATIONS: LruCache[UUID, dict[str, object]] = LruCache(128)
+
+
+def get_route_optimization(route_id: UUID) -> dict[str, object] | None:
+    return ROUTE_OPTIMIZATIONS.get(route_id)
+
+
+@dataclass(frozen=True, slots=True)
+class RouteOperationResult:
+    route: Route
+    ordered_delivery_point_ids: tuple[UUID, ...]
+    matrix_source: str
+    warning: str | None
+    traffic_ai: dict[str, object]
+    customer_notifications_queued: int = 0
+    customer_notifications_queued_by_channel: tuple[
+        tuple[CustomerNotificationChannel, int], ...
+    ] = ()
+    live_traffic: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class RouteUndoResult:
+    route: Route
+    can_undo: bool
+    released_delivery_point_ids: tuple[UUID, ...]
+
+
