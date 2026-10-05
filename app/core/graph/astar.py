@@ -38,3 +38,43 @@ def astar[Id: Hashable](
     def estimate(node: Id) -> float:
         value = heuristic(node, target)
         if not math.isfinite(value) or value < 0:
+            raise ValueError("La heurística debe devolver un valor finito no negativo")
+        return value
+
+    scores: dict[Id, float] = {source: 0.0}
+    previous: dict[Id, Id] = {}
+    open_ids = {source}
+    heap = MinHeap[_OpenEntry[Id], Id](
+        compare=lambda left, right: (left.f_cost > right.f_cost) - (left.f_cost < right.f_cost),
+        get_id=lambda entry: entry.id,
+    )
+    heap.insert(_OpenEntry(id=source, g_cost=0.0, f_cost=estimate(source)))
+
+    while not heap.is_empty():
+        current = heap.extract_min()
+        if current is None:
+            continue
+        open_ids.discard(current.id)
+
+        if current.id == target:
+            return build_path(source, target, previous, scores[target])
+
+        for edge in graph.get_neighbors(current.id):
+            candidate_cost = current.g_cost + edge.weight
+            if candidate_cost >= scores.get(edge.to, float("inf")):
+                continue
+
+            scores[edge.to] = candidate_cost
+            previous[edge.to] = current.id
+            entry = _OpenEntry(
+                id=edge.to,
+                g_cost=candidate_cost,
+                f_cost=candidate_cost + estimate(edge.to),
+            )
+            if edge.to in open_ids:
+                heap.decrease_key(edge.to, entry)
+            else:
+                heap.insert(entry)
+                open_ids.add(edge.to)
+
+    return no_path()
