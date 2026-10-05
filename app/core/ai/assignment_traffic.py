@@ -57,3 +57,62 @@ class AssignmentTrafficAdvice:
 
 @dataclass(frozen=True, slots=True)
 class AssignmentTrafficRequest:
+    candidates: tuple[AssignmentCandidate, ...]
+    generated_at: datetime
+
+    def as_payload(self) -> dict[str, object]:
+        generated_at = self.generated_at.astimezone(UTC).isoformat(timespec="milliseconds")
+        return {
+            "contractVersion": TRAFFIC_AI_CONTRACT_VERSION,
+            "task": "assignment_traffic",
+            "city": TRAFFIC_AI_CITY,
+            "generatedAt": generated_at.replace("+00:00", "Z"),
+            "candidates": [candidate.as_payload() for candidate in self.candidates],
+        }
+
+
+def build_assignment_candidates(
+    couriers: Sequence[tuple[str, Coordinate]],
+    orders: Sequence[tuple[str, Coordinate]],
+    *,
+    road_metrics: Mapping[
+        tuple[str, str], tuple[float | None, float | None]
+    ] | None = None,
+) -> list[AssignmentCandidate]:
+    candidates: list[AssignmentCandidate] = []
+    for courier_id, courier_coordinate in couriers:
+        courier_lat_lng = {"lat": courier_coordinate[1], "lng": courier_coordinate[0]}
+        for order_id, order_coordinate in orders:
+            order_lat_lng = {"lat": order_coordinate[1], "lng": order_coordinate[0]}
+            metrics = (
+                road_metrics.get((courier_id, order_id))
+                if road_metrics is not None
+                else None
+            )
+            if road_metrics is not None and (metrics is None or metrics[1] is None):
+                continue
+            road_distance = metrics[0] if metrics is not None else None
+            candidates.append(
+                AssignmentCandidate(
+                    courier_id=courier_id,
+                    order_id=order_id,
+                    courier_coordinates=courier_lat_lng,
+                    delivery_coordinates=order_lat_lng,
+                    distance_meters=(
+                        road_distance
+                        if road_distance is not None
+                        else haversine_distance_meters(courier_lat_lng, order_lat_lng)
+                    ),
+                    distance_source=(
+                        "road" if road_distance is not None else "straight-line-estimate"
+                    ),
+                    baseline_duration_minutes=(metrics[1] if metrics is not None else None),
+                )
+            )
+    return candidates
+
+
+def parse_assignment_traffic_response(payload: object) -> AssignmentTrafficAdvice:
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("adjustments"), list):
+        raise ValueError("La respuesta de IA no cumple el contrato de ajustes de asignación.")
+    adjustments: list[AssignmentTrafficAdjustment] = []
