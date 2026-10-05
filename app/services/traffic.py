@@ -65,3 +65,70 @@ class TrafficTile:
 @dataclass(frozen=True, slots=True)
 class _TileCacheEntry:
     key: str
+    stored_at: float
+    data: TrafficTile
+    refresh_bucket: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _TrafficCacheEntry:
+    key: str
+    fresh_until: float
+    stale_until: float
+    data: TrafficData
+
+
+class TrafficService:
+    """La caché vive en este singleton de proceso; no es persistente ni compartida entre workers."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        timeout_ms: int = 3_500,
+        transport: httpx.AsyncBaseTransport | None = None,
+        client: httpx.AsyncClient | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        if not api_key.strip():
+            raise ValueError("TOMTOM_API_KEY debe configurarse para consultar tráfico.")
+        if timeout_ms <= 0:
+            raise ValueError("TOMTOM_TRAFFIC_TIMEOUT_MS debe ser positivo.")
+        if transport is not None and client is not None:
+            raise ValueError("No se puede inyectar transport y client al mismo tiempo.")
+        self._api_key = api_key.strip()
+        self._timeout_seconds = timeout_ms / 1_000
+        self._owns_client = client is None
+        self._client = client or httpx.AsyncClient(
+            timeout=self._timeout_seconds,
+            transport=transport,
+        )
+        self._monotonic = monotonic
+        self._utc_now = utc_now
+        self._cache: DoublyLinkedList[_TrafficCacheEntry] = DoublyLinkedList()
+        self._cache_nodes: dict[str, DoublyLinkedNode[_TrafficCacheEntry]] = {}
+        self._request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TOMTOM_REQUESTS)
+        self._rate_limited_until = 0.0
+        self._tiles: DoublyLinkedList[_TileCacheEntry] = DoublyLinkedList()
+        self._tile_nodes: dict[str, DoublyLinkedNode[_TileCacheEntry]] = {}
+        self.last_tile: TrafficTile | None = None
+
+    async def get_flow_tile(
+        self, z: int, x: int, y: int, *, refresh_bucket: int | None = None
+    ) -> TrafficTile:
+        validate_traffic_tile(z, x, y)
+        key = f"{z}/{x}/{y}"
+        cached = self._tile_nodes.get(key)
+        now = self._monotonic()
+        # Un ciclo nuevo refresca la tesela, pero conserva la anterior ante caída del proveedor.
+        if (
+            cached
+            and cached.value.refresh_bucket == refresh_bucket
+            and now - cached.value.stored_at < TRAFFIC_CACHE_TTL_SECONDS
+        ):
+            self._tiles.move_to_front(cached)
+            self.last_tile = cached.value.data
+            return cached.value.data
+        try:
+            if now < self._rate_limited_until:
