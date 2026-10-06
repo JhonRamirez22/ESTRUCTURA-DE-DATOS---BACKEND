@@ -64,3 +64,69 @@ class JointAssignmentResult:
     moves: list[Move]
     evaluations: int
 
+    @property
+    def saved_total_minutes(self) -> float:
+        return self.before.total_minutes - self.after.total_minutes
+
+
+@dataclass(frozen=True, slots=True)
+class _Candidate:
+    gain: float
+    key: tuple[object, ...]
+    move: Move
+
+
+def _compare(left: _Candidate, right: _Candidate) -> int:
+    # Menor «gain negativo» primero = mayor ganancia primero; el desempate es estable.
+    if left.gain != right.gain:
+        return -1 if left.gain > right.gain else 1
+    return (left.key > right.key) - (left.key < right.key)
+
+
+class _Evaluator:
+    """Costo de la ruta de un repartidor para un conjunto de pedidos, con memoria."""
+
+    def __init__(self, matrix: Matrix) -> None:
+        self._matrix = matrix
+        self._memo: dict[tuple[int, frozenset[int]], float] = {}
+        self.evaluations = 0
+
+    def route_minutes(self, courier: int, orders: frozenset[int]) -> float:
+        key = (courier, orders)
+        cached = self._memo.get(key)
+        if cached is not None:
+            return cached
+        self.evaluations += 1
+        nodes = [courier, *sorted(orders)]
+        sub = [[self._matrix[a][b] for b in nodes] for a in nodes]
+        # Matriz de ceros en la diagonal; ``None`` queda como sin conexión.
+        for index in range(len(nodes)):
+            sub[index][index] = 0.0
+        if len(nodes) == 1:
+            value = 0.0
+        else:
+            route = local_search(sub, nearest_neighbor(sub, 0))
+            value = route_cost(sub, route)
+        self._memo[key] = value
+        return value
+
+
+def estimate_cost(
+    matrix: Matrix,
+    courier_index: Mapping[str, int],
+    order_index: Mapping[str, int],
+    assignments: Mapping[str, Sequence[str]],
+) -> AssignmentCost:
+    evaluator = _Evaluator(matrix)
+    return _cost_of(evaluator, courier_index, order_index, assignments)
+
+
+def _cost_of(
+    evaluator: _Evaluator,
+    courier_index: Mapping[str, int],
+    order_index: Mapping[str, int],
+    assignments: Mapping[str, Sequence[str]],
+) -> AssignmentCost:
+    routes = [
+        evaluator.route_minutes(courier_index[courier], frozenset(order_index[o] for o in orders))
+        for courier, orders in assignments.items()
