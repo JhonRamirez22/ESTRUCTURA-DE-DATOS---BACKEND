@@ -25,3 +25,30 @@ class _Edge:
 
 
 def _compare(left: _Edge, right: _Edge) -> int:
+    return (left.weight > right.weight) - (left.weight < right.weight)
+
+
+def spanning_tree_lower_bound(matrix: CostMatrix) -> float | None:
+    """Peso del árbol de expansión mínimo; ``None`` si alguna parada no se puede conectar."""
+    _validate_matrix(matrix)
+    size = len(matrix)
+    if size < 2:
+        return 0.0
+    heap = MinHeap[_Edge, tuple[int, int]](_compare, lambda edge: (edge.left, edge.right))
+    for left in range(size):
+        for right in range(left + 1, size):
+            forward, backward = matrix[left][right], matrix[right][left]
+            options = [cost for cost in (forward, backward) if cost is not None]
+            if options:
+                heap.insert(_Edge(min(options), left, right))
+    components = DisjointSet(list(range(size)))
+    total = 0.0
+    joined = 0
+    while joined < size - 1:
+        edge = heap.extract_min()
+        if edge is None:
+            return None
+        if components.union(edge.left, edge.right):
+            total += edge.weight
+            joined += 1
+    return total
