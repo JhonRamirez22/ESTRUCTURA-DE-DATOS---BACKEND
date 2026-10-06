@@ -61,3 +61,66 @@ class WindowPlan:
 _CLOCK = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 
+def _clock_minutes(value: object) -> float | None:
+    if not isinstance(value, str):
+        return None
+    match = _CLOCK.match(value.strip())
+    return None if match is None else int(match.group(1)) * 60 + int(match.group(2))
+
+
+def window_from_json(raw: object, now_minute_of_day: float) -> Window | None:
+    """Ventana de ``{"start": "HH:MM", "end": "HH:MM"}`` (hora local) a minutos desde ahora.
+
+    Devuelve ``None`` si el valor no tiene esa forma o la hora de fin no es posterior a la de
+    inicio: una ventana mal escrita se ignora, no inventa un plazo.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    start = _clock_minutes(raw.get("start"))
+    end = _clock_minutes(raw.get("end"))
+    if start is None and end is None:
+        return None
+    if start is not None and end is not None and end <= start:
+        return None
+    earliest = 0.0 if start is None else max(0.0, start - now_minute_of_day)
+    latest = math.inf if end is None else end - now_minute_of_day
+    return Window(earliest=earliest, latest=latest)
+
+
+def evaluate_route(
+    matrix: Matrix,
+    route: Sequence[int],
+    windows: Mapping[int, Window],
+    priority: Mapping[int, float] | None = None,
+    *,
+    service_minutes: float = DEFAULT_SERVICE_MINUTES,
+) -> WindowEvaluation:
+    """Llegadas, retraso ponderado y fin de ruta; infinito si algún tramo no tiene conexión."""
+    weights = priority or {}
+    clock = 0.0
+    arrivals = [0.0]
+    lateness = 0.0
+    late = 0
+    for previous, node in zip(route, route[1:], strict=False):
+        leg = matrix[previous][node]
+        if leg is None:
+            return WindowEvaluation(arrivals, math.inf, len(route), math.inf)
+        arrive = clock + leg
+        window = windows.get(node)
+        if window is not None:
+            arrive = max(arrive, window.earliest)
+            if arrive > window.latest + _EPS:
+                lateness += (arrive - window.latest) * weights.get(node, 1.0)
+                late += 1
+        arrivals.append(arrive)
+        clock = arrive + service_minutes
+    return WindowEvaluation(arrivals, lateness, late, clock)
+
+
+def plan_with_windows(
+    matrix: Matrix,
+    route: Sequence[int],
+    windows: Mapping[int, Window],
+    priority: Mapping[int, float] | None = None,
+    *,
+    service_minutes: float = DEFAULT_SERVICE_MINUTES,
