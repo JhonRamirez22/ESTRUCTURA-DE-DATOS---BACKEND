@@ -68,3 +68,72 @@ def assign_orders(
     travel_costs = _validate_travel_costs(options.travel_costs_minutes, couriers, orders)
     orders_by_id = {order.order_id: order for order in orders}
 
+    for order in orders:
+        eligible = [
+            courier
+            for courier in available
+            if len(assignments[courier.courier_id]) < MAX_ASSIGNABLE_ORDERS_PER_ROUTE
+        ]
+        if not eligible:
+            break
+
+        nearest = min(
+            eligible,
+            key=lambda courier: _pair_cost(
+                courier,
+                order,
+                adjustment_map,
+                travel_costs,
+            ),
+        )
+        if not math.isfinite(
+            _pair_cost(nearest, order, adjustment_map, travel_costs)
+        ):
+            continue
+        assignments[nearest.courier_id].append(order.order_id)
+
+    _balance_assignments(assignments, available, orders_by_id, adjustment_map, travel_costs)
+    return assignments
+
+
+def _balance_assignments(
+    assignments: dict[str, list[str]],
+    couriers: Sequence[CourierPosition],
+    orders_by_id: dict[str, OrderPoint],
+    adjustment_map: dict[tuple[str, str], float],
+    travel_costs: Mapping[tuple[str, str], float | None],
+) -> None:
+    average_load = len(orders_by_id) / len(couriers)
+    maximum_load = min(
+        max(1, math.floor(average_load * MAX_LOAD_MULTIPLIER)),
+        MAX_ASSIGNABLE_ORDERS_PER_ROUTE,
+    )
+
+    while True:
+        overloaded = max(
+            (
+                courier
+                for courier in couriers
+                if len(assignments[courier.courier_id]) > maximum_load
+            ),
+            key=lambda courier: len(assignments[courier.courier_id]),
+            default=None,
+        )
+        if overloaded is None:
+            return
+
+        possible_destinations = [
+            (
+                courier,
+                [
+                    order_id
+                    for order_id in assignments[overloaded.courier_id]
+                    if math.isfinite(
+                        _pair_cost(
+                            courier,
+                            orders_by_id[order_id],
+                            adjustment_map,
+                            travel_costs,
+                        )
+                    )
+                ],
