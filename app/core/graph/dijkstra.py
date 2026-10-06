@@ -28,3 +28,32 @@ def dijkstra[Id: Hashable](graph: Graph[Id], source: Id, target: Id) -> PathResu
         compare=lambda left, right: (left.cost > right.cost) - (left.cost < right.cost),
         get_id=lambda entry: entry.id,
     )
+    heap.insert(_QueueEntry(id=source, cost=0.0))
+
+    while not heap.is_empty():
+        current = heap.extract_min()
+        if current is None or current.id in settled:
+            continue
+
+        settled.add(current.id)
+        if current.id == target:
+            return build_path(source, target, previous, distances[target])
+
+        for edge in graph.get_neighbors(current.id):
+            if edge.to in settled:
+                continue
+
+            candidate_cost = current.cost + edge.weight
+            if candidate_cost >= distances.get(edge.to, float("inf")):
+                continue
+
+            distances[edge.to] = candidate_cost
+            previous[edge.to] = current.id
+            entry = _QueueEntry(id=edge.to, cost=candidate_cost)
+            if edge.to in queued:
+                heap.decrease_key(edge.to, entry)
+            else:
+                heap.insert(entry)
+                queued.add(edge.to)
+
+    return no_path()
