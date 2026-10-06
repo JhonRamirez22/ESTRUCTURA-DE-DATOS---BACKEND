@@ -62,3 +62,67 @@ def held_karp_path(matrix: CostMatrix, start: int = 0) -> list[int] | None:
     size = len(matrix)
     if size == 0:
         return []
+    if size == 1:
+        return [start]
+    if size > MAX_EXACT_NODES:
+        raise ValueError(f"Held-Karp se limita a {MAX_EXACT_NODES} nodos")
+    if not 0 <= start < size:
+        raise IndexError("start está fuera de la matriz de costos")
+
+    # Se renumera para que el origen sea el bit 0 y las máscaras sean compactas.
+    others = [node for node in range(size) if node != start]
+    order = [start, *others]
+    cost = [
+        [math.inf if matrix[a][b] is None else float(matrix[a][b] or 0.0) for b in order]
+        for a in order
+    ]
+    full = (1 << size) - 1
+    inf = math.inf
+    dp = [[inf] * size for _ in range(1 << size)]
+    parent = [[-1] * size for _ in range(1 << size)]
+    dp[1][0] = 0.0
+    for mask in range(1, 1 << size, 2):  # solo máscaras que contienen al origen
+        row = dp[mask]
+        for last in range(size):
+            base = row[last]
+            if base == inf:
+                continue
+            edge = cost[last]
+            for nxt in range(1, size):
+                bit = 1 << nxt
+                if mask & bit:
+                    continue
+                candidate = base + edge[nxt]
+                target = dp[mask | bit]
+                if candidate < target[nxt]:
+                    target[nxt] = candidate
+                    parent[mask | bit][nxt] = last
+    final = dp[full]
+    last = min(range(1, size), key=final.__getitem__)
+    if final[last] == inf:
+        return None
+    path = []
+    mask = full
+    while last != -1:
+        path.append(order[last])
+        previous = parent[mask][last]
+        mask ^= 1 << last
+        last = previous
+    path.reverse()
+    return path
+
+
+def _finite(matrix: CostMatrix) -> list[list[float]]:
+    return [[_UNREACHABLE if cost is None else float(cost) for cost in row] for row in matrix]
+
+
+def local_search(matrix: CostMatrix, route: Sequence[int]) -> list[int]:
+    """2-opt y Or-opt alternados hasta que ninguno mejora, con costo de movimiento en O(1)."""
+    _validate_matrix(matrix)
+    return _descend(_finite(matrix), list(route))
+
+
+def _descend(cost: list[list[float]], route: list[int]) -> list[int]:
+    for _ in range(MAX_LOCAL_PASSES):
+        if _two_opt_pass(cost, route) or _or_opt_pass(cost, route):
+            continue
