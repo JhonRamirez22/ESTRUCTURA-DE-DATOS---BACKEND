@@ -67,3 +67,71 @@ class CachedRouteProvider:
 
         task = _in_flight_requests.get(key)
         if task is None:
+            task = asyncio.create_task(self._fetch_and_cache(key, coordinates))
+            _in_flight_requests[key] = task
+            task.add_done_callback(lambda completed: _remove_finished_task(key, completed))
+
+        return _copy_route_result(await asyncio.shield(task))
+
+    async def _fetch_and_cache(
+        self,
+        key: str,
+        coordinates: Sequence[Coordinate],
+    ) -> RouteResult:
+        result = await self._client.get_route(coordinates)
+        if result["geometry_provider"] != self._provider:
+            raise ValueError(
+                f"Se esperaba geometría {self._provider}, se recibió {result['geometry_provider']}"
+            )
+
+        copied = _copy_route_result(result)
+        _route_cache[key] = {"expires_at": self._now() + self._ttl_seconds, "result": copied}
+        _route_cache.move_to_end(key)
+        while len(_route_cache) > self._max_entries:
+            _route_cache.popitem(last=False)
+        return copied
+
+
+def build_route_cache_key(
+    provider: GeometryProvider,
+    coordinates: Sequence[Coordinate],
+) -> str:
+    rounded = [
+        [
+            round(longitude, _ROUTE_CACHE_COORDINATE_PRECISION),
+            round(latitude, _ROUTE_CACHE_COORDINATE_PRECISION),
+        ]
+        for longitude, latitude in coordinates
+    ]
+    return f"{_ROUTE_CACHE_SCHEMA}:{provider}:{rounded!r}"
+
+
+def clear_route_cache() -> None:
+    """Cancela requests de prueba y limpia la memoria del módulo."""
+    for task in _in_flight_requests.values():
+        task.cancel()
+    _in_flight_requests.clear()
+    _route_cache.clear()
+
+
+def _remove_finished_task(key: str, completed: asyncio.Task[RouteResult]) -> None:
+    if _in_flight_requests.get(key) is completed:
+        del _in_flight_requests[key]
+    if not completed.cancelled():
+        completed.exception()
+
+
+def _copy_route_result(result: RouteResult) -> RouteResult:
+    geometry = result["geometry"]
+    copied: RouteResult = {
+        "geometry": {
+            "type": "LineString",
+            "coordinates": list(geometry["coordinates"]),
+        },
+        "geometry_provider": result["geometry_provider"],
+        "distance_meters": result["distance_meters"],
+        "duration_minutes": result["duration_minutes"],
+    }
+    if "snap_distances_meters" in result:
+        copied["snap_distances_meters"] = list(result["snap_distances_meters"])
+    return copied
