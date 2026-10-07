@@ -46,3 +46,51 @@ class MinHeap[T, Id: Hashable]:
             raise KeyError(f"El ID no existe en el heap: {item_id!r}")
         if self._get_id(new_value) != item_id:
             raise ValueError("decrease_key no puede reemplazar un elemento con otro ID")
+        if self._compare(new_value, self._items[index]) > 0:
+            raise ValueError("decrease_key no puede aumentar la prioridad")
+
+        self._items[index] = new_value
+        self._bubble_up(index)
+
+    def is_empty(self) -> bool:
+        return not self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def _bubble_up(self, index: int) -> None:
+        current = index
+        while current > 0:
+            parent = (current - 1) // 2
+            if self._compare(self._items[current], self._items[parent]) >= 0:
+                break
+            self._swap(current, parent)
+            current = parent
+
+    def _bubble_down(self, index: int) -> None:
+        current = index
+        while True:
+            left = current * 2 + 1
+            right = left + 1
+            smallest = current
+
+            if (
+                left < len(self._items)
+                and self._compare(self._items[left], self._items[smallest]) < 0
+            ):
+                smallest = left
+            if (
+                right < len(self._items)
+                and self._compare(self._items[right], self._items[smallest]) < 0
+            ):
+                smallest = right
+            if smallest == current:
+                return
+
+            self._swap(current, smallest)
+            current = smallest
+
+    def _swap(self, left: int, right: int) -> None:
+        self._items[left], self._items[right] = self._items[right], self._items[left]
+        self._indices[self._get_id(self._items[left])] = left
+        self._indices[self._get_id(self._items[right])] = right
