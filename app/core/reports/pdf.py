@@ -62,3 +62,67 @@ def wrap(text: str, width: float, size: float, *, bold: bool = False) -> list[st
         for word in paragraph.split(" "):
             while text_width(word, size, bold=bold) > width and len(word) > 1:
                 room = max(1, int(len(word) * width / text_width(word, size, bold=bold)))
+                head, word = word[:room], word[room:]
+                if current:
+                    lines.append(current)
+                    current = ""
+                lines.append(head)
+            candidate = word if not current else f"{current} {word}"
+            if current and text_width(candidate, size, bold=bold) > width:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+        lines.append(current)
+    return lines or [""]
+
+
+class _Page:
+    def __init__(self) -> None:
+        self.ops: list[str] = []
+
+
+class PdfReport:
+    def __init__(self, title: str, subtitle: str, footer: str) -> None:
+        self._title = _clean(title)
+        self._footer = _clean(footer)
+        self._pages: list[_Page] = []
+        self._y = 0.0
+        self._new_page()
+        self._text(MARGIN, self._y - 14, self._title, 16, bold=True)
+        self._y -= 30
+        for line in wrap(subtitle, PAGE_WIDTH - 2 * MARGIN, 9):
+            self._text(MARGIN, self._y - 9, line, 9, gray=0.35)
+            self._y -= LEADING
+        self._rule()
+        self._y -= 8
+
+    # ---- contenido -------------------------------------------------------------------
+
+    def heading(self, text: str) -> None:
+        self._ensure(40)
+        self._y -= 8
+        self._text(MARGIN, self._y - 11, _clean(text), 11.5, bold=True)
+        self._y -= 18
+
+    def paragraph(self, text: str, *, gray: float = 0.0) -> None:
+        for line in wrap(text, PAGE_WIDTH - 2 * MARGIN, BODY_SIZE):
+            self._ensure(LEADING)
+            self._text(MARGIN, self._y - 9, line, BODY_SIZE, gray=gray)
+            self._y -= LEADING
+        self._y -= 4
+
+    def key_values(self, pairs: Sequence[tuple[str, object]]) -> None:
+        label_w = 150.0
+        value_w = PAGE_WIDTH - 2 * MARGIN - label_w
+        for label, value in pairs:
+            lines = wrap(str(value), value_w, BODY_SIZE)
+            self._ensure(LEADING * len(lines))
+            self._text(MARGIN, self._y - 9, _clean(label), BODY_SIZE, bold=True, gray=0.25)
+            for line in lines:
+                self._text(MARGIN + label_w, self._y - 9, line, BODY_SIZE)
+                self._y -= LEADING
+        self._y -= 4
+
+    def table(
+        self, headers: Sequence[str], rows: Sequence[Sequence[object]], fractions: Sequence[float]
