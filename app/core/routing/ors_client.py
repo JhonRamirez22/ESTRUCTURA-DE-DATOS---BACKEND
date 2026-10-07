@@ -75,3 +75,79 @@ class OrsClient:
         return self
 
     async def __aexit__(self, *_: object) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def get_duration_matrix(self, coordinates: Sequence[Coordinate]) -> MatrixResult:
+        """ORS entrega segundos; esta función los normaliza a minutos."""
+        validate_coordinates(coordinates)
+        payload = await self._request(
+            "/v2/matrix/driving-car",
+            {"locations": coordinates, "metrics": ["duration"]},
+        )
+        durations_seconds = _read_matrix(payload.get("durations"), len(coordinates))
+        return {
+            "durations_minutes": [
+                [None if seconds is None else seconds / 60 for seconds in row]
+                for row in durations_seconds
+            ]
+        }
+
+    async def get_route(self, coordinates: Sequence[Coordinate]) -> RouteResult:
+        """Retorna geometría vial en [lng,lat], distancia en metros y minutos."""
+        validate_coordinates(coordinates)
+        payload = await self._request(
+            "/v2/directions/driving-car/geojson",
+            {"coordinates": coordinates},
+        )
+        features = payload.get("features")
+        if not isinstance(features, list) or not features:
+            raise OrsClientError("OpenRouteService directions response has no features")
+        feature = _read_object(
+            features[0], "OpenRouteService directions response has an invalid feature"
+        )
+        geometry = _read_geometry(feature.get("geometry"))
+        properties = _read_object(
+            feature.get("properties"),
+            "OpenRouteService directions response has invalid properties",
+        )
+        summary = _read_object(
+            properties.get("summary"),
+            "OpenRouteService directions response has no summary",
+        )
+        distance = _read_number(summary.get("distance"), "distance")
+        duration_seconds = _read_number(summary.get("duration"), "duration")
+        return {
+            "geometry": geometry,
+            "geometry_provider": "ORS",
+            "distance_meters": distance,
+            "duration_minutes": duration_seconds / 60,
+        }
+
+    async def _request(self, path: str, body: object) -> dict[str, object]:
+        try:
+            response = await self._client.post(
+                path,
+                json=body,
+                headers={"Authorization": self._api_key},
+            )
+        except httpx.TimeoutException as error:
+            raise OrsTimeoutError(self._timeout_seconds) from error
+        except httpx.RequestError as error:
+            raise OrsClientError(f"OpenRouteService network request failed: {error}") from error
+
+        if not response.is_success:
+            response_body = response.text
+            if response.status_code == 429:
+                raise OrsRateLimitError(response_body)
+            raise OrsClientError(
+                f"OpenRouteService request failed (HTTP {response.status_code}): {response_body}",
+                status=response.status_code,
+                response_body=response_body,
+            )
+
+        try:
+            raw_payload: object = response.json()
