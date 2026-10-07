@@ -49,3 +49,54 @@ def match_location_events_to_segments(
     run_segment: RoadSegment | None = None
     run_start: LocationEventPoint | None = None
     run_end: LocationEventPoint | None = None
+    run_event_count = 0
+
+    def flush_run() -> None:
+        if run_segment is None or run_start is None or run_end is None or run_event_count < 2:
+            return
+        elapsed_seconds = (
+            _as_utc(run_end.recorded_at) - _as_utc(run_start.recorded_at)
+        ).total_seconds()
+        observed_minutes = elapsed_seconds / 60
+        if observed_minutes > 0:
+            samples.append(
+                TravelTimeSample(
+                    segment_id=run_segment.id,
+                    hour_of_day=_as_utc(run_start.recorded_at).astimezone(_PASTO_TIMEZONE).hour,
+                    ors_duration_minutes=run_segment.ors_duration_minutes,
+                    observed_duration_minutes=observed_minutes,
+                )
+            )
+
+    for event, segment in matches:
+        if segment is None or segment.id != (run_segment.id if run_segment else None):
+            flush_run()
+            run_segment = segment
+            run_start = event if segment is not None else None
+            run_end = run_start
+            run_event_count = 1 if run_start is not None else 0
+        else:
+            run_end = event
+            run_event_count += 1
+    flush_run()
+    return samples
+
+
+def _find_nearest_segment(
+    point: Coordinate,
+    segments: Sequence[RoadSegment],
+    max_distance: float,
+) -> RoadSegment | None:
+    nearest: RoadSegment | None = None
+    nearest_distance = math.inf
+    for segment in segments:
+        distance = _distance_to_segment_squared(point, segment)
+        if distance < nearest_distance:
+            nearest = segment
+            nearest_distance = distance
+    return nearest if nearest_distance <= max_distance**2 else None
+
+
+def _distance_to_segment_squared(point: Coordinate, segment: RoadSegment) -> float:
+    point_x = point[0] * math.cos(math.radians(point[1]))
+    point_y = point[1]
