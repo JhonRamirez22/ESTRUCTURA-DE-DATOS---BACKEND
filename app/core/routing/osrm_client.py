@@ -65,3 +65,70 @@ class OsrmClient:
         timeout_seconds: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
         client: httpx.AsyncClient | None = None,
+    ) -> None:
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds debe ser positivo y finito")
+        if transport is not None and client is not None:
+            raise ValueError("No se puede inyectar transport y client al mismo tiempo")
+
+        configured_url = base_url or os.getenv("OSRM_API_URL") or "https://router.project-osrm.org"
+        self._base_url = configured_url.strip().rstrip("/")
+        if not self._base_url.startswith(("http://", "https://")):
+            raise ValueError("OSRM_API_URL debe comenzar con http:// o https://")
+        self._timeout_seconds = timeout_seconds
+        self._owns_client = client is None
+        self._client = client or httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=httpx.Timeout(timeout_seconds),
+            transport=transport,
+        )
+
+    async def __aenter__(self) -> OsrmClient:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def get_duration_matrix(self, coordinates: Sequence[Coordinate]) -> OsrmMatrixResult:
+        """Consulta Table; duraciones en minutos, distancias en metros y null sin conexión."""
+        validate_coordinates(coordinates)
+        encoded = _serialize_coordinates(coordinates)
+        radiuses = _serialize_radiuses(len(coordinates))
+        payload = await self._request(
+            f"/table/v1/driving/{encoded}?annotations=duration,distance&radiuses={radiuses}"
+        )
+        if payload.get("code") != "Ok":
+            detail = payload.get("message", payload.get("code", "respuesta desconocida"))
+            raise OsrmClientError(f"OSRM table response was not successful: {detail}")
+
+        duration_seconds = _read_matrix(payload.get("durations"), "durations")
+        distances_meters = _read_matrix(payload.get("distances"), "distances")
+        _validate_matrix_dimensions(duration_seconds, len(coordinates), "durations")
+        _validate_matrix_dimensions(distances_meters, len(coordinates), "distances")
+        return {
+            "durations_minutes": [
+                [None if seconds is None else seconds / 60 for seconds in row]
+                for row in duration_seconds
+            ],
+            "distances_meters": distances_meters,
+        }
+
+    async def get_route(self, coordinates: Sequence[Coordinate]) -> OsrmRouteResult:
+        """Consulta Route; entrega geometría [lng,lat], metros y duración en minutos."""
+        validate_coordinates(coordinates)
+        encoded = _serialize_coordinates(coordinates)
+        radiuses = _serialize_radiuses(len(coordinates))
+        payload = await self._request(
+            f"/route/v1/driving/{encoded}"
+            f"?overview=full&geometries=geojson&steps=false&radiuses={radiuses}"
+        )
+        routes = payload.get("routes")
+        if payload.get("code") != "Ok" or not isinstance(routes, list) or not routes:
+            detail = payload.get("message", payload.get("code", "respuesta desconocida"))
+            raise OsrmClientError(f"OSRM route response was not successful: {detail}")
+
+        route = _read_object(routes[0], "OSRM route response contains an invalid route")
