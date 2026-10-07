@@ -23,3 +23,28 @@ class LruCache[K: Hashable, V]:
 
     def get(self, key: K) -> V | None:
         node = self._nodes.get(key)
+        if node is None:
+            return None
+        self._order.move_to_front(node)
+        return node.value[1]
+
+    def put(self, key: K, value: V) -> None:
+        existing = self._nodes.get(key)
+        if existing is not None:
+            self._order.remove(existing)
+        self._nodes[key] = self._order.appendleft((key, value))
+        while len(self._nodes) > self._capacity:
+            evicted = self._order.pop_back()
+            if evicted is None:
+                break
+            self._nodes.pop(evicted[0], None)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._nodes
+
+    def __len__(self) -> int:
+        return len(self._nodes)
+
+    def clear(self) -> None:
+        self._order = DoublyLinkedList()
+        self._nodes.clear()
