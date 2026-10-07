@@ -46,3 +46,51 @@ class DoublyLinkedList[T]:
     def remove(self, node: DoublyLinkedNode[T]) -> T:
         if node._owner is not self._owner:
             raise ValueError("node is not attached to this list")
+        if node.previous is None:
+            self._head = node.next
+        else:
+            node.previous.next = node.next
+        if node.next is None:
+            self._tail = node.previous
+        else:
+            node.next.previous = node.previous
+        node.previous = None
+        node.next = None
+        node._owner = None
+        self._size -= 1
+        return node.value
+
+    def move_to_front(self, node: DoublyLinkedNode[T]) -> None:
+        if node._owner is not self._owner:
+            raise ValueError("node is not attached to this list")
+        if node is self._head:
+            return
+        if node.previous is not None:
+            node.previous.next = node.next
+        if node.next is None:
+            self._tail = node.previous
+        else:
+            node.next.previous = node.previous
+        node.previous = None
+        node.next = self._head
+        if self._head is not None:
+            self._head.previous = node
+        self._head = node
+
+    def pop_front(self) -> T | None:
+        return None if self._head is None else self.remove(self._head)
+
+    def pop_back(self) -> T | None:
+        return None if self._tail is None else self.remove(self._tail)
+
+    def __iter__(self) -> Iterator[T]:
+        current = self._head
+        while current is not None:
+            yield current.value
+            current = current.next
+
+    def __len__(self) -> int:
+        return self._size
+
+    def __bool__(self) -> bool:
+        return self._size > 0
