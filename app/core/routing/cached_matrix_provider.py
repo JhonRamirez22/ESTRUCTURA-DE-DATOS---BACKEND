@@ -59,3 +59,64 @@ class CachedMatrixProvider:
         max_entries: int = MATRIX_CACHE_MAX_ENTRIES,
         now: Callable[[], float] = time.monotonic,
     ) -> None:
+        if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+            raise ValueError("ttl_seconds debe ser positivo y finito")
+        if max_entries < 1:
+            raise ValueError("max_entries debe ser positivo")
+        self._client = client
+        self._source = source
+        self._ttl_seconds = ttl_seconds
+        self._max_entries = max_entries
+        self._now = now
+
+    async def get_duration_matrix(
+        self,
+        coordinates: Sequence[Coordinate],
+    ) -> MatrixProviderResult:
+        validate_coordinates(coordinates)
+        key = build_matrix_cache_key(coordinates, source=self._source)
+        cached_node = _matrix_cache_nodes.get(key)
+        current_time = self._now()
+        if cached_node is not None and cached_node.value["expires_at"] > current_time:
+            _matrix_cache.move_to_front(cached_node)
+            cached = cached_node.value
+            return _copy_result(cached["result"], source=self._source)
+        if cached_node is not None:
+            _matrix_cache.remove(cached_node)
+            del _matrix_cache_nodes[key]
+
+        # TODO: deduplicar miss simultáneos cuando el volumen supere el MVP de un despachador.
+        try:
+            result = await self._client.get_duration_matrix(coordinates)
+        except Exception as error:
+            if not is_recoverable_routing_error(error):
+                raise
+            return {
+                "durations_minutes": _build_euclidean_fallback_matrix(coordinates),
+                "source": "euclidean-fallback",
+                "warning": _fallback_warning(error, self._source),
+            }
+
+        existing_node = _matrix_cache_nodes.get(key)
+        if existing_node is not None:
+            _matrix_cache.remove(existing_node)
+        entry: _CacheEntry = {
+            "key": key,
+            "expires_at": self._now() + self._ttl_seconds,
+            "result": _copy_matrix_result(result),
+        }
+        _matrix_cache_nodes[key] = _matrix_cache.appendleft(entry)
+        while len(_matrix_cache) > self._max_entries:
+            evicted = _matrix_cache.pop_back()
+            if evicted is not None:
+                _matrix_cache_nodes.pop(evicted["key"], None)
+        return _copy_result(result, source=self._source)
+
+
+def build_matrix_cache_key(
+    coordinates: Sequence[Coordinate],
+    *,
+    source: MatrixSource = "osrm",
+) -> str:
+    """Conserva orden y redondea a 5 decimales para amortiguar jitter GPS."""
+    rounded = [[round(longitude, 5), round(latitude, 5)] for longitude, latitude in coordinates]
