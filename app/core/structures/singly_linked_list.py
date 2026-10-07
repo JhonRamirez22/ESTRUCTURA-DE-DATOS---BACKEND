@@ -42,3 +42,47 @@ class SinglyLinkedList[T]:
         node = self._head
         self._head = node.next
         node.next = None
+        self._size -= 1
+        if self._head is None:
+            self._tail = None
+        return node.value
+
+    def remove(self, value: T) -> bool:
+        previous: _Node[T] | None = None
+        current = self._head
+        while current is not None:
+            if current.value == value:
+                if previous is None:
+                    self._head = current.next
+                else:
+                    previous.next = current.next
+                if current is self._tail:
+                    self._tail = previous
+                current.next = None
+                self._size -= 1
+                return True
+            previous, current = current, current.next
+        return False
+
+    def peek_front(self) -> T | None:
+        return None if self._head is None else self._head.value
+
+    def clear(self) -> None:
+        self._head = None
+        self._tail = None
+        self._size = 0
+
+    def __contains__(self, value: object) -> bool:
+        return any(item == value for item in self)
+
+    def __iter__(self) -> Iterator[T]:
+        current = self._head
+        while current is not None:
+            yield current.value
+            current = current.next
+
+    def __len__(self) -> int:
+        return self._size
+
+    def __bool__(self) -> bool:
+        return self._size > 0
