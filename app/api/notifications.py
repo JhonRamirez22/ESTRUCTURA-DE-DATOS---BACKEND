@@ -100,3 +100,53 @@ async def customer_notification_status(
         "sms": CustomerNotificationChannelStatus(
             configured=configured[CustomerNotificationChannel.SMS],
             pending=counts[CustomerNotificationChannel.SMS]["pending"],
+            retrying=counts[CustomerNotificationChannel.SMS]["retrying"],
+            processing=counts[CustomerNotificationChannel.SMS]["processing"],
+            failed=counts[CustomerNotificationChannel.SMS]["failed"],
+        ),
+    }
+    warning = None
+    if not any(configured.values()):
+        warning = "Configura SMTP o Twilio en el backend para enviar los avisos en cola."
+    elif not worker_running:
+        warning = (
+            "Los avisos nuevos se intentan enviar al asignar la ruta o registrar el GPS. "
+            "El worker persistente está apagado; si un envío falla, no habrá reintento "
+            "automático. Verifica CUSTOMER_NOTIFICATION_WORKER_ENABLED y ejecuta FastAPI "
+            "como servicio persistente."
+        )
+    if sum(channel["failed"] for channel in counts.values()) > 0:
+        failed_warning = "Hay avisos agotados tras varios intentos; requieren revisión operativa."
+        warning = f"{warning} {failed_warning}" if warning else failed_warning
+    payload = CustomerNotificationOperationsStatus(
+        channels=channels,
+        worker_running=worker_running,
+        warning=warning,
+    )
+    return JSONResponse(
+        content=payload.model_dump(mode="json", by_alias=True),
+        headers={"Cache-Control": "private, no-store, max-age=0"},
+    )
+
+
+def _authorized_recipient(claims: SessionClaims) -> str:
+    courier_id = claims.get("courierId")
+    if claims["role"] == "courier":
+        return courier_id or ""
+    return "dispatcher"
+
+
+def _parse_limit(raw_limit: str | None) -> int:
+    try:
+        parsed = int("20" if raw_limit is None else raw_limit)
+    except ValueError:
+        return 20
+    return min(max(parsed, 1), 100)
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        content={"error": message},
+        status_code=status_code,
+        headers={"Cache-Control": "private, no-store, max-age=0"},
+    )
