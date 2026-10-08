@@ -168,3 +168,88 @@ async def create_courier(
         return _error("Un repartidor nuevo queda fuera de turno hasta que reporte GPS válido.", 400)
     try:
         data = CourierCreateRequest.model_validate(body)
+    except ValidationError as error:
+        return _error(_string_field_error(error), 400)
+
+    courier_id = uuid4()
+    access_code = create_courier_access_code(str(courier_id))
+    try:
+        access_code_hash = await run_in_threadpool(hash_courier_access_code, access_code)
+        courier = Courier(
+            id=courier_id,
+            name=data.name,
+            phone=data.phone,
+            status=CourierStatus.OFFLINE,
+            credential=CourierCredential(access_code_hash=access_code_hash),
+        )
+        repository = CourierRepository(session)
+        repository.add_courier(courier)
+        if data.account is not None:
+            # Un solo commit evita crear un repartidor sin su acceso si el correo está ocupado.
+            await session.flush()
+            session.add(
+                Account(
+                    email=data.account.email,
+                    password_hash=await run_in_threadpool(
+                        hash_password, data.account.password.get_secret_value()
+                    ),
+                    role="courier",
+                    courier_id=courier_id,
+                )
+            )
+        await session.commit()
+        await repository.refresh_courier(courier)
+        payload = CourierCreatedResponse(
+            courier=CourierView.model_validate(courier),
+            access_code=access_code if data.account is None else None,
+        )
+        return _json(
+            payload.model_dump(mode="json", by_alias=True, exclude_none=True),
+            status_code=201,
+            headers=_NO_STORE_PRIVATE,
+        )
+    except IntegrityError:
+        await session.rollback()
+        return _error("Ese correo ya pertenece a otra cuenta.", 409)
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_db_error("No se pudo crear el repartidor", error)
+        return _error("No se pudo procesar el repartidor.", 500)
+
+
+@router.get("/{courier_id}")
+async def get_courier(
+    courier_id: str,
+    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    parsed_id = _parse_uuid(courier_id)
+    courier = await CourierRepository(session).get_courier(parsed_id)
+    if courier is None:
+        return _error("El repartidor no existe.", 404)
+    return _json(
+        CourierResponse(courier=CourierView.model_validate(courier)).model_dump(
+            mode="json", by_alias=True
+        )
+    )
+
+
+@router.patch("/{courier_id}")
+async def update_courier(
+    courier_id: str,
+    request: Request,
+    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    parsed_id = _parse_uuid(courier_id)
+    body = await _read_json_object(request)
+    if isinstance(body, JSONResponse):
+        return body
+    if "currentLat" in body or "currentLng" in body:
+        return _error(
+            "La ubicación solo se actualiza desde el endpoint GPS autenticado del repartidor.",
+            400,
+        )
+    try:
+        data = CourierUpdateRequest.model_validate(body)
+    except ValidationError as error:
