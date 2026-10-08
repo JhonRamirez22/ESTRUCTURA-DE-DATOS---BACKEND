@@ -155,3 +155,81 @@ class Settings(BaseSettings):
                 username=self.database_username,
                 password=(
                     self.database_password.get_secret_value()
+                    if self.database_password is not None
+                    else None
+                ),
+                host=self.database_host,
+                port=self.database_port,
+                database=self.database_name,
+            )
+        query = dict(url.query)
+        query.pop("schema", None)  # Prisma's schema query parameter is not an asyncpg option.
+        # asyncpg recibe TLS como `ssl` (un SSLContext), no como `sslmode` de libpq.
+        query.pop("sslmode", None)
+        query.pop("sslrootcert", None)
+        driver_name = url.drivername
+        if driver_name in {"postgres", "postgresql"}:
+            driver_name = "postgresql+asyncpg"
+        elif driver_name == "sqlite":
+            driver_name = "sqlite+aiosqlite"
+        return url.set(drivername=driver_name, query=query)
+
+    @property
+    def sqlalchemy_connect_args(self) -> dict[str, object]:
+        database_url = (
+            self.database_url.get_secret_value().strip() if self.database_url is not None else ""
+        )
+        url_query = make_url(database_url).query if database_url else {}
+        ssl_mode = str(url_query.get("sslmode", self.database_ssl_mode))
+        root_cert = str(url_query.get("sslrootcert", self.database_ssl_root_cert or ""))
+
+        if ssl_mode == "disable":
+            return {}
+        if ssl_mode not in {"require", "verify-ca", "verify-full"}:
+            raise ValueError("DATABASE_SSL_MODE debe ser un modo SSL válido para PostgreSQL")
+        if ssl_mode in {"verify-ca", "verify-full"} and not root_cert:
+            raise ValueError(
+                "DATABASE_SSL_ROOT_CERT es requerido al verificar el certificado de RDS"
+            )
+
+        if ssl_mode == "require":
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        else:
+            ssl_context = ssl.create_default_context(cafile=root_cert)
+            if ssl_mode == "verify-ca":
+                ssl_context.check_hostname = False
+
+        return {"ssl": ssl_context}
+
+    @property
+    def is_development(self) -> bool:
+        return self.node_env == "development"
+
+    def startup_problems(self) -> list[str]:
+        """Errores de configuración que deben impedir el arranque, no solo avisar en el log."""
+        problems: list[str] = []
+        if self.node_env == "production":
+            secret = self.auth_secret.get_secret_value().strip() if self.auth_secret else ""
+            if len(secret.encode("utf-8")) < 32:
+                problems.append("AUTH_SECRET debe tener al menos 32 bytes en producción.")
+        elif self.is_development and not self._database_is_local():
+            problems.append("NODE_ENV=development solo se permite con una base de datos local.")
+        return problems
+
+    def _database_is_local(self) -> bool:
+        raw_url = self.database_url.get_secret_value().strip() if self.database_url else ""
+        if raw_url:
+            url = make_url(raw_url)
+            if url.drivername.startswith("sqlite"):
+                return True
+            host = url.host
+        else:
+            host = self.database_host
+        return host in {None, "", "localhost", "127.0.0.1", "::1"}
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()
