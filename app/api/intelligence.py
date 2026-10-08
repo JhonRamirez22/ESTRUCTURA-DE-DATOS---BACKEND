@@ -150,3 +150,79 @@ async def dispatch_suggestions(
             for c in couriers
         ],
         [PendingView(str(p.id), p.lat, p.lng) for p in pending],
+        now,
+    )
+    key = hashlib.sha256(
+        json.dumps(
+            [(c["id"], c["text"], c["figures"]) for c in cards], sort_keys=True
+        ).encode()
+    ).hexdigest()
+    cached = _SUGGESTION_CACHE.get(key)
+    if cached is not None:
+        public, ai = cached
+        return JSONResponse(
+            {"enabled": True, "suggestions": public, "ai": {**ai, "cached": True}},
+            headers=_NO_STORE,
+        )
+    public, ai = await phrase_with_ai(cards)
+    if ai.get("source") == "groq-validated":
+        _SUGGESTION_CACHE.put(key, (public, ai))
+    return JSONResponse(
+        {"enabled": True, "suggestions": public, "ai": {**ai, "cached": False}},
+        headers=_NO_STORE,
+    )
+
+
+@router.get("/resumen-turno")
+async def shift_report(
+    claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    if not get_settings().ai_suggestions_enabled:
+        return JSONResponse(
+            {"enabled": False, "cards": [], "ai": {"source": "deterministic"}}, headers=_NO_STORE
+        )
+    subject = claims.get("accountId") or claims["role"]
+    retry = _SUGGESTION_LIMITER.retry_after(hashlib.sha256(subject.encode()).hexdigest())
+    if retry is not None:
+        return JSONResponse(
+            {"error": "Demasiadas consultas del resumen."},
+            status_code=429,
+            headers={**_NO_STORE, "Retry-After": str(retry)},
+        )
+    try:
+        routes = await RouteRepository(session).list_routes(courier_id=None, status=None)
+    except SQLAlchemyError:
+        return JSONResponse({"error": "No se pudo leer la operación."}, status_code=500)
+    views = [
+        RouteView(
+            ident=str(route.id),
+            courier_name=route.courier.name,
+            status=route.status,
+            estimated_minutes=route.estimated_duration_minutes,
+            baseline_minutes=route.baseline_duration_minutes,
+            created_at=route.created_at,
+            started_at=route.started_at,
+            completed_at=route.completed_at,
+            delivered=sum(p.status == DeliveryPointStatus.DELIVERED for p in route.delivery_points),
+            failed=sum(p.status == DeliveryPointStatus.FAILED for p in route.delivery_points),
+        )
+        for route in routes
+    ]
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cards = build_shift_cards(views, now)
+    key = "shift:" + hashlib.sha256(
+        json.dumps([(c["id"], c["text"], c["figures"]) for c in cards], sort_keys=True).encode()
+    ).hexdigest()
+    cached = _SUGGESTION_CACHE.get(key)
+    if cached is not None:
+        public, ai = cached
+        return JSONResponse(
+            {"enabled": True, "cards": public, "ai": {**ai, "cached": True}}, headers=_NO_STORE
+        )
+    public, ai = await phrase_with_ai(cards)
+    if ai.get("source") == "groq-validated":
+        _SUGGESTION_CACHE.put(key, (public, ai))
+    return JSONResponse(
+        {"enabled": True, "cards": public, "ai": {**ai, "cached": False}}, headers=_NO_STORE
+    )
