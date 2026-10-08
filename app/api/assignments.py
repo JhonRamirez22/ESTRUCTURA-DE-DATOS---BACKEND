@@ -156,3 +156,82 @@ async def propose_assignments(
             data.delivery_point_ids
         )
         points = [
+            point
+            for point in raw_points
+            if is_within_pasto_service_area(point.lat, point.lng)
+        ]
+        couriers = [
+            courier
+            for courier in couriers
+            if courier.current_lat is not None
+            and courier.current_lng is not None
+            and is_within_pasto_service_area(courier.current_lat, courier.current_lng)
+        ]
+    except SQLAlchemyError as error:
+        _log_database_error("No se pudo consultar datos para asignación", error)
+        return _error("No se pudo calcular la asignación de pedidos.", 500)
+
+    candidate_count = 0
+    matrix_source = "not-needed"
+    travel_costs_minutes: dict[tuple[str, str], float | None] = {}
+    road_durations: list[list[float | None]] | None = None
+    if couriers and points:
+        matrix_provider, _ = providers
+        matrix_result: MatrixProviderResult | None = None
+        for _attempt in range(MAX_UNROUTABLE_DROPS + 1):
+            courier_coordinates = [
+                (courier.current_lng, courier.current_lat)
+                for courier in couriers
+                if courier.current_lat is not None and courier.current_lng is not None
+            ]
+            point_coordinates = [(point.lng, point.lat) for point in points]
+            coordinates = [*courier_coordinates, *point_coordinates]
+            if not courier_coordinates or not point_coordinates:
+                break
+            try:
+                matrix_result = await matrix_provider.get_duration_matrix(coordinates)
+                break
+            except RoutingClientError as error:
+                bad = _unroutable_index(error)
+                if bad is None or not 0 <= bad < len(coordinates):
+                    _LOGGER.warning(
+                        "No se pudo obtener la matriz vial para asignar pedidos",
+                        extra={"error_type": type(error).__name__,
+                               "status": getattr(error, "status", None)},
+                    )
+                    return _error(
+                        "No se pudo consultar la red vial para asignar los pedidos. "
+                        "Inténtalo de nuevo.",
+                        502,
+                    )
+                # Un punto sin calle cercana (a más de 50 m) no debe tumbar todo el análisis:
+                # se deja fuera y aparece como «sin asignar».
+                if bad < len(courier_coordinates):
+                    del couriers[bad]
+                else:
+                    del points[bad - len(courier_coordinates)]
+        if matrix_result is None:
+            couriers, points = [], []
+        else:
+            matrix_source = matrix_result.get("source", "osrm")
+            durations = matrix_result["durations_minutes"]
+            distances = matrix_result.get("distances_meters")
+            matrix_size = len(coordinates)
+            if len(durations) != matrix_size or any(len(row) != matrix_size for row in durations):
+                return _error("El proveedor vial devolvió una matriz de asignación inválida.", 502)
+            if distances is not None and (
+                len(distances) != matrix_size
+                or any(len(row) != matrix_size for row in distances)
+            ):
+                return _error("El proveedor vial devolvió distancias inválidas.", 502)
+
+            point_offset = len(courier_coordinates)
+            road_durations = durations
+            for courier_index, courier in enumerate(couriers):
+                for point_index, point in enumerate(points):
+                    pair = (str(courier.id), str(point.id))
+                    destination_index = point_offset + point_index
+                    duration = durations[courier_index][destination_index]
+                    travel_costs_minutes[pair] = duration
+                    if duration is not None:
+                        candidate_count += 1
