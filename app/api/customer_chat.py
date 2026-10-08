@@ -132,3 +132,69 @@ async def chat_about_order(
                 if eta_result.traffic_applied:
                     estimate_basis = (
                         "Se aplicó una señal TomTom parcial solo al primer tramo; los tramos "
+                        "posteriores usan tiempos viales base, no tráfico completo."
+                    )
+                elif eta_result.traffic_configured:
+                    estimate_basis = (
+                        "No se aplicó tráfico TomTom; usar tiempos viales base. "
+                        f"Motivo: {eta_result.traffic_warning or eta_result.traffic_status}."
+                    )
+                else:
+                    estimate_basis = (
+                        "TomTom no está configurado; el ETA usa tiempos viales base."
+                    )
+        except Exception as error:
+            _LOGGER.warning(
+                "No se pudo calcular el ETA para la pregunta del cliente",
+                extra={"error_type": type(error).__name__},
+            )
+
+    provider_notice = _PROVIDER_NOTICE
+    try:
+        reply = await assistant.answer(
+            delivery_status=point.status.value,
+            route_status=point.route.status.value if point.route is not None else None,
+            estimated_minutes_from_now=estimated_minutes_from_now,
+            estimate_basis=estimate_basis,
+            messages=data.messages,
+        )
+    except CustomerChatProviderError as error:
+        _LOGGER.warning(
+            "Se usó la respuesta local de respaldo para el chat de pedidos",
+            extra={"error_type": type(error).__name__},
+        )
+        reply = build_order_fallback_answer(
+            delivery_status=point.status.value,
+            route_status=point.route.status.value if point.route is not None else None,
+            estimated_minutes_from_now=estimated_minutes_from_now,
+            messages=data.messages,
+        )
+        provider_notice = (
+            f"{_PROVIDER_NOTICE} En esta respuesta, la IA no estuvo disponible; "
+            "el respaldo se generó localmente con el estado verificado del pedido."
+        )
+
+    payload = CustomerChatResponse(reply=reply, provider_notice=provider_notice)
+    return JSONResponse(
+        content=payload.model_dump(mode="json", by_alias=True),
+        headers=_NO_STORE,
+    )
+
+
+@router.get("/estado")
+async def customer_chat_status(
+    assistant: Annotated[OrderChatAssistant | None, Depends(get_customer_order_chat)],
+) -> JSONResponse:
+    """Expose whether the provider is configured, without exposing its configuration."""
+    return JSONResponse(
+        content={"configured": assistant is not None},
+        headers=_NO_STORE,
+    )
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        content={"error": message},
+        status_code=status_code,
+        headers=_NO_STORE,
+    )
