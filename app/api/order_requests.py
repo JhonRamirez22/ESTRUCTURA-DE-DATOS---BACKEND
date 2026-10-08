@@ -134,3 +134,71 @@ async def create_order_request(
         )
         repository.add(point)
         DeliveryEventRecorder(session).record(
+            point, DeliveryEventType.REQUESTED, CUSTOMER_ACTOR, to_status="REQUESTED"
+        )
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        return _error("No se pudo registrar la solicitud. Intenta de nuevo.", 409)
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _LOGGER.warning(
+            "No se pudo guardar la solicitud", extra={"error_type": type(error).__name__}
+        )
+        return _error("No se pudo registrar la solicitud.", 500)
+
+    return JSONResponse(
+        {
+            "trackingGuide": point.tracking_token,
+            "reference": point.order_id,
+            "status": "REQUESTED",
+            # Solo distancia y estado: nunca datos de otros clientes.
+            "nearbyStop": nearby,
+        },
+        status_code=201,
+        headers=_NO_STORE,
+    )
+
+
+@router.post("/direccion")
+async def lookup_address(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    geocoder: Annotated[AddressGeocoder | None, Depends(get_address_geocoder)],
+    advisor: Annotated[AddressAiAdvisor | None, Depends(get_address_ai_advisor)],
+) -> JSONResponse:
+    """Deduce la dirección de un cliente: TomTom primero y la IA solo si no hay coincidencias.
+
+    La IA interpreta el texto; las coordenadas salen siempre del geocodificador.
+    """
+    _validate_origin(request, required=True)
+    secret = _configured_secret(get_settings())
+    if secret is None or geocoder is None:
+        return _error(
+            "La búsqueda de direcciones no está disponible; marca el punto en el mapa.", 503
+        )
+    raw = await request.body()
+    if len(raw) > MAX_REQUEST_BODY_BYTES:
+        return _error("La solicitud es demasiado grande.", 413)
+    try:
+        data = AddressLookupRequest.model_validate(json.loads(raw))
+    except (json.JSONDecodeError, UnicodeDecodeError, ValidationError):
+        return _error("Escribe una dirección de 3 a 160 caracteres.", 400)
+    if "<" in data.address or ">" in data.address:
+        return _error("La dirección contiene caracteres no permitidos.", 400)
+
+    cache_key = " ".join(normalize_pasto_address(data.address).casefold().split())
+    cached = _LOOKUP_CACHE.get(cache_key)
+    if cached is not None:
+        return JSONResponse({**cached, "cached": True}, headers=_NO_STORE)
+
+    for limiter, key in (
+        (_LOOKUP_CLIENT_LIMITER, f"direccion:{_client_key(request)}"),
+        (_LOOKUP_SERVICE_LIMITER, "direccion:servicio"),
+    ):
+        retry_after = await limiter.retry_after_shared(session, key, hmac_secret=secret)
+        if retry_after is not None:
+            await session.commit()
+            return JSONResponse(
+                {"error": "Hiciste varias búsquedas seguidas. Marca el punto en el mapa o espera."},
+                status_code=429,
