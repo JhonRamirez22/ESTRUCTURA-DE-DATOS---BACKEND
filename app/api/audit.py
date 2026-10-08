@@ -129,3 +129,68 @@ async def download_report(
             return JSONResponse({"error": "El sujeto no existe."}, status_code=404,
                                 headers=_NO_STORE)
         generated_by = "cuenta de despacho"
+        if requester is not None:
+            account = await session.get(Account, requester)
+            generated_by = account.email if account else generated_by
+        now = datetime.now(UTC).replace(tzinfo=None)
+        # Quién descargó qué queda en el propio registro de auditoría (sin datos del sujeto).
+        session.add(SecurityAuditEvent(
+            account_id=requester, action=f"audit_report:{tipo}", outcome="allowed",
+            request_id=getattr(request.state, "request_id", str(uuid4())), created_at=now,
+        ))
+        await session.commit()
+    except SQLAlchemyError:
+        await session.rollback()
+        return JSONResponse({"error": "No se pudo generar el informe."}, status_code=500,
+                            headers=_NO_STORE)
+    pdf = render_report(data, begin=begin, end=end, generated_by=generated_by, generated_at=now)
+    filename = f"auditoria-{tipo}-{now:%Y%m%d}.pdf"
+    return Response(
+        pdf, media_type="application/pdf",
+        headers={**_NO_STORE, "Content-Disposition": f'attachment; filename="{filename}"',
+                 "X-Content-Type-Options": "nosniff"},
+    )
+
+
+_GENERAL_TITLES = {
+    "summary": "resumen",
+    "couriers": "repartidores",
+    "shipments": "envios",
+    "scheduled": "programados",
+}
+
+
+@router.get("/informe-general")
+async def download_fleet_report(
+    request: Request,
+    claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    tipo: Annotated[ReportKind, Query()],
+    desde: Annotated[date, Query()],
+    hasta: Annotated[date, Query()],
+) -> Response:
+    """PDF con datos de toda la operación en un periodo (no de un solo sujeto)."""
+    account_raw = claims.get("accountId")
+    requester = UUID(account_raw) if account_raw else None
+    retry = _LIMITER.retry_after(hashlib.sha256((account_raw or "dispatcher").encode()).hexdigest())
+    if retry is not None:
+        return JSONResponse(
+            {"error": "Demasiados informes seguidos. Intenta en unos segundos."},
+            status_code=429, headers={**_NO_STORE, "Retry-After": str(retry)},
+        )
+    try:
+        begin, end = period_bounds(desde, hasta)
+    except AuditPeriodError as error:
+        return JSONResponse({"error": str(error)}, status_code=400, headers=_NO_STORE)
+    try:
+        data = await FleetReportBuilder(session).build(tipo, begin, end)
+        generated_by = "cuenta de despacho"
+        if requester is not None:
+            account = await session.get(Account, requester)
+            generated_by = account.email if account else generated_by
+        now = datetime.now(UTC).replace(tzinfo=None)
+        session.add(SecurityAuditEvent(
+            account_id=requester, action=f"audit_report:fleet_{tipo}", outcome="allowed",
+            request_id=getattr(request.state, "request_id", str(uuid4())), created_at=now,
+        ))
+        await session.commit()
