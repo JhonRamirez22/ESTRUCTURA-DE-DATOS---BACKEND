@@ -154,3 +154,80 @@ async def login(
         # Solo para la transición explícita de códigos; nunca crea una contraseña conocida.
         import secrets
 
+        account = Account(
+            email=f"legacy-{courier_id}@local.invalid" if courier_id else
+            "legacy-dispatcher@local.invalid",
+            password_hash=await run_in_threadpool(hash_password, secrets.token_urlsafe(32)),
+            role=role,
+            courier_id=UUID(courier_id) if courier_id else None,
+        )
+        session.add(account)
+        await session.flush()
+    if not account.enabled:
+        return _error("Código de acceso inválido.", 401)
+    _audit(session, request, "login", account.id)
+    return await _login_response(account, session, login_request.return_to, settings, secret)
+
+
+async def _login_response(
+    account: Account,
+    session: AsyncSession,
+    return_to: str | None,
+    settings: Settings,
+    secret: str,
+) -> JSONResponse:
+    token = await create_access_session(session, account_id=account.id)
+    await session.commit()
+    role = cast(SessionRole, account.role)
+    payload = LoginResponse(
+        authenticated=True,
+        redirect_to=_safe_redirect_target(role, return_to),
+        access_token=token,
+    )
+    secure = settings.node_env == "production"
+    response = JSONResponse(
+        content=payload.model_dump(by_alias=True),
+        headers={
+            "Set-Cookie": session_cookie(token, role, secure),
+            "Cache-Control": "no-store, private",
+            "X-CSRF-Token": csrf_token(token, secret),
+            SESSION_ROLE_HEADER: role,
+        },
+    )
+    # La cookie compartida anterior se elimina para que no compita con las de cada rol.
+    response.headers.append(
+        "Set-Cookie", cleared_session_cookie(LEGACY_SESSION_COOKIE_NAME, secure)
+    )
+    return response
+
+
+async def _login_with_password(
+    body: dict[str, object], session: AsyncSession, request: Request,
+) -> JSONResponse:
+    try:
+        credentials = EmailLoginRequest.model_validate(body)
+    except ValidationError:
+        return _error("Ingresa un correo válido y tu contraseña (máximo 128 caracteres).", 400)
+    settings = get_settings()
+    secret = _configured_secret(settings)
+    if secret is None:
+        return _error("El acceso no está configurado: falta AUTH_SECRET (mínimo 32 bytes).", 503)
+    rate_key = f"login:{credentials.email}:{client_key(request)}"
+    retry_after = await _LOGIN_LIMITER.retry_after_shared(session, rate_key, hmac_secret=secret)
+    if retry_after is None:
+        retry_after = await _LOGIN_EMAIL_LIMITER.retry_after_shared(
+            session, f"login-email:{credentials.email}", hmac_secret=secret
+        )
+    if retry_after is not None:
+        return JSONResponse(
+            {"error": "Demasiados intentos. Espera un minuto y vuelve a ingresar."},
+            status_code=429,
+            headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+        )
+    account = await session.scalar(select(Account).where(Account.email == credentials.email))
+    valid = await run_in_threadpool(
+        verify_password,
+        credentials.password.get_secret_value(),
+        account.password_hash if account is not None else _DUMMY_PASSWORD_HASH,
+    )
+    if account is None or not valid or not account.enabled:
