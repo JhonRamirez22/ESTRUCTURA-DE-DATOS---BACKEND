@@ -94,3 +94,51 @@ async def resolve_access_session(
         return None
     result = await session.execute(
         select(AccessSession, Account)
+        .outerjoin(Account, Account.id == AccessSession.account_id)
+        .where(AccessSession.token_digest == token_digest(token))
+    )
+    row = result.one_or_none()
+    if row is None:
+        return None
+    record, account = row
+    instant = now or utc_now()
+    if record.revoked_at is not None:
+        return None
+    expired = record.expires_at <= instant
+    idle = record.account_id is not None and (
+        record.last_seen_at + STAFF_SESSION_IDLE_LIMIT <= instant
+    )
+    disabled = record.account_id is not None and (account is None or not account.enabled)
+    if expired or idle or disabled:
+        record.revoked_at = instant
+        await session.flush()
+        return None
+    if tracking != (record.delivery_point_id is not None):
+        return None
+    if instant - record.last_seen_at >= SESSION_TOUCH_INTERVAL:
+        record.last_seen_at = instant
+        await session.flush()
+    return SessionIdentity(
+        account_id=record.account_id,
+        role=account.role if account else "customer",
+        courier_id=account.courier_id if account else None,
+        delivery_point_id=record.delivery_point_id,
+        expires_at=record.expires_at,
+    )
+
+
+async def revoke_access_session(session: AsyncSession, token: str | None) -> None:
+    if token and _TOKEN_PATTERN.fullmatch(token):
+        await session.execute(
+            update(AccessSession)
+            .where(AccessSession.token_digest == token_digest(token))
+            .values(revoked_at=utc_now())
+        )
+
+
+async def revoke_account_sessions(session: AsyncSession, account_id: UUID) -> None:
+    await session.execute(
+        update(AccessSession)
+        .where(AccessSession.account_id == account_id, AccessSession.revoked_at.is_(None))
+        .values(revoked_at=utc_now())
+    )
