@@ -152,3 +152,79 @@ class RouteRepository:
                 Route.courier_id.in_(courier_ids),
                 Route.status.in_(active_statuses),
             )
+        )
+        return active_courier_id is not None
+
+    async def lock_route(self, route_id: UUID) -> Route | None:
+        return await self._session.scalar(
+            select(Route).where(Route.id == route_id).with_for_update()
+        )
+
+    async def lock_route_with_delivery_points(self, route_id: UUID) -> Route | None:
+        return await self._session.scalar(
+            select(Route)
+            .where(Route.id == route_id)
+            .options(selectinload(Route.delivery_points))
+            .with_for_update()
+        )
+
+    async def lock_route_delivery_points(self, route_id: UUID) -> list[DeliveryPoint]:
+        points = await self._session.scalars(
+            select(DeliveryPoint)
+            .where(DeliveryPoint.route_id == route_id)
+            .with_for_update()
+        )
+        return list(points.all())
+
+    async def release_active_delivery_points(
+        self,
+        route_id: UUID,
+        active_statuses: Sequence[DeliveryPointStatus],
+        *,
+        reset_to_pending: bool,
+    ) -> None:
+        if reset_to_pending:
+            await self._session.execute(
+                update(DeliveryPoint)
+                .where(
+                    DeliveryPoint.route_id == route_id,
+                    DeliveryPoint.status.in_(active_statuses),
+                )
+                .values(
+                    route_id=None,
+                    sequence_index=None,
+                    status=DeliveryPointStatus.PENDING,
+                )
+            )
+            return
+        await self._session.execute(
+            update(DeliveryPoint)
+            .where(
+                DeliveryPoint.route_id == route_id,
+                DeliveryPoint.status.in_(active_statuses),
+            )
+            .values(route_id=None, sequence_index=None)
+        )
+
+    async def mark_pending_delivery_points_en_route(self, route_id: UUID) -> None:
+        await self._session.execute(
+            update(DeliveryPoint)
+            .where(
+                DeliveryPoint.route_id == route_id,
+                DeliveryPoint.status == DeliveryPointStatus.PENDING,
+            )
+            .values(status=DeliveryPointStatus.EN_ROUTE)
+        )
+
+    async def try_assign_delivery_point(
+        self,
+        *,
+        route_id: UUID,
+        point_id: UUID,
+        allowed_statuses: Sequence[DeliveryPointStatus],
+        expected_latitude: float,
+        expected_longitude: float,
+        sequence_index: int,
+    ) -> bool:
+        updated_id = await self._session.scalar(
+            update(DeliveryPoint)
