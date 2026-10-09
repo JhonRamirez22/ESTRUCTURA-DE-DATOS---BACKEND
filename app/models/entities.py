@@ -145,3 +145,76 @@ class DeliveryPoint(Base):
     # 1 normal, 2 alta, 3 urgente: pesa el retraso al ordenar con ventanas horarias.
     priority: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=1, server_default="1"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, server_default=func.now()
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    # UTC instant the customer asked for; ``None`` means "as soon as possible".
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+
+    route: Mapped[Route | None] = relationship(back_populates="delivery_points")
+
+
+class Route(Base):
+    __tablename__ = "routes"
+    __table_args__ = (Index("routes_courier_id_idx", "courier_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    courier_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("couriers.id", ondelete="RESTRICT", onupdate="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[RouteStatus] = mapped_column(
+        _enum_type(RouteStatus, "route_status"),
+        nullable=False,
+        default=RouteStatus.PLANNED,
+    )
+    estimated_duration_minutes: Mapped[float] = mapped_column(Float, nullable=False)
+    estimated_distance_meters: Mapped[float] = mapped_column(Float, nullable=False)
+    baseline_duration_minutes: Mapped[float | None] = mapped_column(Float)
+    baseline_distance_meters: Mapped[float | None] = mapped_column(Float)
+    geometry: Mapped[object | None] = mapped_column(_JSON_COLUMN_TYPE)
+    geometry_provider: Mapped[RouteGeometryProvider | None] = mapped_column(
+        _enum_type(RouteGeometryProvider, "route_geometry_provider")
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    optimized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=False),
+        nullable=True,
+        default=func.now(),
+        server_default=func.now(),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        default=func.now(),
+        onupdate=func.now(),
+    )
+
+    courier: Mapped[Courier] = relationship(back_populates="routes")
+    delivery_points: Mapped[list[DeliveryPoint]] = relationship(
+        back_populates="route",
+        passive_deletes=True,
+    )
+    revisions: Mapped[list[RouteRevision]] = relationship(
+        back_populates="route",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class RouteRevision(Base):
+    """Snapshot de una ruta antes de recalcularla; permite restauración LIFO durable."""
+
+    __tablename__ = "route_revisions"
+    __table_args__ = (
+        UniqueConstraint("route_id", "revision_number", name="route_revisions_route_number_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
