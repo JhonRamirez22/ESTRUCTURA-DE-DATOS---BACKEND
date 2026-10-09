@@ -146,3 +146,77 @@ class _Candidate:
     remove_position: int
     insert_position: int
     remove_delta: float
+    insert_delta: float
+
+
+def _compare(left: _Candidate, right: _Candidate) -> int:
+    if left.gain != right.gain:
+        return -1 if left.gain > right.gain else 1  # larger gain first
+    return (left.key > right.key) - (left.key < right.key)
+
+
+class CrossRouteBalancer:
+    """Greedy best-gain relocation of stops between routes.
+
+    A :class:`SpatialGrid` limits each stop to the routes that own one of its nearest
+    neighbours, and a :class:`MinHeap` ranks the candidate moves so the best is applied first.
+    """
+
+    def __init__(
+        self,
+        matrix: CostMatrix,
+        index: FleetIndex,
+        *,
+        makespan_weight: float = MAKESPAN_WEIGHT,
+        max_moves: int = MAX_MOVES,
+        min_gain: float = MIN_MOVE_GAIN_MINUTES,
+    ) -> None:
+        self._matrix = matrix
+        self._index = index
+        self._weight = makespan_weight
+        self._max_moves = max_moves
+        self._min_gain = min_gain
+
+    def rebalance(self, states: dict[str, _RouteState]) -> list[StopMove]:
+        node_to_stop = {node: stop_id for stop_id, node in self._index.stop_node.items()}
+        owner = {node: route_id for route_id, st in states.items() for node in st.order}
+        grid: SpatialGrid[int] = SpatialGrid()
+        for node in owner:
+            grid.insert(node, self._index.points[node])
+        total_stops = len(owner)
+        cap = max(
+            1,
+            math.floor(total_stops / max(1, len(states)) * LOAD_CAP_MULTIPLIER),
+            max((len(st.order) for st in states.values()), default=0),
+        )
+        moves: list[StopMove] = []
+        for _ in range(self._max_moves):
+            best = self._best_candidate(states, owner, grid, cap)
+            if best is None or best.gain < self._min_gain:
+                break
+            source, target = states[best.source], states[best.target]
+            source.order.pop(best.remove_position)
+            target.order.insert(best.insert_position, best.node)
+            owner[best.node] = best.target
+            moves.append(StopMove(node_to_stop[best.node], best.source, best.target, best.gain))
+        return moves
+
+    def _objective(self, costs: dict[str, float]) -> float:
+        finite = [value for value in costs.values() if math.isfinite(value)]
+        return sum(finite) + self._weight * max(finite, default=0.0)
+
+    def _best_candidate(
+        self,
+        states: dict[str, _RouteState],
+        owner: dict[int, str],
+        grid: SpatialGrid[int],
+        cap: int,
+    ) -> _Candidate | None:
+        matrix = self._matrix
+        costs = {route_id: st.minutes(matrix) for route_id, st in states.items()}
+        base = self._objective(costs)
+        heap: MinHeap[_Candidate, tuple[int, str]] = MinHeap(_compare, lambda item: item.key)
+        for source_id, source in states.items():
+            if len(source.order) <= 1:
+                continue  # never leave a courier without stops
+            for position in range(source.locked, len(source.order)):
