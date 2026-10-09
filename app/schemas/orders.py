@@ -131,3 +131,69 @@ class OrderRequestCreate(BaseModel):
         if "<" in text or ">" in text:
             raise ValueError("address contiene caracteres no permitidos.")
         return text
+
+
+class OrderUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    address: str | None = Field(default=None, min_length=1, max_length=MAX_ADDRESS_LENGTH)
+    lat: _Latitude | None = None
+    lng: _Longitude | None = None
+    order_id: str | None = Field(
+        default=None, min_length=1, max_length=MAX_ORDER_ID_LENGTH, validation_alias="orderId"
+    )
+    status: DeliveryPointStatus | None = None
+    time_window: JsonValue | None = Field(default=None, validation_alias="timeWindow")
+    priority: int | None = Field(default=None, ge=1, le=3)
+    scheduled_for: datetime | None = Field(default=None, validation_alias="scheduledFor")
+    customer_email: str | None = Field(
+        default=None, max_length=320, validation_alias="customerEmail"
+    )
+    email_notifications_enabled: bool | None = Field(
+        default=None, validation_alias="emailNotificationsEnabled"
+    )
+    customer_phone: str | None = Field(
+        default=None, max_length=30, validation_alias="customerPhone"
+    )
+    sms_notifications_enabled: bool | None = Field(
+        default=None, validation_alias="smsNotificationsEnabled"
+    )
+
+    @field_validator("address")
+    @classmethod
+    def _address_text(cls, value: str | None) -> str | None:
+        return _check_text(value, "address", MAX_ADDRESS_LENGTH)
+
+    @field_validator("order_id")
+    @classmethod
+    def _order_id_text(cls, value: str | None) -> str | None:
+        return _check_text(value, "orderId", MAX_ORDER_ID_LENGTH)
+
+    @field_validator("time_window")
+    @classmethod
+    def _time_window_size(cls, value: JsonValue | None) -> JsonValue | None:
+        return _check_time_window(value)
+
+    @field_validator("scheduled_for")
+    @classmethod
+    def _schedule_in_range(cls, value: datetime | None) -> datetime | None:
+        return DeliverySchedule().parse(value)
+
+    @model_validator(mode="after")
+    def validate_update(self) -> OrderUpdateRequest:
+        if not self.model_fields_set:
+            raise ValueError("No hay campos válidos para actualizar.")
+        nullable_fields = {"time_window", "customer_email", "customer_phone", "scheduled_for"}
+        if self.customer_email is not None:
+            self.customer_email = normalize_email(self.customer_email)
+        if (
+            "customer_email" in self.model_fields_set
+            and self.customer_email is None
+            and self.email_notifications_enabled is True
+        ):
+            raise ValueError("Se requiere customerEmail para activar avisos por correo.")
+        if self.email_notifications_enabled is False:
+            self.customer_email = None
+        if self.sms_notifications_enabled is True:
+            if self.customer_phone is None:
+                raise ValueError("Se requiere customerPhone para activar avisos por SMS.")
