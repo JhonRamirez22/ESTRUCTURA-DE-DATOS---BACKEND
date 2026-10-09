@@ -133,3 +133,70 @@ class HttpAddressAiAdvisor:
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {
                         "role": "user",
+                        "content": json.dumps(
+                            request.model_dump(by_alias=True), ensure_ascii=False
+                        ),
+                    },
+                ],
+                "temperature": 0.1,
+                "top_p": 1,
+                "max_tokens": 1024,
+                "stream": False,
+            }
+        return {
+            "contractVersion": request.contract_version,
+            "task": request.task,
+            "model": self._model,
+            "input": request.model_dump(by_alias=True),
+        }
+
+    @staticmethod
+    def _read_chat_content(payload: object) -> object:
+        if not isinstance(payload, dict):
+            raise ValueError("Chat Completions devolvió una respuesta inválida.")
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise ValueError("Chat Completions no devolvió choices.")
+        message = choices[0].get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            raise ValueError("Chat Completions no devolvió contenido.")
+        content = message["content"].strip()
+        if content.startswith("```") and content.endswith("```"):
+            content = content.removeprefix("```").removesuffix("```").strip()
+            if content[:4].lower() == "json":
+                content = content[4:].strip()
+        return json.loads(content)
+
+
+def get_address_ai_advisor() -> AddressAiAdvisor | None:
+    try:
+        return create_address_ai_advisor(get_settings())
+    except ValueError as error:
+        _LOGGER.warning(
+            "La configuración de IA de direcciones no es válida; se usará normalización local",
+            extra={"error_type": type(error).__name__},
+        )
+        return None
+
+
+def create_address_ai_advisor(settings: Settings) -> AddressAiAdvisor | None:
+    """El opt-in evita enviar direcciones/ubicaciones privadas por defecto."""
+    if not settings.ai_allow_location_data_sharing:
+        return None
+    use_groq = settings.ai_traffic_provider == "groq"
+    api_url = (
+        (settings.customer_chat_api_url if use_groq else settings.ai_traffic_api_url) or ""
+    ).strip()
+    if not api_url:
+        return None
+    credential = settings.customer_chat_api_key if use_groq else settings.ai_traffic_api_key
+    key = credential.get_secret_value().strip() if credential is not None else None
+    model = (
+        (settings.customer_chat_model if use_groq else settings.ai_traffic_model) or ""
+    ).strip()
+    return HttpAddressAiAdvisor(
+        api_url=api_url,
+        api_key=key or None,
+        model=model,
+        timeout_ms=settings.ai_traffic_timeout_ms,
+    )
