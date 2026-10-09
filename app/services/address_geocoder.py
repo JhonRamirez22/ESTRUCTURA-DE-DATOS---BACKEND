@@ -123,3 +123,65 @@ class AddressGeocoder:
             )
         results = payload.get("results")
         if not isinstance(results, list):
+            raise AddressGeocoderError(
+                "El servicio de direcciones devolvió una respuesta inválida."
+            )
+
+        suggestions: list[AddressSuggestion] = []
+        seen: set[tuple[float, float]] = set()
+        for item in results[:100]:
+            if not isinstance(item, Mapping):
+                continue
+            position = item.get("position")
+            address_data = item.get("address")
+            if not isinstance(position, Mapping) or not isinstance(address_data, Mapping):
+                continue
+            if isinstance(position.get("lat"), bool) or isinstance(position.get("lon"), bool):
+                continue
+            try:
+                lat = float(position["lat"])
+                lng = float(position["lon"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(lat) or not math.isfinite(lng):
+                continue
+            if not is_within_pasto_service_area(lat, lng):
+                continue
+            if str(address_data.get("countryCode", "")).upper() != "CO":
+                continue
+            municipality = str(address_data.get("municipality", "")).strip().casefold()
+            if municipality != "pasto":
+                continue
+            label = address_data.get("freeformAddress")
+            if not isinstance(label, str) or not label.strip():
+                continue
+            key = (round(lat, 6), round(lng, 6))
+            if key in seen:
+                continue
+            seen.add(key)
+            suggestions.append(
+                AddressSuggestion(
+                    address=normalize_pasto_address(label), lat=lat, lng=lng,
+                    precision={
+                        "Point Address": "address", "Cross Street": "intersection",
+                    }.get(str(item.get("type")), "approximate"),
+                )
+            )
+        return suggestions
+
+
+def get_address_geocoder() -> AddressGeocoder | None:
+    settings = get_settings()
+    if settings.tomtom_api_key is None:
+        return None
+    api_key = settings.tomtom_api_key.get_secret_value().strip()
+    if not api_key:
+        return None
+    return AddressGeocoder(api_key=api_key)
+
+
+def create_address_geocoder(settings: Settings) -> AddressGeocoder | None:
+    if settings.tomtom_api_key is None:
+        return None
+    key = settings.tomtom_api_key.get_secret_value().strip()
+    return AddressGeocoder(api_key=key) if key else None
