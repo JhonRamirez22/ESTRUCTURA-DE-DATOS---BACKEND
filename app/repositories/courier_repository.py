@@ -95,3 +95,51 @@ class CourierRepository:
             select(DeliveryPoint)
             .join(Route, Route.id == DeliveryPoint.route_id)
             .where(
+                Route.courier_id == courier_id,
+                Route.status == RouteStatus.IN_PROGRESS,
+                DeliveryPoint.status == DeliveryPointStatus.EN_ROUTE,
+            )
+            .order_by(DeliveryPoint.sequence_index.asc())
+            .limit(1)
+        )
+
+    async def courier_exists(self, courier_id: UUID) -> bool:
+        existing_id = await self._session.scalar(
+            select(Courier.id).where(Courier.id == courier_id)
+        )
+        return existing_id is not None
+
+    async def record_location(
+        self,
+        *,
+        courier_id: UUID,
+        latitude: float,
+        longitude: float,
+        recorded_at: datetime,
+    ) -> tuple[LocationEvent, bool]:
+        event = LocationEvent(
+            courier_id=courier_id,
+            lat=latitude,
+            lng=longitude,
+            recorded_at=recorded_at,
+        )
+        self._session.add(event)
+        active_route_id = await self.get_active_route_id(courier_id)
+        updated_id = await self._session.scalar(
+            update(Courier)
+            .where(
+                Courier.id == courier_id,
+                or_(Courier.last_location_at.is_(None), Courier.last_location_at < recorded_at),
+            )
+            .values(
+                current_lat=latitude,
+                current_lng=longitude,
+                last_location_at=recorded_at,
+                status=CourierStatus.ON_ROUTE
+                if active_route_id is not None
+                else CourierStatus.AVAILABLE,
+            )
+            .returning(Courier.id)
+        )
+        await self._session.flush()
+        return event, updated_id == courier_id
