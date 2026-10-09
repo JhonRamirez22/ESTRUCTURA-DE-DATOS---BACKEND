@@ -165,3 +165,86 @@ async def create_route(
         return _error("Debes iniciar sesión para continuar.", 401)
     if claims["role"] != "dispatcher":
         return _error("Se requiere una sesión de despacho.", 403)
+    parsed = await _read_model(request, CreateRouteRequest)
+    if isinstance(parsed, JSONResponse):
+        return parsed
+    if len(set(parsed.delivery_point_ids)) != len(parsed.delivery_point_ids):
+        return _error("deliveryPointIds no puede contener duplicados.", 400)
+    matrix_provider, route_provider = providers
+    try:
+        plan = await build_optimized_route_plan(
+            session,
+            parsed.courier_id,
+            parsed.delivery_point_ids,
+            matrix_provider=cast(MatrixProvider, matrix_provider),
+            route_provider=cast(RouteProvider, route_provider),
+            traffic_ai_advisor=advisor,
+            traffic_provider=traffic,
+            order_advisor=order_advisor,
+        )
+        result = await create_optimized_route(session, plan, EventActor.from_claims(claims))
+        return _json(_operation_json(result), status_code=201, headers=_NO_STORE)
+    except RoutePlanningError as error:
+        return _error(str(error), error.status_code)
+    except IntegrityError as error:
+        await session.rollback()
+        _log_database_error("Conflicto al guardar la ruta", error)
+        return _error("Un pedido o el repartidor cambió mientras se creaba la ruta.", 409)
+    except (RoutingClientError, TimeoutError) as error:
+        _LOGGER.warning(
+            "No se pudo obtener una ruta vial",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error(
+            "El proveedor vial no pudo calcular la matriz o el trazado. "
+            "La ruta no se guardó sin calles verificadas.",
+            502,
+        )
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_database_error("No se pudo guardar la ruta", error)
+        return _error("No se pudo crear la ruta.", 500)
+
+
+@router.get("/{route_id}")
+async def get_route(
+    route_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> JSONResponse:
+    authorized = _authorize_route_id(route_id, claims)
+    if isinstance(authorized, JSONResponse):
+        return authorized
+    parsed_id, dispatcher = authorized
+    try:
+        route = await RouteRepository(session).load_route(parsed_id)
+        if route is None:
+            return _error("La ruta no existe.", 404)
+        if (
+            claims is not None
+            and claims["role"] == "courier"
+            and route.courier_id != _claim_courier_id(claims)
+        ):
+            return _error("La ruta no existe.", 404)
+        can_undo = bool(
+            dispatcher
+            and await RouteRepository(session).route_ids_with_revisions([route.id])
+        )
+        return _json(
+            {"route": _route_json(route, dispatcher=dispatcher, can_undo=can_undo)},
+            headers=_NO_STORE,
+        )
+    except SQLAlchemyError as error:
+        _log_database_error("No se pudo consultar la ruta", error)
+        return _error("No se pudieron consultar las rutas.", 500)
+
+
+@router.patch("/{route_id}")
+async def patch_route_status(
+    route_id: str,
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> JSONResponse:
+    authorized = _authorize_route_id(route_id, claims)
+    if isinstance(authorized, JSONResponse):
