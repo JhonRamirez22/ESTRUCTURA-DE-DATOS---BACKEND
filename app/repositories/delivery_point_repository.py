@@ -109,3 +109,58 @@ class DeliveryPointRepository:
         result = await self._session.scalars(
             select(DeliveryPoint).where(
                 DeliveryPoint.status.in_(
+                    [DeliveryPointStatus.PENDING, DeliveryPointStatus.EN_ROUTE]
+                ),
+                DeliveryPoint.lat.between(lat - lat_delta, lat + lat_delta),
+                DeliveryPoint.lng.between(lng - lng_delta, lng + lng_delta),
+            ).limit(MAX_LIST_ROWS)
+        )
+        return list(result.all())
+
+    async def count_requested(self) -> int:
+        """Solicitudes de clientes en espera; acota cuántas puede acumular la bandeja."""
+        total = await self._session.scalar(
+            select(func.count())
+            .select_from(DeliveryPoint)
+            .where(DeliveryPoint.status == DeliveryPointStatus.REQUESTED)
+        )
+        return int(total or 0)
+
+    async def accept_request(self, point_id: UUID) -> bool:
+        """Pasa una solicitud a pedido pendiente; falla si otro despachador ya la resolvió."""
+        result = await self._session.execute(
+            update(DeliveryPoint)
+            .where(
+                DeliveryPoint.id == point_id,
+                DeliveryPoint.status == DeliveryPointStatus.REQUESTED,
+                DeliveryPoint.route_id.is_(None),
+            )
+            .values(status=DeliveryPointStatus.PENDING)
+            .returning(DeliveryPoint.id)
+        )
+        return result.scalar_one_or_none() == point_id
+
+    async def reject_request(self, point_id: UUID) -> bool:
+        """Descarta una solicitud no aceptada: nunca entró a la operación."""
+        result = await self._session.execute(
+            delete(DeliveryPoint)
+            .where(
+                DeliveryPoint.id == point_id,
+                DeliveryPoint.status == DeliveryPointStatus.REQUESTED,
+                DeliveryPoint.route_id.is_(None),
+            )
+            .returning(DeliveryPoint.id)
+        )
+        return result.scalar_one_or_none() == point_id
+
+    async def delete_if_pending_unassigned(self, point_id: UUID) -> bool:
+        result = await self._session.execute(
+            delete(DeliveryPoint)
+            .where(
+                DeliveryPoint.id == point_id,
+                DeliveryPoint.status == DeliveryPointStatus.PENDING,
+                DeliveryPoint.route_id.is_(None),
+            )
+            .returning(DeliveryPoint.id)
+        )
+        return result.scalar_one_or_none() == point_id
