@@ -127,3 +127,67 @@ class BaselinePlanner:
                 for sid, p in zip(stop_ids, scenario.stops, strict=True)
             ],
             AssignOrdersOptions(travel_costs_minutes=travel),
+        )
+        improved = improve_assignment(
+            matrix.rows,
+            {cid: i for i, cid in enumerate(courier_ids)},
+            {sid: c_count + i for i, sid in enumerate(stop_ids)},
+            assigned,
+        ).assignments
+        pipeline = RoutePipeline.standard()
+        routes: list[Route] = []
+        for c_index, cid in enumerate(courier_ids):
+            nodes = [c_index, *(c_count + int(sid[1:]) for sid in improved[cid])]
+            order = pipeline.improve(matrix, nodes).order
+            stops = [
+                Stop(f"s{node - c_count}", scenario.stops[node - c_count]) for node in order[1:]
+            ]
+            routes.append(Route(cid, CourierState(cid, scenario.couriers[c_index]), stops))
+        fleet = Fleet(routes)
+        index = fleet.index()
+        # Re-index the matrix in the fleet's own node order (couriers first, then route stops).
+        return fleet, street_matrix(list(index.points))
+
+
+class BenchmarkRunner:
+    """Scores the baseline and the live re-optimiser on every scenario."""
+
+    def __init__(self, generator: ScenarioGenerator | None = None) -> None:
+        self._generator = generator or ScenarioGenerator()
+        self._baseline = BaselinePlanner()
+
+    def run(self, scenarios: list[Scenario] | None = None) -> list[BenchmarkRow]:
+        rows: list[BenchmarkRow] = []
+        for scenario in scenarios or self._generator.battery():
+            fleet, matrix = self._baseline.plan(scenario)
+            proposal = LiveFleetReoptimizer(fleet, matrix).propose()
+            rows.append(BenchmarkRow(scenario.name, proposal.score_before, proposal.score_after))
+        return rows
+
+    @staticmethod
+    def summarize(rows: list[BenchmarkRow]) -> dict[str, float]:
+        def mean(values: list[float]) -> float:
+            return sum(values) / len(values) if values else 0.0
+
+        gains = [row.objective_gain for row in rows]
+        return {
+            "scenarios": float(len(rows)),
+            "improved": float(sum(1 for gain in gains if gain > 0.05)),
+            "neverWorse": float(all(gain >= -1e-6 for gain in gains)),
+            "meanTotalBefore": mean([r.baseline.total_minutes for r in rows]),
+            "meanTotalAfter": mean([r.reoptimized.total_minutes for r in rows]),
+            "meanLongestBefore": mean([r.baseline.longest_minutes for r in rows]),
+            "meanLongestAfter": mean([r.reoptimized.longest_minutes for r in rows]),
+            "meanCrossingsBefore": mean([float(r.baseline.crossings) for r in rows]),
+            "meanCrossingsAfter": mean([float(r.reoptimized.crossings) for r in rows]),
+            "meanGapBefore": mean(
+                [r.baseline.lower_bound_gap for r in rows if r.baseline.lower_bound_gap is not None]
+            ),
+            "meanGapAfter": mean(
+                [
+                    r.reoptimized.lower_bound_gap
+                    for r in rows
+                    if r.reoptimized.lower_bound_gap is not None
+                ]
+            ),
+        }
