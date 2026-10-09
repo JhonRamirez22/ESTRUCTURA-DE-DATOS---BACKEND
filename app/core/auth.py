@@ -138,3 +138,73 @@ def verify_session_token(
 
     return cast(SessionClaims, value)
 
+
+def session_cookie_name(role: SessionRole) -> str:
+    """Cada rol tiene su propia cookie: un inicio de sesión en otro rol no reemplaza la primera."""
+    return SESSION_COOKIE_NAMES[role]
+
+
+def read_session_token(cookie_header: str | None, role: SessionRole) -> str | None:
+    return _read_cookie(cookie_header, session_cookie_name(role))
+
+
+def read_bearer_token(authorization: str | None) -> str | None:
+    """Token de `Authorization: Bearer <token>`; None si falta o está mal formado."""
+    if not authorization:
+        return None
+    scheme, _, value = authorization.partition(" ")
+    value = value.strip()
+    if scheme.lower() != "bearer" or not value or len(value) > 512 or " " in value:
+        return None
+    return value
+
+
+def read_legacy_session_token(cookie_header: str | None) -> str | None:
+    return _read_cookie(cookie_header, LEGACY_SESSION_COOKIE_NAME)
+
+
+def _read_cookie(cookie_header: str | None, cookie_name: str) -> str | None:
+    if not cookie_header:
+        return None
+    for entry in cookie_header.split(";"):
+        name, separator, value = entry.strip().partition("=")
+        if name == cookie_name:
+            return value if separator and value else None
+    return None
+
+
+def session_cookie(token: str, role: SessionRole, secure: bool) -> str:
+    parts = [
+        f"{session_cookie_name(role)}={token}",
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Strict",
+        f"Max-Age={SESSION_MAX_AGE_SECONDS}",
+    ]
+    if secure:
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+def cleared_session_cookie(cookie_name: str, secure: bool) -> str:
+    parts = [
+        f"{cookie_name}=",
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Strict",
+        "Max-Age=0",
+    ]
+    if secure:
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+def _encode_base64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _decode_base64url(value: str) -> bytes:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("Invalid base64url value")
+    padded = value + "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
