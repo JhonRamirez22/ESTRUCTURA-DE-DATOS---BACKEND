@@ -164,3 +164,86 @@ async def get_delivery_point(
         if point is None:
             return _error("El pedido no existe.", 404)
         if not _is_dispatcher(claims) and not _belongs_to_courier(point, claims):
+            return _error("El pedido no existe.", 404)
+        return _json(
+            {
+                "deliveryPoint": _point_json(
+                    point,
+                    include_route=_is_dispatcher(claims),
+                    include_tracking=_is_dispatcher(claims),
+                )
+            },
+            headers=_NO_STORE,
+        )
+    except SQLAlchemyError as error:
+        _log_database_error("No se pudo consultar el pedido", error)
+        return _error("No se pudo procesar el pedido.", 500)
+
+
+@router.patch("/{delivery_point_id}")
+async def update_delivery_point(
+    delivery_point_id: str,
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    advisor: Annotated[AddressAiAdvisor | None, Depends(get_address_ai_advisor)],
+) -> JSONResponse:
+    parsed_id = _parse_uuid(delivery_point_id)
+    if parsed_id is None:
+        return _error("El pedido no existe.", 404)
+    if claims is None:
+        return _error("Debes iniciar sesión para continuar.", 401)
+
+    is_dispatcher = _is_dispatcher(claims)
+    courier_id = _session_courier_id(claims)
+    if not is_dispatcher and courier_id is None:
+        return _error("Se requiere una sesión de despacho.", 403)
+
+    body = await _read_json_object(request)
+    if isinstance(body, JSONResponse):
+        return body
+    try:
+        data = OrderUpdateRequest.model_validate(body)
+    except ValidationError as error:
+        return _validation_error(error)
+    fields = data.model_fields_set
+
+    try:
+        repository = DeliveryPointRepository(session)
+        point = await repository.get_delivery_point(parsed_id, include_route=True)
+        if point is None:
+            return _error("El pedido no existe.", 404)
+        if courier_id is not None and not _belongs_to_courier(point, claims):
+            return _error("El pedido no existe.", 404)
+
+        # Una solicitud de cliente solo se resuelve en /solicitudes (aceptar o rechazar).
+        if point.status is DeliveryPointStatus.REQUESTED:
+            return _error("Acepta o rechaza la solicitud antes de modificarla.", 409)
+        if "status" in fields and data.status is DeliveryPointStatus.REQUESTED:
+            return _error("Un pedido no puede volver a ser solicitud.", 400)
+
+        if (
+            is_dispatcher
+            and point.route is not None
+            and point.route.status in {RouteStatus.PLANNED, RouteStatus.IN_PROGRESS}
+            and fields.intersection({"address", "lat", "lng"})
+        ):
+            return _error(
+                "No se puede cambiar la dirección o ubicación con una ruta activa. "
+                "Cancela la ruta antes de corregir el pedido y vuelve a optimizar.",
+                409,
+            )
+
+        if courier_id is not None:
+            if fields != {"status"}:
+                return _error(
+                    "El repartidor solo puede actualizar el estado de sus propias entregas.",
+                    403,
+                )
+            if point.route is None or point.route.status is not RouteStatus.IN_PROGRESS:
+                return _error("Solo puedes reportar entregas de una ruta que esté en curso.", 409)
+            if point.status not in {
+                DeliveryPointStatus.PENDING,
+                DeliveryPointStatus.EN_ROUTE,
+            }:
+                return _error("Esta entrega ya tiene un estado final y no puede modificarse.", 409)
