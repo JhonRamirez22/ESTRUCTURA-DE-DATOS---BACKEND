@@ -140,3 +140,73 @@ async def get_tracking(
         try:
             matrix_result = await matrix_provider.get_duration_matrix(
                 [
+                    (shared_position[1], shared_position[0]),
+                    *((point.lng, point.lat) for point in remaining_points),
+                ]
+            )
+        except Exception as error:
+            _LOGGER.warning(
+                "No se pudo calcular el ETA vial del seguimiento",
+                extra={"error_type": type(error).__name__},
+            )
+            estimate_warning = (
+                "El ETA por calles no está disponible ahora; "
+                "no se estimó con distancias en línea recta."
+            )
+
+    geometry: GeoJsonLineString | None = None
+    geometry_provider: str | None = None
+    road_distance_meters: float | None = None
+    road_duration_minutes: float | None = None
+    road_route: RouteResult | None = None
+    navigation_warning: str | None = None
+    if shared_position is not None:
+        # La guía solo autoriza compartir el tramo hacia su propio pedido.
+        try:
+            road_route = await route_provider.get_route(
+                [
+                    (shared_position[1], shared_position[0]),
+                    (delivery_point.lng, delivery_point.lat),
+                ]
+            )
+            if road_route["geometry_provider"] in {"OSRM", "ORS"}:
+                geometry = road_route["geometry"]
+                geometry_provider = road_route["geometry_provider"]
+                road_distance_meters = road_route["distance_meters"]
+                road_duration_minutes = road_route["duration_minutes"]
+            else:
+                road_route = None
+                navigation_warning = (
+                    "El proveedor no verificó el trazado por calles. "
+                    "No se muestra una línea recta como ruta vial."
+                )
+        except Exception as error:
+            _LOGGER.warning(
+                "No se pudo calcular el trayecto privado de seguimiento",
+                extra={"error_type": type(error).__name__},
+            )
+            navigation_warning = (
+                "No fue posible calcular ahora el trayecto por calles. "
+                "No se muestra una línea recta como si fuera una ruta vial."
+            )
+    else:
+        navigation_warning = (
+            "La ubicación reciente del repartidor o el motor de rutas no está disponible."
+            if may_show_courier
+            else (
+                "Este pedido no está activo en una ruta; "
+                "no se comparte la ubicación del repartidor."
+            )
+        )
+
+    first_leg_traffic: FirstLegTrafficEstimate | None = None
+    if shared_position is not None and remaining_points:
+        first_point = remaining_points[0]
+        is_first_point_target = first_point.id == delivery_point.id
+        matrix_durations = matrix_result["durations_minutes"] if matrix_result else None
+        matrix_distances = matrix_result.get("distances_meters") if matrix_result else None
+        base_duration = (
+            matrix_durations[0][1]
+            if matrix_durations is not None
+            else road_duration_minutes if is_first_point_target else None
+        )
