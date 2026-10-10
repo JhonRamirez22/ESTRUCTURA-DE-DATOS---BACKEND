@@ -104,3 +104,56 @@ class CustomerChatRateLimiter:
             insert_statement.values(
                 guide_hash=guide_digest,
                 window_started_at=instant,
+                request_count=1,
+            )
+            .on_conflict_do_update(
+                index_elements=[CustomerChatRateLimitWindow.guide_hash],
+                set_={
+                    "window_started_at": case(
+                        (expired, instant),
+                        else_=CustomerChatRateLimitWindow.window_started_at,
+                    ),
+                    "request_count": case(
+                        (expired, 1),
+                        (
+                            CustomerChatRateLimitWindow.request_count < self._max_requests + 1,
+                            CustomerChatRateLimitWindow.request_count + 1,
+                        ),
+                        else_=self._max_requests + 1,
+                    ),
+                },
+            )
+            .returning(
+                CustomerChatRateLimitWindow.window_started_at,
+                CustomerChatRateLimitWindow.request_count,
+            )
+        )
+        stored_window_start, stored_request_count = (await session.execute(statement)).one()
+        window_started_at = cast(datetime, stored_window_start)
+        request_count = cast(int, stored_request_count)
+
+        self._database_checks += 1
+        if self._database_checks % _DATABASE_CLEANUP_EVERY_CHECKS == 0:
+            await session.execute(
+                delete(CustomerChatRateLimitWindow).where(
+                    CustomerChatRateLimitWindow.window_started_at <= cutoff
+                )
+            )
+        await session.commit()
+
+        if request_count <= self._max_requests:
+            return None
+        retry_at = window_started_at + timedelta(seconds=self._window_seconds)
+        return max(1, math.ceil((retry_at - instant).total_seconds()))
+
+    def _remove_expired(self, cutoff: float) -> None:
+        for guide_digest, requests in tuple(self._requests.items()):
+            while requests and requests[0] <= cutoff:
+                requests.popleft()
+            if not requests:
+                del self._requests[guide_digest]
+
+
+def _as_naive_utc(value: datetime) -> datetime:
+    normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return normalized.replace(tzinfo=None)
