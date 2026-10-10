@@ -166,3 +166,86 @@ async def collect_courier_report(
                 LocationEvent.courier_id == courier_id,
                 LocationEvent.recorded_at >= begin,
                 LocationEvent.recorded_at < end,
+            )
+            .order_by(LocationEvent.recorded_at.asc())
+            .limit(50_000)
+        )
+    ).all()
+    routes = (
+        await session.scalars(
+            select(Route)
+            .where(
+                Route.courier_id == courier_id,
+                Route.created_at >= begin,
+                Route.created_at < end,
+            )
+            .order_by(Route.created_at.desc())
+        )
+    ).all()
+    route_ids = [route.id for route in routes]
+    points = (
+        list(
+            (
+                await session.scalars(
+                    select(DeliveryPoint).where(DeliveryPoint.route_id.in_(route_ids))
+                )
+            ).all()
+        )
+        if route_ids
+        else []
+    )
+    by_route: dict[UUID, list[DeliveryPoint]] = defaultdict(list)
+    for point in points:
+        if point.route_id is not None:
+            by_route[point.route_id].append(point)
+    delivered = sum(p.status == DeliveryPointStatus.DELIVERED for p in points)
+    failed = sum(p.status == DeliveryPointStatus.FAILED for p in points)
+
+    data = ReportData(
+        "Auditoría de repartidor",
+        [
+            ("Repartidor", courier.name),
+            ("Teléfono", courier.phone),
+            ("Estado actual", courier.status.value),
+            ("Última ubicación", local(courier.last_location_at)),
+            ("Cuenta", account.email if account else "Sin cuenta de correo"),
+            ("Cuenta habilitada", "Sí" if account and account.enabled else "No"),
+            ("Rutas en el periodo", str(len(routes))),
+            ("Entregas completadas / fallidas", f"{delivered} / {failed}"),
+            ("Eventos GPS / distancia", f"{len(events)} / {_distance_km(events):.1f} km"),
+        ],
+    )
+
+    route_rows = []
+    for route in routes:
+        stops = by_route.get(route.id, [])
+        actual = (
+            f"{(route.completed_at - route.started_at).total_seconds() / 60:.0f}"
+            if route.started_at and route.completed_at
+            else "—"
+        )
+        route_rows.append([
+            local(route.created_at), route.status.value, str(len(stops)),
+            str(sum(p.status == DeliveryPointStatus.DELIVERED for p in stops)),
+            str(sum(p.status == DeliveryPointStatus.FAILED for p in stops)),
+            f"{route.estimated_duration_minutes:.0f}",
+            "—" if route.baseline_duration_minutes is None
+            else f"{route.baseline_duration_minutes:.0f}",
+            actual,
+        ])
+    rows, note = _cap(route_rows, len(route_rows))
+    data.sections.append(Section(
+        "Rutas", ["Creada", "Estado", "Paradas", "Entreg.", "Fallid.", "Est. min", "Base min",
+                  "Real min"], rows, [3, 3, 2, 2, 2, 2, 2, 2], note,
+    ))
+
+    point_rows = [
+        [route_ref, point.order_id, point.status.value, point.address]
+        for route in routes
+        for point in sorted(by_route.get(route.id, []), key=lambda p: p.sequence_index or 0)
+        for route_ref in [local(route.created_at)]
+    ]
+    rows, note = _cap(point_rows, len(point_rows))
+    data.sections.append(Section(
+        "Entregas asignadas", ["Ruta creada", "Pedido", "Estado", "Dirección"], rows,
+        [3, 3, 2, 6], note,
