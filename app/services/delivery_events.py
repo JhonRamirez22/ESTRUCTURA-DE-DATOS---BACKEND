@@ -98,3 +98,52 @@ class DeliveryEventRecorder:
         *,
         courier_id: UUID | None = None,
     ) -> None:
+        kind = _STATUS_EVENT.get(new)
+        if kind is None:
+            return  # other status moves are recorded as assignment, start or release
+        self.record(point, kind, actor, from_status=previous, to_status=new, courier_id=courier_id)
+
+    def rescheduled(
+        self, point: DeliveryPoint, before: datetime | None, after: datetime | None,
+        actor: EventActor,
+    ) -> None:
+        kind = DeliveryEventType.SCHEDULED if before is None else DeliveryEventType.RESCHEDULED
+        detail = f"{_when(before)} → {_when(after)}"
+        self.record(point, kind, actor, detail=detail)
+
+    def assigned(
+        self, points: Iterable[DeliveryPoint], route_id: UUID, courier_id: UUID,
+        actor: EventActor,
+    ) -> None:
+        for point in points:
+            self.record(
+                point, DeliveryEventType.ASSIGNED, actor, route_id=route_id, courier_id=courier_id
+            )
+
+    def started(self, points: Iterable[DeliveryPoint], actor: EventActor) -> None:
+        for point in points:
+            self.record(
+                point, DeliveryEventType.STARTED, actor,
+                from_status="PENDING", to_status="EN_ROUTE",
+            )
+
+    def deleted(self, point: DeliveryPoint, actor: EventActor) -> None:
+        """The shipment row is gone, so the event keeps only its order reference."""
+        self.record(
+            point, DeliveryEventType.DELETED, actor,
+            from_status=point.status.value, keep_link=False,
+        )
+
+    def rejected(self, point: DeliveryPoint, actor: EventActor) -> None:
+        self.record(
+            point, DeliveryEventType.REJECTED, actor,
+            from_status="REQUESTED", keep_link=False,
+        )
+
+    def released(self, points: Iterable[DeliveryPoint], actor: EventActor, detail: str) -> None:
+        for point in points:
+            self.record(point, DeliveryEventType.RELEASED, actor, detail=detail)
+
+
+def _when(moment: datetime | None) -> str:
+    return "—" if moment is None else moment.strftime("%Y-%m-%d %H:%M UTC")
