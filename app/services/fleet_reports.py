@@ -126,3 +126,66 @@ class FleetReportBuilder:
             select(DeliveryEvent.courier_id, DeliveryEvent.event_type, func.count())
             .where(DeliveryEvent.occurred_at >= begin, DeliveryEvent.occurred_at < end,
                    DeliveryEvent.courier_id.is_not(None))
+            .group_by(DeliveryEvent.courier_id, DeliveryEvent.event_type)
+        )).all()
+        for courier_id, kind, count in rows:
+            by_courier[str(courier_id)][kind] = int(count)
+        routes = (await self._session.scalars(
+            select(Route).where(Route.created_at >= begin, Route.created_at < end)
+        )).all()
+        per_route: dict[str, list[Route]] = defaultdict(list)
+        for route in routes:
+            per_route[str(route.courier_id)].append(route)
+        table: list[list[str]] = []
+        for courier in couriers:
+            counts = by_courier.get(str(courier.id), {})
+            mine = per_route.get(str(courier.id), [])
+            delivered, failed = counts.get("DELIVERED", 0), counts.get("FAILED", 0)
+            finished = [r for r in mine if r.started_at and r.completed_at
+                        and r.status == RouteStatus.COMPLETED]
+            actual = [(r.completed_at - r.started_at).total_seconds() / 60  # type: ignore[operator]
+                      for r in finished]
+            estimated = [r.estimated_duration_minutes for r in finished]
+            km = await self._gps_km(courier.id, begin, end)
+            table.append([
+                courier.name, str(len(mine)), str(counts.get("ASSIGNED", 0)), str(delivered),
+                str(failed),
+                f"{100 * delivered / (delivered + failed):.0f} %" if delivered + failed else "—",
+                _minutes(sum(actual) / len(actual) if actual else None),
+                _minutes(sum(estimated) / len(estimated) if estimated else None),
+                f"{km:.1f}",
+            ])
+        data = ReportData(
+            "Rendimiento por repartidor",
+            [("Repartidores", str(len(couriers))), ("Rutas del periodo", str(len(routes)))],
+        )
+        data.sections.append(Section(
+            "Por repartidor",
+            ["Repartidor", "Rutas", "Asig.", "Entreg.", "Fallid.", "Éxito", "Real min", "Est. min",
+             "Km GPS"],
+            table, [4, 2, 2, 2, 2, 2, 2, 2, 2],
+        ))
+        return data
+
+    async def _gps_km(self, courier_id: object, begin: datetime, end: datetime) -> float:
+        events = (await self._session.scalars(
+            select(LocationEvent)
+            .where(LocationEvent.courier_id == courier_id,
+                   LocationEvent.recorded_at >= begin, LocationEvent.recorded_at < end)
+            .order_by(LocationEvent.recorded_at.asc()).limit(20_000)
+        )).all()
+        total = 0.0
+        for a, b in zip(events, events[1:], strict=False):
+            step = haversine_m(a.lat, a.lng, b.lat, b.lng)
+            if step <= GPS_GAP_BREAK_M:
+                total += step
+        return total / 1000.0
+
+    # ---- shipment history ---------------------------------------------------------------
+
+    async def shipments(self, begin: datetime, end: datetime) -> ReportData:
+        total = int(await self._session.scalar(
+            select(func.count()).select_from(DeliveryPoint)
+            .where(DeliveryPoint.created_at >= begin, DeliveryPoint.created_at < end)) or 0)
+        rows = (await self._session.execute(
+            select(DeliveryPoint, Courier.name)
