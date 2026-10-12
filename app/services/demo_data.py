@@ -129,3 +129,68 @@ async def seed_demo(
     if dispatcher_password:
         accounts += await _upsert_account(
             session, DISPATCHER_EMAIL, dispatcher_password, "dispatcher", None
+        )
+    if courier_password:
+        accounts += await _upsert_account(
+            session, COURIER_EMAIL, courier_password, "courier",
+            demo_id(f"courier:{DEMO_COURIERS[0][0]}"),
+        )
+    await session.commit()
+    return SeedSummary(len(DEMO_COURIERS), created, accounts)
+
+
+async def refresh_demo_gps(session: AsyncSession, *, now: datetime) -> int:
+    """Renueva la posición y la hora GPS de los repartidores demo disponibles; no crea nada."""
+    renewed = 0
+    for name, _phone, lat, lng in DEMO_COURIERS:
+        courier = await session.get(Courier, demo_id(f"courier:{name}"))
+        if courier is not None and courier.status == CourierStatus.AVAILABLE:
+            courier.current_lat, courier.current_lng, courier.last_location_at = lat, lng, now
+            renewed += 1
+    await session.commit()
+    return renewed
+
+
+async def reset_operational_data(session: AsyncSession) -> dict[str, int]:
+    """Borra pedidos, rutas, repartidores y eventos. Conserva cuentas, sesiones y auditoría."""
+    counts: dict[str, int] = {}
+    for model in _OPERATIONAL_TABLES:
+        total = await session.scalar(select(func.count()).select_from(model))
+        counts[model.__tablename__] = int(total or 0)
+    for model in _OPERATIONAL_TABLES:
+        await session.execute(delete(model))
+    # Las cuentas de repartidor referencian couriers con ON DELETE CASCADE: se retiran solas.
+    await session.commit()
+    return counts
+
+
+async def count_operational_data(session: AsyncSession) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for model in _OPERATIONAL_TABLES:
+        total = await session.scalar(select(func.count()).select_from(model))
+        counts[model.__tablename__] = int(total or 0)
+    return counts
+
+
+async def _upsert_account(
+    session: AsyncSession, email: str, password: str, role: str, courier_id: uuid.UUID | None,
+) -> int:
+    if len(password) < MIN_DEMO_PASSWORD_LENGTH:
+        raise ValueError(f"La contraseña de {email} debe tener al menos 12 caracteres.")
+    account = await session.scalar(select(Account).where(Account.email == email))
+    if account is None:
+        session.add(
+            AccountModel(
+                email=email, password_hash=hash_password(password), role=role,
+                courier_id=courier_id, enabled=True,
+            )
+        )
+    else:
+        account.password_hash = hash_password(password)
+        account.enabled = True
+    return 1
+
+
+def _require_inside_pasto(lat: float, lng: float) -> None:
+    if not is_within_pasto_service_area(lat, lng):
+        raise ValueError("Una coordenada de demo quedó fuera de la zona de servicio de Pasto.")
