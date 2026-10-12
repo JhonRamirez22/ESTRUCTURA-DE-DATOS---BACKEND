@@ -156,3 +156,82 @@ class HttpOrderChatAssistant:
         *,
         api_url: str,
         api_key: str,
+        model: str,
+        timeout_ms: int,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        if not api_url.startswith("https://"):
+            raise ValueError("CUSTOMER_CHAT_API_URL debe usar HTTPS.")
+        if not api_key.strip() or not model.strip():
+            raise ValueError("La URL, API key y modelo del chat son obligatorios.")
+        if timeout_ms <= 0:
+            raise ValueError("CUSTOMER_CHAT_TIMEOUT_MS debe ser positivo.")
+        self._api_url = api_url
+        self._api_key = api_key
+        self._model = model
+        self._timeout_seconds = timeout_ms / 1_000
+        self._transport = transport
+
+    async def answer(
+        self,
+        *,
+        delivery_status: str,
+        route_status: str | None,
+        messages: Sequence[CustomerChatTurn],
+        estimated_minutes_from_now: float | None = None,
+        estimate_basis: str = (
+            "tiempos viales estimados; TomTom, si se aplica, "
+            "solo cubre parcialmente el primer tramo"
+        ),
+    ) -> str:
+        scoped_messages = _messages_in_order_scope(messages)
+        if not scoped_messages or scoped_messages[-1] is not messages[-1]:
+            return _OUT_OF_SCOPE_REPLY
+
+        context: dict[str, object] = {
+            "deliveryStatus": delivery_status,
+            "routeStatus": route_status,
+            "statusDefinitions": {
+                "PENDING": "recibido y aún sin asignar a una ruta",
+                "EN_ROUTE": "asignado y en camino",
+                "DELIVERED": "entregado",
+                "FAILED": "entrega con incidencia",
+                "PLANNED": "ruta planeada, aún no iniciada",
+                "IN_PROGRESS": "ruta en curso",
+                "COMPLETED": "ruta finalizada",
+                "CANCELLED": "ruta cancelada",
+            },
+        }
+        # No compartimos el ETA con el proveedor si el cliente no preguntó por la llegada.
+        if customer_asks_for_arrival_estimate(scoped_messages):
+            context["estimatedMinutesFromNow"] = estimated_minutes_from_now
+            context["estimateBasis"] = estimate_basis
+        request_messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": f"{_SYSTEM_PROMPT}\nContexto del pedido (JSON): "
+                f"{json.dumps(context, ensure_ascii=False)}",
+            }
+        ]
+        # Nunca enviamos texto libre: así nombres, guías, direcciones, coordenadas e IDs
+        # no dependen de que una expresión regular reconozca cada formato posible.
+        request_messages.extend(
+            {"role": message.role, "content": _canonical_order_question(message.content)}
+            for message in scoped_messages
+        )
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._timeout_seconds,
+                transport=self._transport,
+            ) as client:
+                response = await client.post(
+                    self._api_url,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self._api_key}",
+                    },
+                    json={
+                        "model": self._model,
+                        "messages": request_messages,
