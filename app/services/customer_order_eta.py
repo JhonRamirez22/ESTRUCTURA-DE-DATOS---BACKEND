@@ -103,3 +103,55 @@ async def estimate_customer_order_eta(
         route_id=route.id,
         next_stop_id=first_point.id,
         start=shared_position,
+        end=(first_point.lng, first_point.lat),
+        base_duration_minutes=(
+            None
+            if matrix_result["source"] == "euclidean-fallback"
+            else durations[0][1]
+        ),
+        base_distance_meters=(
+            None
+            if matrix_result["source"] == "euclidean-fallback" or copied_distances is None
+            else copied_distances[0][1]
+        ),
+        route_provider=route_provider,
+        traffic_provider=traffic_provider,
+        require_road_route=(
+            target_index == 0 or matrix_result["source"] == "euclidean-fallback"
+        ),
+    )
+    if first_leg.duration_minutes is not None:
+        durations[0][1] = first_leg.duration_minutes
+    else:
+        durations[0][1] = None
+    if copied_distances is not None and first_leg.distance_meters is not None:
+        copied_distances[0][1] = first_leg.distance_meters
+
+    if matrix_result["source"] == "euclidean-fallback" and (
+        first_leg.road_route is None or target_index != 0
+    ):
+        return CustomerEtaResult(
+            None,
+            first_leg.configured,
+            first_leg.applied,
+            first_leg.status,
+            first_leg.warning,
+        )
+
+    stop_etas: list[StopEta] = estimate_stop_etas_from_matrix(
+        [str(point.id) for point in remaining_points],
+        durations,
+        copied_distances,
+    )
+    target_eta = stop_etas[target_index]
+    return CustomerEtaResult(
+        target_eta.estimated_minutes_from_now,
+        first_leg.configured,
+        first_leg.applied,
+        first_leg.status,
+        first_leg.warning,
+    )
+
+
+def _round_coordinate(value: float) -> float:
+    return float(f"{value:.4f}")
