@@ -132,3 +132,70 @@ class DeliveryHistoryReader:
                 point.id, point.order_id, point.address, point.status.value, name,
                 point.created_at, point.delivered_at, point.scheduled_for,
                 *counts.get(point.id, (0, None)),
+            )
+            for point, name in rows
+        ]
+        return HistoryPage(items, total, page, page_size)
+
+    @staticmethod
+    def _conditions(filters: HistoryFilters) -> list[ColumnElement[bool]]:
+        conditions: list[ColumnElement[bool]] = []
+        if filters.begin is not None:
+            conditions.append(DeliveryPoint.created_at >= filters.begin)
+        if filters.end is not None:
+            conditions.append(DeliveryPoint.created_at < filters.end)
+        if filters.status is not None:
+            conditions.append(DeliveryPoint.status == filters.status)
+        if filters.courier_id is not None:
+            conditions.append(Route.courier_id == filters.courier_id)
+        if filters.scheduled_only:
+            conditions.append(DeliveryPoint.scheduled_for.is_not(None))
+        text = filters.text.strip()
+        if text:
+            conditions.append(
+                or_(
+                    DeliveryPoint.order_id.ilike(_like(text), escape="\\"),
+                    DeliveryPoint.address.ilike(_like(text), escape="\\"),
+                )
+            )
+        return conditions
+
+    async def timeline(self, point_id: UUID) -> list[TimelineEntry] | None:
+        """Events of one shipment oldest first; ``None`` if the shipment does not exist."""
+        if await self._session.get(DeliveryPoint, point_id) is None:
+            return None
+        events = (
+            await self._session.scalars(
+                select(DeliveryEvent)
+                .where(DeliveryEvent.delivery_point_id == point_id)
+                .order_by(DeliveryEvent.occurred_at.asc(), DeliveryEvent.id.asc())
+            )
+        ).all()
+        courier_ids = {e.courier_id for e in events if e.courier_id is not None}
+        names: dict[UUID, str] = {}
+        if courier_ids:
+            rows = await self._session.execute(
+                select(Courier.id, Courier.name).where(Courier.id.in_(courier_ids))
+            )
+            names = {cid: name for cid, name in rows.all()}
+        return [
+            TimelineEntry(
+                e.event_type, e.occurred_at, e.from_status, e.to_status, e.actor_role,
+                names.get(e.courier_id) if e.courier_id else None, e.detail,
+            )
+            for e in events
+        ]
+
+    async def customer_milestones(self, point_id: UUID) -> list[tuple[str, datetime]]:
+        """Only the moments a customer may see, without actors, couriers or places."""
+        rows = await self._session.execute(
+            select(DeliveryEvent.event_type, DeliveryEvent.occurred_at)
+            .where(
+                and_(
+                    DeliveryEvent.delivery_point_id == point_id,
+                    DeliveryEvent.event_type.in_([e.value for e in CUSTOMER_EVENTS]),
+                )
+            )
+            .order_by(DeliveryEvent.occurred_at.asc(), DeliveryEvent.id.asc())
+        )
+        return [(kind, when) for kind, when in rows.all()]
