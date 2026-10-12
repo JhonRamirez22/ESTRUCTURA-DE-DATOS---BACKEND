@@ -101,3 +101,54 @@ class HttpSecurityMiddleware:
             await reject(400, "Content-Length inválido.")
             return
         if length < 0 or length > MAX_REQUEST_BYTES:
+            await reject(413, "La petición excede el tamaño permitido.")
+            return
+        body = bytearray()
+        while True:
+            chunk = await receive()
+            if chunk["type"] == "http.disconnect":
+                return
+            data = chunk.get("body", b"")
+            if len(body) + len(data) > MAX_REQUEST_BYTES:
+                await reject(413, "La petición excede el tamaño permitido.")
+                return
+            body.extend(data)
+            if not chunk.get("more_body", False):
+                break
+        delivered = False
+
+        async def replay() -> Message:
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return await receive()
+
+        try:
+            await self.app(scope, replay, secure_send)
+        except PoolTimeoutError:
+            # Sin conexiones libres: es sobrecarga, no un fallo; el cliente reintenta enseguida.
+            _LOGGER.warning("http_overload request_id=%s reason=db_pool", request_id)
+            if response_started:
+                raise
+            await reject(503, "El servicio está saturado; reintenta en unos segundos.", 2)
+        except Exception as error:
+            # El traceback de drivers/proveedores puede contener parámetros privados.
+            _LOGGER.error(
+                "http_exception request_id=%s error_type=%s", request_id, type(error).__name__,
+            )
+            if response_started:
+                raise
+            await reject(500, "No se pudo completar la operación. Usa la referencia para soporte.")
+        if legacy:
+            # El retiro exige 30 días sin estos eventos; nunca registra URL, query ni cuerpo.
+            _LOGGER.info("legacy_api_used method=%s request_id=%s", scope["method"], request_id)
+
+
+def _origin_allowed(headers: Headers) -> bool:
+    """Con ORIGIN_AUTH_SECRET configurado, solo el proxy que lo conoce llega a la API."""
+    secret = get_settings().origin_auth_secret
+    if secret is None:
+        return True
+    expected = secret.get_secret_value().encode()
+    return hmac.compare_digest(headers.get("X-Origin-Auth", "").encode(), expected)
