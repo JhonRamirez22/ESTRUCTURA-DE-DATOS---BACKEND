@@ -171,3 +171,89 @@ def customer_email_delivery_configured(settings: Settings | None = None) -> bool
     )
 
 
+def customer_sms_delivery_configured(settings: Settings | None = None) -> bool:
+    active_settings = settings or get_settings()
+    account_sid = (active_settings.notification_sms_twilio_account_sid or "").strip()
+    auth_token = active_settings.notification_sms_twilio_auth_token
+    from_phone = (active_settings.notification_sms_twilio_from_phone or "").strip()
+    return bool(
+        re.fullmatch(r"AC[a-fA-F0-9]{32}", account_sid) is not None
+        and auth_token is not None
+        and auth_token.get_secret_value().strip()
+        and _E164_PATTERN.fullmatch(from_phone)
+        and active_settings.notification_sms_timeout_ms > 0
+    )
+
+
+def customer_notification_channels_configured(
+    settings: Settings | None = None,
+) -> dict[CustomerNotificationChannel, bool]:
+    active_settings = settings or get_settings()
+    return {
+        CustomerNotificationChannel.EMAIL: customer_email_delivery_configured(active_settings),
+        CustomerNotificationChannel.SMS: customer_sms_delivery_configured(active_settings),
+    }
+
+
+def any_customer_notification_delivery_configured(settings: Settings | None = None) -> bool:
+    return any(customer_notification_channels_configured(settings).values())
+
+
+async def enqueue_order_assigned_notification(
+    session: AsyncSession,
+    point: DeliveryPoint,
+    route_id: UUID,
+    *,
+    now: datetime | None = None,
+) -> tuple[CustomerNotificationChannel, ...]:
+    return await _enqueue_customer_event(
+        session,
+        point,
+        route_id,
+        CustomerNotificationEvent.ORDER_ASSIGNED,
+        subject="Tu pedido ya fue asignado",
+        text_body=(
+            "Tu pedido fue asignado a una ruta de entrega. "
+            "Te avisaremos cuando el repartidor esté cerca."
+        ),
+        sms_body=(
+            "Rutas Pasto: tu pedido ya fue asignado. "
+            "Te avisaremos cuando el repartidor esté cerca."
+        ),
+        now=now,
+    )
+
+
+async def enqueue_courier_near_notification(
+    session: AsyncSession,
+    point: DeliveryPoint,
+    route_id: UUID,
+    *,
+    now: datetime | None = None,
+) -> tuple[CustomerNotificationChannel, ...]:
+    return await _enqueue_customer_event(
+        session,
+        point,
+        route_id,
+        CustomerNotificationEvent.COURIER_NEAR,
+        subject="Tu repartidor está cerca",
+        text_body=(
+            "El repartidor asignado a tu pedido está a menos de "
+            f"{NEARBY_DELIVERY_RADIUS_METERS} m del destino. La distancia es aproximada "
+            "y no representa una hora exacta de llegada."
+        ),
+        sms_body=(
+            "Rutas Pasto: el repartidor asignado a tu pedido está a menos de "
+            f"{NEARBY_DELIVERY_RADIUS_METERS} m. Distancia aproximada, no es una hora exacta."
+        ),
+        now=now,
+    )
+
+
+async def _enqueue_customer_event(
+    session: AsyncSession,
+    point: DeliveryPoint,
+    route_id: UUID,
+    event_type: CustomerNotificationEvent,
+    *,
+    subject: str,
