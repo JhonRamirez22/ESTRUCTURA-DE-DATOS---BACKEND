@@ -117,3 +117,62 @@ def build_suggestions(
                     courier, "idle_courier", "action", text,
                     {"orders": len(near), "nearestMeters": nearest},
                 )
+                card["action"] = {
+                    "type": "select",
+                    "label": "Seleccionar esos pedidos",
+                    "deliveryPointIds": [p.ident for _, p in near],
+                }
+                found.append((1, card))
+    found.sort(key=lambda item: (item[0], item[1]["id"]))
+    return [card for _, card in found[:MAX_SUGGESTIONS]]
+
+
+def _card(
+    courier: CourierView, kind: str, severity: str, text: str, figures: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "id": f"{kind}:{courier.ident}",
+        "kind": kind,
+        "severity": severity,
+        "courierId": courier.ident,
+        "text": text,
+        "figures": figures,
+        "source": "deterministic",
+        "action": None,
+        "_name": courier.name,
+    }
+
+
+class DailyBudget:
+    """Tope de llamadas a la IA por día: al agotarse, todo sigue con texto determinista."""
+
+    def __init__(self, limit: int, clock: Any = time.time) -> None:
+        self._limit = limit
+        self._clock = clock
+        self._day = -1
+        self._used = 0
+
+    def take(self) -> bool:
+        day = int(self._clock() // 86_400)
+        if day != self._day:
+            self._day, self._used = day, 0
+        if self._used >= self._limit:
+            return False
+        self._used += 1
+        return True
+
+
+_BUDGET = DailyBudget(AI_CALLS_PER_DAY)
+
+
+def _figure_values(figures: dict[str, Any]) -> list[float]:
+    return [float(value) for value in figures.values() if isinstance(value, int | float)]
+
+
+async def phrase_with_ai(
+    cards: list[dict[str, Any]],
+    *,
+    budget: DailyBudget | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Reescribe los textos con Groq si es posible; devuelve tarjetas públicas y el estado."""
