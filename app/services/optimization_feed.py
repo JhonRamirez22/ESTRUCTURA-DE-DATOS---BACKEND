@@ -114,3 +114,61 @@ def recent_incidents(limit: int) -> list[dict[str, object]]:
     return list(reversed(snapshot))[:limit]
 
 
+def reset() -> None:
+    """Limpia el estado; las pruebas lo usan para aislarse."""
+    while _EVENTS.pop_front() is not None:
+        pass
+    while _INCIDENTS.dequeue() is not None:
+        pass
+    for key in _COUNTERS:
+        _COUNTERS[key] = 0
+    _SAVED_MINUTES.clear()
+
+
+def _push_event(event: dict[str, object]) -> None:
+    _EVENTS.appendleft(event)
+    while len(_EVENTS) > MAX_EVENTS:
+        _EVENTS.pop_back()
+
+
+def stats() -> FeedStats:
+    return FeedStats(
+        proposals=_COUNTERS["proposals"],
+        cache_hits=_COUNTERS["cacheHits"],
+        applied=_COUNTERS["applied"],
+        traffic_segments=_COUNTERS["trafficSegments"],
+        saved_minutes=round(sum(_SAVED_MINUTES), 1),
+    )
+
+
+def summary_cooldown_remaining() -> float:
+    if not _LAST_SUMMARY_AT:
+        return 0.0
+    return max(0.0, SUMMARY_COOLDOWN_SECONDS - (time.monotonic() - _LAST_SUMMARY_AT[0]))
+
+
+def mark_summary_requested() -> None:
+    _LAST_SUMMARY_AT[:] = [time.monotonic()]
+
+
+def _traffic_segments(body: dict[str, object]) -> int:
+    live = body.get("liveTraffic")
+    if isinstance(live, dict):
+        used = live.get("usedMeasuredSegments")
+        if isinstance(used, int):
+            return used
+    return 0
+
+
+def _ai_order(body: dict[str, object], key: str) -> object:
+    ai_order = body.get("aiOrder")
+    return ai_order.get(key) if isinstance(ai_order, dict) else None
+
+
+def _ai_applied(body: dict[str, object]) -> bool:
+    ai = body.get("trafficAi")
+    return isinstance(ai, dict) and ai.get("applied") is True
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
