@@ -116,3 +116,62 @@ def parse_assignment_traffic_response(payload: object) -> AssignmentTrafficAdvic
     if not isinstance(payload, Mapping) or not isinstance(payload.get("adjustments"), list):
         raise ValueError("La respuesta de IA no cumple el contrato de ajustes de asignación.")
     adjustments: list[AssignmentTrafficAdjustment] = []
+    seen: set[tuple[str, str]] = set()
+    for index, raw in enumerate(payload["adjustments"]):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"El ajuste de IA {index} no es un objeto.")
+        courier_id = _read_nonempty_string(raw, "courierId", index)
+        order_id = _read_nonempty_string(raw, "orderId", index)
+        pair = (courier_id, order_id)
+        if pair in seen:
+            raise ValueError(f"La IA repitió el ajuste {courier_id}/{order_id}.")
+        seen.add(pair)
+        multiplier = _read_number(raw, "trafficMultiplier", index)
+        if not MIN_TRAFFIC_MULTIPLIER <= multiplier <= MAX_TRAFFIC_MULTIPLIER:
+            raise ValueError("El factor de IA debe estar entre 0.5 y 3.")
+        confidence_raw = raw.get("confidence")
+        confidence: float | None = None
+        if confidence_raw is not None:
+            confidence = _read_number(raw, "confidence", index)
+            if not 0 <= confidence <= 1:
+                raise ValueError("La confianza de IA debe estar entre 0 y 1.")
+        reason = raw.get("reason")
+        adjustments.append(
+            AssignmentTrafficAdjustment(
+                courier_id,
+                order_id,
+                multiplier,
+                confidence,
+                reason if isinstance(reason, str) else None,
+            )
+        )
+    model = payload.get("model")
+    return AssignmentTrafficAdvice(
+        tuple(adjustments), model if isinstance(model, str) else None
+    )
+
+
+def supported_assignment_adjustments(
+    candidates: Sequence[AssignmentCandidate],
+    adjustments: Sequence[AssignmentTrafficAdjustment],
+) -> tuple[list[AssignmentTrafficAdjustment], int]:
+    allowed = {(candidate.courier_id, candidate.order_id) for candidate in candidates}
+    supported = [item for item in adjustments if (item.courier_id, item.order_id) in allowed]
+    return supported, len(adjustments) - len(supported)
+
+
+def _read_nonempty_string(value: Mapping[str, object], field: str, index: int) -> str:
+    candidate = value.get(field)
+    if not isinstance(candidate, str) or not candidate.strip():
+        raise ValueError(f"El campo {field} del ajuste {index} debe ser no vacío.")
+    return candidate
+
+
+def _read_number(value: Mapping[str, object], field: str, index: int) -> float:
+    candidate = value.get(field)
+    if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+        raise ValueError(f"El campo {field} del ajuste {index} debe ser numérico.")
+    result = float(candidate)
+    if not math.isfinite(result):
+        raise ValueError(f"El campo {field} del ajuste {index} debe ser finito.")
+    return result
