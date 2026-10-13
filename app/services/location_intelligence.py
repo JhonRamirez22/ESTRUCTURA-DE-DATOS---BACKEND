@@ -146,3 +146,77 @@ def build_groups(pending: Sequence[PendingLocation]) -> list[dict[str, Any]]:
     for members in groups:
         points = [by_alias[alias] for alias in members]
         spread = max(
+            (haversine_m(a.lat, a.lng, b.lat, b.lng) for a in points for b in points), default=0.0
+        )
+        result.append(
+            {
+                "members": members,
+                "spreadMeters": round(spread),
+                "source": "deterministic",
+                "reason": None,
+            }
+        )
+    return result
+
+
+async def suggest_groups(
+    pending: Sequence[PendingLocation], *, transport: httpx.AsyncBaseTransport | None = None
+) -> dict[str, Any]:
+    """Grupos finales: los que Groq propone y el chequeo acepta, más los deterministas restantes."""
+    candidates = build_groups(pending)
+    status: dict[str, Any] = {"source": "deterministic", "proposed": False, "accepted": 0}
+    if not candidates:
+        return {"groups": [], "ai": status}
+
+    payload = {
+        "groups": [
+            {"members": group["members"], "spreadMeters": group["spreadMeters"]}
+            for group in candidates
+        ],
+        "maxGroupSize": MAX_GROUP_SIZE,
+    }
+    accepted_groups: list[dict[str, Any]] = []
+    try:
+        parsed = await _chat_json(_GROUP_PROMPT, payload, transport=transport)
+        status["proposed"] = True
+        accepted_groups = _validate_group_proposal(parsed, candidates)
+        status["accepted"] = len(accepted_groups)
+        status["source"] = "groq-validated" if accepted_groups else "deterministic"
+    except IntelligenceUnavailable as error:
+        status["reason"] = str(error)
+
+    covered = {alias for group in accepted_groups for alias in group["members"]}
+    leftovers = [
+        group for group in candidates
+        if not set(group["members"]) & covered
+    ]
+    return {"groups": accepted_groups + leftovers, "ai": status}
+
+
+def _validate_group_proposal(
+    parsed: Mapping[str, Any], candidates: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Solo acepta grupos que caen dentro de un candidato, sin repetir ni inventar paradas."""
+    raw_groups = parsed.get("groups")
+    if not isinstance(raw_groups, list):
+        return []
+    allowed = [set(group["members"]) for group in candidates]
+    seen: set[str] = set()
+    accepted: list[dict[str, Any]] = []
+    for item in raw_groups:
+        if not isinstance(item, dict):
+            continue
+        members = item.get("members")
+        if not isinstance(members, list) or not all(isinstance(member, str) for member in members):
+            continue
+        unique = list(dict.fromkeys(members))
+        if not (2 <= len(unique) <= MAX_GROUP_SIZE) or len(unique) != len(members):
+            continue
+        if any(member in seen for member in unique):
+            continue
+        if not any(set(unique) <= candidate for candidate in allowed):
+            continue
+        seen.update(unique)
+        reason = item.get("reason")
+        accepted.append(
+            {
