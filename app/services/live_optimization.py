@@ -148,3 +148,77 @@ class LiveOptimizationService:
             )
             if not worth or drawn >= MAX_GEOMETRY_ROUTES:
                 out.append(None)
+                continue
+            courier = fleet.route(route_proposal.route_id).courier.location
+            coordinates: list[Coordinate] = [courier.as_lng_lat()] + [
+                stops[stop_id].location.as_lng_lat() for stop_id in route_proposal.proposed_order
+            ]
+            try:
+                drawn += 1
+                road = await self._route_provider.get_route(coordinates)
+                out.append(road["geometry"])
+            except (RoutingClientError, ValueError, TimeoutError) as error:
+                _LOGGER.info(
+                    "Live proposal geometry unavailable", extra={"error_type": type(error).__name__}
+                )
+                out.append(None)
+        return out
+
+    @staticmethod
+    def _envelope(
+        proposal: FleetProposal | None,
+        geometries: list[GeoJsonLineString | None],
+        skipped: list[dict[str, str]],
+        source: str,
+        *,
+        cached: bool,
+    ) -> dict[str, Any]:
+        routes: list[dict[str, Any]] = []
+        if proposal is not None:
+            for item, geometry in zip(proposal.routes, geometries, strict=True):
+                routes.append(_route_json(item, geometry))
+        return {
+            "enabled": True,
+            "tickSeconds": TICK_SECONDS,
+            "computedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "matrixSource": source,
+            "approximate": source not in {"osrm", "ors"},
+            "cached": cached,
+            "routes": routes,
+            "moves": [
+                {
+                    "stopId": move.stop_id,
+                    "fromRouteId": move.from_route,
+                    "toRouteId": move.to_route,
+                    "gainMinutes": round(move.gain_minutes, 1),
+                }
+                for move in (proposal.moves if proposal else ())
+            ],
+            "scoreBefore": proposal.score_before.as_dict() if proposal else None,
+            "scoreAfter": proposal.score_after.as_dict() if proposal else None,
+            "savedMinutes": round(proposal.saved_minutes, 1) if proposal else 0.0,
+            "changed": bool(proposal and proposal.changed),
+            "skippedRoutes": skipped,
+        }
+
+
+def _route_json(item: RouteProposal, geometry: GeoJsonLineString | None) -> dict[str, Any]:
+    return {
+        "routeId": item.route_id,
+        "changed": item.changed,
+        "currentOrder": list(item.current_order),
+        "proposedOrder": list(item.proposed_order),
+        "movedIn": list(item.moved_in),
+        "movedOut": list(item.moved_out),
+        "currentMinutes": _round(item.current_minutes),
+        "proposedMinutes": _round(item.proposed_minutes),
+        "savedMinutes": round(item.saved_minutes, 1),
+        "geometry": geometry,
+    }
+
+
+def _round(value: float) -> float | None:
+    return round(value, 1) if value == value and value != float("inf") else None
+
+
+_SHARED_CACHE: TtlCache[str, dict[str, Any]] = TtlCache(64, TICK_SECONDS)
