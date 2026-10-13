@@ -124,3 +124,65 @@ def plan_with_windows(
     priority: Mapping[int, float] | None = None,
     *,
     service_minutes: float = DEFAULT_SERVICE_MINUTES,
+) -> WindowPlan:
+    """Mejor orden conocido respetando ventanas y prioridades; el origen no se mueve."""
+    current = list(route)
+    if len(current) > MAX_STOPS + 1:
+        raise ValueError(f"Se admiten como máximo {MAX_STOPS} paradas")
+    if len(set(current)) != len(current):
+        raise ValueError("La ruta repite paradas")
+
+    def score(candidate: Sequence[int]) -> float:
+        return evaluate_route(
+            matrix, candidate, windows, priority, service_minutes=service_minutes
+        ).objective
+
+    before = evaluate_route(matrix, current, windows, priority, service_minutes=service_minutes)
+    if len(current) < 3:
+        return WindowPlan(current, before, before)
+
+    seeds = [current, _earliest_deadline_first(current, windows)]
+    best = current
+    best_score = before.objective
+    for seed in seeds:
+        candidate = _descend(seed, score)
+        value = score(candidate)
+        if value < best_score - _EPS:
+            best, best_score = candidate, value
+    after = evaluate_route(matrix, best, windows, priority, service_minutes=service_minutes)
+    return WindowPlan(best, before, after)
+
+
+def _earliest_deadline_first(route: Sequence[int], windows: Mapping[int, Window]) -> list[int]:
+    stops = sorted(
+        route[1:], key=lambda node: windows.get(node, Window()).latest
+    )
+    return [route[0], *stops]
+
+
+def _descend(route: Sequence[int], score: Callable[[Sequence[int]], float]) -> list[int]:
+    current = list(route)
+    value = score(current)
+    for _ in range(MAX_PASSES):
+        improved = False
+        size = len(current)
+        for source in range(1, size):  # traslado de una parada a otra posición
+            for target in range(1, size):
+                if source == target:
+                    continue
+                candidate = list(current)
+                node = candidate.pop(source)
+                candidate.insert(target, node)
+                candidate_value = score(candidate)
+                if candidate_value < value - _EPS:
+                    current, value, improved = candidate, candidate_value, True
+        for first in range(1, size - 1):  # intercambio de dos paradas
+            for second in range(first + 1, size):
+                candidate = list(current)
+                candidate[first], candidate[second] = candidate[second], candidate[first]
+                candidate_value = score(candidate)
+                if candidate_value < value - _EPS:
+                    current, value, improved = candidate, candidate_value, True
+        if not improved:
+            break
+    return current
