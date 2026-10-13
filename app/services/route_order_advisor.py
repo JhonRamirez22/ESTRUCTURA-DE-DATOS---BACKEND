@@ -98,3 +98,52 @@ class HttpRouteOrderAdvisor:
             except httpx.HTTPError as error:
                 record_incident("groq", "orden:red")
                 last_error = RouteOrderAdvisorError("No se pudo consultar a la IA de orden.")
+                last_error.__cause__ = error
+            else:
+                if response.is_success:
+                    return response
+                retryable = response.status_code == 429 or response.status_code >= 500
+                record_incident("groq", f"orden:http-{response.status_code}")
+                last_error = RouteOrderAdvisorError(
+                    f"La IA de orden respondió HTTP {response.status_code}."
+                )
+                if not retryable:
+                    break
+            if attempt == 0:
+                await asyncio.sleep(0.4)
+        assert last_error is not None
+        raise last_error
+
+
+def _parse_order(response: httpx.Response, size: int) -> list[int]:
+    try:
+        content = str(response.json()["choices"][0]["message"]["content"]).strip()
+        if content.startswith("```"):
+            content = content.strip("`").removeprefix("json").strip()
+        raw_order = json.loads(content)["order"]
+        order = [int(str(item).removeprefix("stop-")) for item in raw_order]
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise RouteOrderAdvisorError("La respuesta de la IA de orden no es válida.") from error
+    if sorted(order) != list(range(size)):
+        raise RouteOrderAdvisorError("La IA devolvió un orden que no cubre las paradas.")
+    return order
+
+
+def get_route_order_advisor() -> HttpRouteOrderAdvisor | None:
+    settings = get_settings()
+    if not (settings.ai_allow_route_location_sharing or settings.ai_allow_location_data_sharing):
+        return None
+    if settings.ai_traffic_provider != "groq":
+        return None
+    key = settings.customer_chat_api_key
+    api_url = (settings.customer_chat_api_url or "").strip()
+    model = (settings.customer_chat_model or "").strip()
+    api_key = key.get_secret_value().strip() if key is not None else ""
+    if not api_url or not api_key or not model:
+        return None
+    return HttpRouteOrderAdvisor(
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+        timeout_ms=settings.ai_traffic_timeout_ms,
+    )
