@@ -137,3 +137,72 @@ def _balance_assignments(
                         )
                     )
                 ],
+            )
+            for courier in couriers
+            if courier.courier_id != overloaded.courier_id
+            and len(assignments[courier.courier_id]) < maximum_load
+        ]
+        possible_destinations = [item for item in possible_destinations if item[1]]
+        destination = min(
+            possible_destinations,
+            key=lambda item: len(assignments[item[0].courier_id]),
+            default=None,
+        )
+        if destination is None:
+            return
+        destination_courier, movable_orders = destination
+
+        # Mover primero el pedido más cercano al nuevo repartidor reduce el desvío.
+        order_to_move = min(
+            movable_orders,
+            key=lambda order_id: _pair_cost(
+                destination_courier,
+                orders_by_id[order_id],
+                adjustment_map,
+                travel_costs,
+            ),
+            default=None,
+        )
+        if order_to_move is None:
+            return
+
+        assignments[overloaded.courier_id].remove(order_to_move)
+        assignments[destination_courier.courier_id].append(order_to_move)
+
+
+def _pair_cost(
+    courier: CourierPosition,
+    order: OrderPoint,
+    adjustment_map: Mapping[tuple[str, str], float],
+    travel_costs: Mapping[tuple[str, str], float | None],
+) -> float:
+    pair = (courier.courier_id, order.order_id)
+    base_cost = (
+        travel_costs[pair]
+        if pair in travel_costs
+        else _assignment_cost(courier.coordinates, order.coordinates)
+    )
+    if base_cost is None:
+        return math.inf
+    return base_cost * adjustment_map.get(pair, 1.0)
+
+
+def _build_adjustment_map(
+    adjustments: Sequence[AssignmentAdjustment],
+) -> dict[tuple[str, str], float]:
+    result: dict[tuple[str, str], float] = {}
+    for adjustment in adjustments:
+        multiplier = adjustment.traffic_multiplier
+        if (
+            not math.isfinite(multiplier)
+            or not MIN_TRAFFIC_MULTIPLIER <= multiplier <= MAX_TRAFFIC_MULTIPLIER
+        ):
+            raise ValueError(
+                "traffic_multiplier debe estar entre "
+                f"{MIN_TRAFFIC_MULTIPLIER} y {MAX_TRAFFIC_MULTIPLIER}"
+            )
+
+        key = (adjustment.courier_id, adjustment.order_id)
+        if key in result:
+            raise ValueError(
+                "No puede haber más de un ajuste para "
