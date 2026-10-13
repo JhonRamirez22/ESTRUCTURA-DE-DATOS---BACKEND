@@ -166,3 +166,87 @@ class RouteUndoResult:
     released_delivery_point_ids: tuple[UUID, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _RouteRevisionSnapshot:
+    estimated_duration_minutes: float
+    estimated_distance_meters: float
+    baseline_duration_minutes: float | None
+    baseline_distance_meters: float | None
+    geometry: object | None
+    geometry_provider: RouteGeometryProvider | None
+    active_stops: tuple[tuple[UUID, int], ...]
+
+
+_routing_clients: tuple[
+    ClosableRoutingClient,
+    CachedMatrixProvider,
+    CachedRouteProvider,
+] | None = None
+
+
+def get_routing_providers() -> tuple[CachedMatrixProvider, CachedRouteProvider]:
+    """Comparte el proveedor vial elegido y sus cachés durante la vida del proceso."""
+    global _routing_clients
+    if _routing_clients is None:
+        settings = get_settings()
+        if settings.routing_provider == "ors":
+            api_key = (
+                settings.ors_api_key.get_secret_value().strip()
+                if settings.ors_api_key is not None
+                else ""
+            )
+            if not api_key:
+                raise ValueError("ROUTING_PROVIDER=ors requiere ORS_API_KEY.")
+            client: object = OrsClient(
+                api_key=api_key,
+                base_url=settings.ors_api_url,
+            )
+            matrix_source: MatrixSource = "ors"
+            geometry_provider: GeometryProvider = "ORS"
+        else:
+            client = OsrmClient(base_url=settings.osrm_api_url)
+            matrix_source = "osrm"
+            geometry_provider = "OSRM"
+        _routing_clients = (
+            cast(ClosableRoutingClient, client),
+            CachedMatrixProvider(cast(MatrixClient, client), source=matrix_source),
+            CachedRouteProvider(cast(RouteClient, client), provider=geometry_provider),
+        )
+    return _routing_clients[1], _routing_clients[2]
+
+
+async def close_routing_clients() -> None:
+    global _routing_clients
+    if _routing_clients is not None:
+        await _routing_clients[0].aclose()
+        _routing_clients = None
+
+
+@dataclass(frozen=True, slots=True)
+class PlanInputs:
+    """Lo que el plan necesita de la base de datos; cargarlo aparte permite calcular en paralelo."""
+
+    courier: Courier | None
+    points: list[DeliveryPoint]
+
+
+async def load_plan_inputs(
+    session: AsyncSession, courier_id: UUID, delivery_point_ids: Sequence[UUID]
+) -> PlanInputs:
+    repository = RouteRepository(session)
+    courier = await repository.get_courier(courier_id)
+    points = await repository.get_delivery_points(delivery_point_ids)
+    return PlanInputs(courier, points)
+
+
+async def build_optimized_route_plan(
+    session: AsyncSession,
+    courier_id: UUID,
+    delivery_point_ids: Sequence[UUID],
+    *,
+    inputs: PlanInputs | None = None,
+    matrix_provider: MatrixProvider,
+    route_provider: RouteProvider,
+    traffic_ai_advisor: RouteTrafficAdvisor | None = None,
+    traffic_provider: TrafficProvider | None = None,
+    order_advisor: RouteOrderAdvisor | None = None,
