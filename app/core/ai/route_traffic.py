@@ -142,3 +142,75 @@ def build_route_traffic_candidates(
                 RouteTrafficCandidate(
                     from_stop_id=from_stop_id,
                     to_stop_id=to_stop_id,
+                    from_coordinates=from_lat_lng,
+                    to_coordinates=to_lat_lng,
+                    distance_meters=distance_meters,
+                    distance_source=(
+                        distance_source
+                        if road_distance is not None
+                        else "unavailable"
+                        if distance_matrix is not None
+                        else "straight-line-estimate"
+                    ),
+                    baseline_duration_minutes=duration,
+                )
+            )
+    return candidates
+
+
+def select_route_traffic_candidates(
+    candidates: Sequence[RouteTrafficCandidate],
+    baseline_path_stop_ids: Sequence[str],
+    max_candidates: int = MAX_ROUTE_TRAFFIC_AI_CANDIDATES,
+) -> list[RouteTrafficCandidate]:
+    if max_candidates < 1:
+        raise ValueError("max_candidates debe ser positivo")
+    by_pair: dict[tuple[str, str], RouteTrafficCandidate] = {}
+    for candidate in candidates:
+        duration = candidate.baseline_duration_minutes
+        pair = (candidate.from_stop_id, candidate.to_stop_id)
+        if (
+            candidate.from_stop_id != candidate.to_stop_id
+            and math.isfinite(duration)
+            and duration >= 0
+        ):
+            by_pair.setdefault(pair, candidate)
+
+    preferred_pairs = set(zip(baseline_path_stop_ids, baseline_path_stop_ids[1:], strict=False))
+    compare = lambda item: (  # noqa: E731
+        item.baseline_duration_minutes,
+        item.from_stop_id,
+        item.to_stop_id,
+    )
+    preferred = sorted(
+        (candidate for pair, candidate in by_pair.items() if pair in preferred_pairs),
+        key=compare,
+        reverse=True,
+    )
+    selected = preferred[: math.ceil(max_candidates / 2)]
+    selected_pairs = {(item.from_stop_id, item.to_stop_id) for item in selected}
+    alternatives = sorted(
+        (candidate for pair, candidate in by_pair.items() if pair not in selected_pairs),
+        key=compare,
+    )
+    selected.extend(alternatives[: max_candidates - len(selected)])
+    return selected
+
+
+def parse_route_traffic_response(payload: object) -> RouteTrafficAdvice:
+    if not isinstance(payload, dict) or not isinstance(payload.get("adjustments"), list):
+        raise ValueError("La respuesta de IA no cumple el contrato de ajustes de tráfico.")
+
+    adjustments: list[RouteTrafficAdjustment] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for index, value in enumerate(payload["adjustments"]):
+        if not isinstance(value, dict):
+            raise ValueError(f"El ajuste de IA en la posición {index} no es un objeto.")
+        from_id = _read_nonempty_string(value, "fromStopId", index)
+        to_id = _read_nonempty_string(value, "toStopId", index)
+        pair = (from_id, to_id)
+        if pair in seen_pairs:
+            raise ValueError(f"La respuesta de IA repite el par {from_id}/{to_id}.")
+        seen_pairs.add(pair)
+        multiplier = _read_finite_number(value, "trafficMultiplier", index)
+        if not MIN_TRAFFIC_MULTIPLIER <= multiplier <= MAX_TRAFFIC_MULTIPLIER:
