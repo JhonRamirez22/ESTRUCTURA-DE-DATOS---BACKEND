@@ -130,3 +130,68 @@ def _cost_of(
     routes = [
         evaluator.route_minutes(courier_index[courier], frozenset(order_index[o] for o in orders))
         for courier, orders in assignments.items()
+    ]
+    if not routes:
+        return AssignmentCost(0.0, 0.0)
+    return AssignmentCost(sum(routes), max(routes))
+
+
+def improve_assignment(
+    matrix: Matrix,
+    courier_index: Mapping[str, int],
+    order_index: Mapping[str, int],
+    assignments: Mapping[str, Sequence[str]],
+    *,
+    weight: float = MAKESPAN_WEIGHT,
+) -> JointAssignmentResult:
+    """Devuelve un reparto con objetivo menor o igual al recibido.
+
+    ``matrix`` es la matriz de duraciones (minutos) sobre repartidores y pedidos; los índices de
+    ``courier_index`` y ``order_index`` apuntan a sus filas. Las claves de ``assignments`` son los
+    repartidores disponibles.
+    """
+    evaluator = _Evaluator(matrix)
+    current = {courier: list(orders) for courier, orders in assignments.items()}
+    total_orders = sum(len(orders) for orders in current.values())
+    # Sin este tope, minimizar minutos totales «mejora» dejando todo a un solo repartidor.
+    load_cap = min(
+        MAX_ORDERS_PER_COURIER,
+        max(1, math.floor(total_orders / max(1, len(current)) * LOAD_CAP_MULTIPLIER)),
+    )
+    # Nunca por debajo de lo que el reparto de partida ya le dio a alguien.
+    load_cap = max(load_cap, max((len(orders) for orders in current.values()), default=0))
+    before = _cost_of(evaluator, courier_index, order_index, current)
+    moves: list[Move] = []
+    if len(current) < 2 or not any(current.values()):
+        return JointAssignmentResult(current, before, before, moves, evaluator.evaluations)
+
+    state = before
+    for _ in range(MAX_PASSES):
+        if evaluator.evaluations >= MAX_EVALUATIONS:
+            break
+        best = _best_move(
+            matrix, evaluator, courier_index, order_index, current, state, weight, load_cap
+        )
+        if best is None:
+            break
+        _apply(current, best.move)
+        moves.append(best.move)
+        state = _cost_of(evaluator, courier_index, order_index, current)
+    return JointAssignmentResult(current, before, state, moves, evaluator.evaluations)
+
+
+def _best_move(
+    matrix: Matrix,
+    evaluator: _Evaluator,
+    courier_index: Mapping[str, int],
+    order_index: Mapping[str, int],
+    current: Mapping[str, list[str]],
+    state: AssignmentCost,
+    weight: float,
+    load_cap: int,
+) -> _Candidate | None:
+    heap = MinHeap[_Candidate, tuple[object, ...]](_compare, lambda item: item.key)
+    base_objective = state.objective(weight)
+    sets = {c: frozenset(order_index[o] for o in orders) for c, orders in current.items()}
+    route = {c: evaluator.route_minutes(courier_index[c], sets[c]) for c in current}
+
