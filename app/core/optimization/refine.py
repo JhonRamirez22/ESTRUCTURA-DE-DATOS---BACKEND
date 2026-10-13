@@ -126,3 +126,67 @@ def _descend(cost: list[list[float]], route: list[int]) -> list[int]:
     for _ in range(MAX_LOCAL_PASSES):
         if _two_opt_pass(cost, route) or _or_opt_pass(cost, route):
             continue
+        break
+    return route
+
+
+def _two_opt_pass(cost: list[list[float]], route: list[int]) -> bool:
+    """Primera inversión que mejora. Las sumas prefijas dan el costo del tramo invertido en O(1)."""
+    size = len(route)
+    if size < 4:
+        return False
+    forward = [0.0] * size
+    backward = [0.0] * size
+    for index in range(size - 1):
+        forward[index + 1] = forward[index] + cost[route[index]][route[index + 1]]
+        backward[index + 1] = backward[index] + cost[route[index + 1]][route[index]]
+    for start in range(1, size - 1):
+        before = route[start - 1]
+        first = route[start]
+        for end in range(start + 1, size):
+            last = route[end]
+            after = route[end + 1] if end + 1 < size else -1
+            old = cost[before][first] + (forward[end] - forward[start])
+            new = cost[before][last] + (backward[end] - backward[start])
+            if after != -1:
+                old += cost[last][after]
+                new += cost[first][after]
+            if new < old - _EPSILON:
+                route[start : end + 1] = route[start : end + 1][::-1]
+                return True
+    return False
+
+
+def _or_opt_pass(cost: list[list[float]], route: list[int]) -> bool:
+    """Primer traslado de un tramo de 1 a 3 paradas (sin invertirlo) que mejora."""
+    size = len(route)
+    if size < 4:
+        return False
+    for length in range(1, MAX_SEGMENT_LENGTH + 1):
+        for start in range(1, size - length + 1):
+            stop = start + length - 1
+            head, tail = route[start], route[stop]
+            previous = route[start - 1]
+            following = route[stop + 1] if stop + 1 < size else -1
+            removed = cost[previous][head]
+            if following != -1:
+                removed += cost[tail][following] - cost[previous][following]
+            # Aristas (k, k+1) de la ruta original que no tocan el tramo.
+            for edge in range(size):
+                if start - 1 <= edge <= stop:
+                    continue
+                source = route[edge]
+                target = route[edge + 1] if edge + 1 < size else -1
+                added = cost[source][head]
+                if target != -1:
+                    added += cost[tail][target] - cost[source][target]
+                if added < removed - _EPSILON:
+                    segment = route[start : stop + 1]
+                    rest = route[:start] + route[stop + 1 :]
+                    position = edge + 1 if edge < start else edge + 1 - length
+                    route[:] = rest[:position] + segment + rest[position:]
+                    return True
+    return False
+
+
+def _double_bridge(route: list[int], rng: random.Random) -> list[int]:
