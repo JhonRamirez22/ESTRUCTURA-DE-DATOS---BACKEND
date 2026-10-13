@@ -121,3 +121,64 @@ class HttpRouteTrafficAdvisor:
 
     def _request_body_from(self, payload: dict[str, object]) -> dict[str, object]:
         if self._protocol == "openai-chat":
+            body: dict[str, object] = {
+                "model": self._model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            _ASSIGNMENT_SYSTEM_PROMPT
+                            if payload.get("task") == "assignment_traffic"
+                            else _SYSTEM_PROMPT
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(payload, ensure_ascii=False),
+                    },
+                ],
+                "temperature": 0.1,
+                "top_p": 1,
+                "max_tokens": 1_024,
+                "stream": False,
+            }
+            if "api.groq.com" in self._api_url:
+                body["response_format"] = {"type": "json_object"}
+                body["max_tokens"] = 4_096
+                if self._model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
+                    body["reasoning_effort"] = "low"
+            return body
+        return {
+            "contractVersion": payload["contractVersion"],
+            "task": payload["task"],
+            "model": self._model,
+            "input": payload,
+        }
+
+    async def _post(self, payload: dict[str, object]) -> object:
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._timeout_seconds,
+                transport=self._transport,
+            ) as client:
+                response = await client.post(
+                    self._api_url,
+                    headers=headers,
+                    json=self._request_body_from(payload),
+                )
+        except httpx.TimeoutException as error:
+            raise RouteTrafficAiError("La IA de tráfico excedió el tiempo límite.") from error
+        except httpx.HTTPError as error:
+            raise RouteTrafficAiError("No se pudo conectar con la IA de tráfico.") from error
+
+        if response.status_code == 429:
+            raise RouteTrafficAiError("La IA de tráfico alcanzó su límite de solicitudes.")
+        if not response.is_success:
+            raise RouteTrafficAiError(f"La IA de tráfico respondió HTTP {response.status_code}.")
+        try:
+            result: object = response.json()
+            if self._protocol == "openai-chat":
+                content = self._read_chat_content(result)
