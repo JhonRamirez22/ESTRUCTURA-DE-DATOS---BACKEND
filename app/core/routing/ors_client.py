@@ -151,3 +151,79 @@ class OrsClient:
 
         try:
             raw_payload: object = response.json()
+        except ValueError as error:
+            raise OrsClientError(f"OpenRouteService returned invalid JSON: {error}") from error
+        return _read_object(raw_payload, "OpenRouteService response must be a JSON object")
+
+
+def _read_object(value: object, message: str) -> dict[str, object]:
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise OrsClientError(message)
+    return {key: item for key, item in value.items() if isinstance(key, str)}
+
+
+def _read_number(value: object, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise OrsClientError(f"OpenRouteService directions response has an invalid {name}")
+    return float(value)
+
+
+def _read_matrix(value: object, size: int) -> list[list[float | None]]:
+    if not isinstance(value, list) or any(not isinstance(row, list) for row in value):
+        raise OrsClientError("OpenRouteService matrix response has no durations matrix")
+
+    matrix: list[list[float | None]] = []
+    for row in value:
+        durations: list[float | None] = []
+        for duration in row:
+            if duration is None:
+                durations.append(None)
+            elif (
+                isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not math.isfinite(duration)
+                or duration < 0
+            ):
+                raise OrsClientError(
+                    "OpenRouteService matrix response contains an invalid duration"
+                )
+            else:
+                durations.append(float(duration))
+        matrix.append(durations)
+
+    if len(matrix) != size or any(len(row) != size for row in matrix):
+        raise OrsClientError("OpenRouteService matrix response has incorrect dimensions")
+    return matrix
+
+
+def _read_geometry(value: object) -> GeoJsonLineString:
+    geometry = _read_object(value, "OpenRouteService directions response has no geometry")
+    raw_coordinates = geometry.get("coordinates")
+    if geometry.get("type") != "LineString" or not isinstance(raw_coordinates, list):
+        raise OrsClientError("OpenRouteService directions response has invalid geometry")
+    if len(raw_coordinates) < 2:
+        raise OrsClientError("OpenRouteService directions response has invalid geometry")
+
+    coordinates: list[Coordinate] = []
+    for coordinate in raw_coordinates:
+        if (
+            not isinstance(coordinate, list)
+            or len(coordinate) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for value in coordinate
+            )
+        ):
+            raise OrsClientError("OpenRouteService directions response has invalid geometry")
+        longitude, latitude = float(coordinate[0]), float(coordinate[1])
+        if not -180 <= longitude <= 180 or not -90 <= latitude <= 90:
+            raise OrsClientError("OpenRouteService directions response has invalid geometry")
+        coordinates.append((longitude, latitude))
+    return {"type": "LineString", "coordinates": coordinates}
