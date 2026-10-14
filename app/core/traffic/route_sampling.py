@@ -108,3 +108,57 @@ def _project_waypoint(
         end_x, end_y = end[0] * longitude_scale, end[1] * latitude_scale
         direction_x, direction_y = end_x - start_x, end_y - start_y
         length_squared = direction_x**2 + direction_y**2
+        ratio = (
+            0.0
+            if length_squared == 0
+            else min(
+                1.0,
+                max(
+                    0.0,
+                    ((point_x - start_x) * direction_x + (point_y - start_y) * direction_y)
+                    / length_squared,
+                ),
+            )
+        )
+        projected_x = start_x + ratio * direction_x
+        projected_y = start_y + ratio * direction_y
+        distance = math.hypot(point_x - projected_x, point_y - projected_y)
+        if distance < nearest_distance:
+            segment_length = cumulative[index + 1] - cumulative[index]
+            nearest_distance = distance
+            nearest_projection = (index, cumulative[index] + ratio * segment_length)
+
+    if nearest_distance > MAX_WAYPOINT_SNAP_METERS:
+        return None
+    return nearest_projection
+
+
+def _point_at_distance(
+    line: Sequence[Coordinate],
+    cumulative: Sequence[float],
+    target_distance: float,
+) -> Coordinate:
+    for index in range(len(cumulative) - 1):
+        segment_length = cumulative[index + 1] - cumulative[index]
+        if target_distance <= cumulative[index + 1] or index == len(cumulative) - 2:
+            if segment_length <= 0:
+                return line[index]
+            ratio = (target_distance - cumulative[index]) / segment_length
+            return (
+                line[index][0] + ratio * (line[index + 1][0] - line[index][0]),
+                line[index][1] + ratio * (line[index + 1][1] - line[index][1]),
+            )
+    return line[-1]
+
+
+def _distance_meters(start: Coordinate, end: Coordinate) -> float:
+    start_latitude, end_latitude = math.radians(start[1]), math.radians(end[1])
+    latitude_delta = end_latitude - start_latitude
+    longitude_delta = math.radians(end[0] - start[0])
+    haversine = (
+        math.sin(latitude_delta / 2) ** 2
+        + math.cos(start_latitude)
+        * math.cos(end_latitude)
+        * math.sin(longitude_delta / 2) ** 2
+    )
+    return 2 * EARTH_RADIUS_METERS * math.atan2(math.sqrt(haversine), math.sqrt(1 - haversine))
