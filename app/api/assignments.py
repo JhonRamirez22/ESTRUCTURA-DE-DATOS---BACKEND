@@ -235,3 +235,82 @@ async def propose_assignments(
                     travel_costs_minutes[pair] = duration
                     if duration is not None:
                         candidate_count += 1
+
+    # Analizar no optimiza ni consulta IA/tráfico: eso ocurre al confirmar el despacho.
+    ai_status: dict[str, object] = {
+        "source": "deterministic",
+        "applied": False,
+        "routingSource": matrix_source,
+        "warning": (
+            "Propuesta por cercanía vial y balanceo; TomTom e IA se consultan al despachar."
+            if candidate_count
+            else "No hay repartidores, pedidos o caminos viales disponibles para calcular."
+        ),
+    }
+    result = assign_orders(
+        [
+            CourierPosition(
+                str(courier.id),
+                Coordinates(courier.current_lat, courier.current_lng),
+                True,
+            )
+            for courier in couriers
+            if courier.current_lat is not None and courier.current_lng is not None
+        ],
+        [OrderPoint(str(point.id), Coordinates(point.lat, point.lng)) for point in points],
+        options=AssignOrdersOptions([], travel_costs_minutes),
+    )
+    improvement: dict[str, object] = {"enabled": False, "applied": False}
+    if road_durations is not None and get_settings().joint_assignment_enabled:
+        usable = [c for c in couriers if c.current_lat is not None and c.current_lng is not None]
+        joint = await asyncio.to_thread(
+            improve_assignment,
+            road_durations,
+            {str(courier.id): index for index, courier in enumerate(usable)},
+            {str(point.id): len(usable) + index for index, point in enumerate(points)},
+            result,
+        )
+        result = joint.assignments
+        improvement = _improvement_view(joint)
+    assignments = [
+        {"courierId": courier_id, "deliveryPointIds": point_ids}
+        for courier_id, point_ids in result.items()
+    ]
+    assigned_ids = {
+        point_id for point_ids in result.values() for point_id in point_ids
+    }
+    requested_ids = (
+        [str(point_id) for point_id in data.delivery_point_ids]
+        if data.delivery_point_ids is not None
+        else [str(point.id) for point in raw_points]
+    )
+    return _json(
+        {
+            "assignments": assignments,
+            "unassignedDeliveryPointIds": [
+                point_id for point_id in requested_ids if point_id not in assigned_ids
+            ],
+            "ai": ai_status,
+            "improvement": improvement,
+        }
+    )
+
+
+def _improvement_view(joint: JointAssignmentResult) -> dict[str, object]:
+    """Resumen verificable de lo que cambió el reparto conjunto, sin datos personales."""
+    return {
+        "enabled": True,
+        "applied": bool(joint.moves),
+        "beforeMinutes": round(joint.before.total_minutes, 1),
+        "afterMinutes": round(joint.after.total_minutes, 1),
+        "savedMinutes": round(joint.saved_total_minutes, 1),
+        "longestBeforeMinutes": round(joint.before.longest_route_minutes, 1),
+        "longestAfterMinutes": round(joint.after.longest_route_minutes, 1),
+        "evaluations": joint.evaluations,
+        "moves": [
+            {
+                "kind": move.kind,
+                "deliveryPointId": move.order_id,
+                "fromCourierId": move.from_courier,
+                "toCourierId": move.to_courier,
+                "swappedDeliveryPointId": move.swapped_order_id,
