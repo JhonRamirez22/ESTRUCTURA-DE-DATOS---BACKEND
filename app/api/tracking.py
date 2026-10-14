@@ -210,3 +210,73 @@ async def get_tracking(
             if matrix_durations is not None
             else road_duration_minutes if is_first_point_target else None
         )
+        base_distance = (
+            matrix_distances[0][1]
+            if matrix_distances is not None
+            else road_distance_meters if is_first_point_target else None
+        )
+        if matrix_result is not None and matrix_result["source"] == "euclidean-fallback":
+            base_duration = None
+            base_distance = None
+        first_leg_traffic = await estimate_first_leg_with_traffic(
+            route_id=route.id,
+            next_stop_id=first_point.id,
+            start=(shared_position[1], shared_position[0]),
+            end=(first_point.lng, first_point.lat),
+            base_duration_minutes=base_duration,
+            base_distance_meters=base_distance,
+            route_provider=route_provider,
+            traffic_provider=traffic_provider,
+            road_route=road_route if is_first_point_target else None,
+            require_road_route=(
+                is_first_point_target
+                and (
+                    matrix_result is None
+                    or matrix_result["source"] == "euclidean-fallback"
+                )
+            ),
+        )
+
+        can_accumulate = matrix_result is not None and (
+            matrix_result["source"] != "euclidean-fallback" or is_first_point_target
+        )
+        if can_accumulate and matrix_result is not None:
+            duration_matrix = [list(row) for row in matrix_result["durations_minutes"]]
+            duration_matrix[0][1] = first_leg_traffic.duration_minutes
+            distance_matrix = matrix_result.get("distances_meters")
+            copied_distances = [list(row) for row in distance_matrix] if distance_matrix else None
+            if copied_distances is not None and first_leg_traffic.distance_meters is not None:
+                copied_distances[0][1] = first_leg_traffic.distance_meters
+            stop_etas = estimate_stop_etas_from_matrix(
+                [str(point.id) for point in remaining_points],
+                duration_matrix,
+                copied_distances,
+            )
+    target_eta = next(
+        (eta for eta in stop_etas if eta.stop_id == str(delivery_point.id)),
+        None,
+    )
+    if (
+        estimate_warning is not None
+        and is_next_stop
+        and first_leg_traffic is not None
+        and first_leg_traffic.road_route is not None
+    ):
+        estimate_warning = (
+            "El ETA de la siguiente parada usa la ruta vial verificada; "
+            "no se pudo calcular el acumulado "
+            "de las demás paradas."
+        )
+    elif estimate_warning is None and may_show_courier:
+        warning_parts = [
+            matrix_result.get("warning") if matrix_result is not None else None,
+        ]
+        estimate_warning = " ".join(part for part in warning_parts if part)
+        if target_eta is not None and target_eta.estimated_minutes_from_now is None:
+            estimate_warning += " No se encontró conexión vial para este pedido en el orden actual."
+
+    response_route: dict[str, object] = {
+        "status": route.status.value,
+        "courier": {
+            "currentLat": shared_position[0] if shared_position is not None else None,
+            "currentLng": shared_position[1] if shared_position is not None else None,
