@@ -231,3 +231,80 @@ async def _login_with_password(
         account.password_hash if account is not None else _DUMMY_PASSWORD_HASH,
     )
     if account is None or not valid or not account.enabled:
+        _audit(session, request, "login", outcome="denied")
+        await session.commit()
+        return _error("Correo o contraseña incorrectos.", 401)
+    # Descuenta solo este éxito: no borra intentos concurrentes de otras réplicas.
+    digest = hmac.new(secret.encode(), rate_key.encode(), hashlib.sha256).hexdigest()
+    await session.execute(
+        update(CustomerChatRateLimitWindow)
+        .where(CustomerChatRateLimitWindow.guide_hash == digest)
+        .values(request_count=case(
+            (CustomerChatRateLimitWindow.request_count > 0,
+             CustomerChatRateLimitWindow.request_count - 1),
+            else_=0,
+        ))
+    )
+    _audit(session, request, "login", account.id)
+    return await _login_response(
+        account,
+        session,
+        credentials.return_to,
+        settings,
+        secret,
+    )
+
+
+@router.get("/session", response_model=SessionResponse)
+async def read_session(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    settings = get_settings()
+    claims = await get_optional_session(request, session)
+    headers = {"Cache-Control": "no-store, private"}
+    secret = _configured_secret(settings)
+    if claims is not None and secret:
+        role = claims["role"]
+        token = read_session_token(request.headers.get("cookie"), role)
+        if token:
+            headers["X-CSRF-Token"] = csrf_token(token, secret)
+            headers[SESSION_ROLE_HEADER] = role
+    payload = SessionResponse(authenticated=claims is not None)
+    return JSONResponse(
+        content=payload.model_dump(),
+        headers=headers,
+    )
+
+
+@router.get("/access", response_model=PageAccessResponse, response_model_by_alias=True)
+async def check_page_access(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    path: Annotated[str, Query(min_length=1, max_length=256)],
+) -> PageAccessResponse:
+    if path == "/acceso":
+        claims = await get_optional_session(request, session)
+        if claims is None:
+            return PageAccessResponse(allowed=True)
+        return PageAccessResponse(allowed=False, redirect_to=_home_for_role(claims["role"]))
+
+    required_role = _required_page_role(path)
+    if required_role is None:
+        raise HTTPException(status_code=400, detail="La ruta no requiere una sesión de rol.")
+    # Cada rol tiene su cookie: una sesión de repartidor no impide entrar al panel de despacho.
+    if await _resolve_session(request, session, role=required_role) is not None:
+        return PageAccessResponse(allowed=True)
+    other_role: SessionRole = "courier" if required_role == "dispatcher" else "dispatcher"
+    other = await _resolve_session(request, session, role=other_role)
+    if other is None:
+        return PageAccessResponse(allowed=False, redirect_to="/acceso")
+    return PageAccessResponse(allowed=False, redirect_to=_home_for_role(other["role"]))
+
+
+@router.post("/logout", response_model=LogoutResponse)
+async def logout(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    settings = get_settings()
