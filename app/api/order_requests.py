@@ -202,3 +202,71 @@ async def lookup_address(
             return JSONResponse(
                 {"error": "Hiciste varias búsquedas seguidas. Marca el punto en el mapa o espera."},
                 status_code=429,
+                headers={**_NO_STORE, "Retry-After": str(retry_after)},
+            )
+    await session.commit()
+    try:
+        result = await resolve_address(data.address, geocoder, advisor)
+    except AddressGeocoderError:
+        return _error("La búsqueda no respondió; marca el punto en el mapa.", 503)
+    if should_cache_lookup(result):
+        _LOOKUP_CACHE.put(cache_key, result)
+    return JSONResponse({**result, "cached": False}, headers=_NO_STORE)
+
+
+@router.post("/{request_id}/aceptar")
+async def accept_order_request(
+    request_id: str,
+    claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    parsed_id = _parse_uuid(request_id)
+    if parsed_id is None:
+        return _error("La solicitud no existe.", 404)
+    try:
+        repository = DeliveryPointRepository(session)
+        pending = await repository.get_delivery_point(parsed_id)
+        accepted = await repository.accept_request(parsed_id)
+        if accepted and pending is not None:
+            DeliveryEventRecorder(session).record(
+                pending, DeliveryEventType.ACCEPTED, EventActor.from_claims(claims),
+                from_status="REQUESTED", to_status="PENDING",
+            )
+        await session.commit()
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _LOGGER.warning(
+            "No se pudo aceptar la solicitud", extra={"error_type": type(error).__name__}
+        )
+        return _error("No se pudo procesar la solicitud.", 500)
+    if not accepted:
+        return _error("La solicitud ya fue resuelta o no existe.", 409)
+    return JSONResponse({"ok": True, "status": "PENDING"}, headers=_NO_STORE)
+
+
+@router.post("/{request_id}/rechazar")
+async def reject_order_request(
+    request_id: str,
+    claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    parsed_id = _parse_uuid(request_id)
+    if parsed_id is None:
+        return _error("La solicitud no existe.", 404)
+    try:
+        repository = DeliveryPointRepository(session)
+        waiting = await repository.get_delivery_point(parsed_id)
+        rejected = await repository.reject_request(parsed_id)
+        if rejected and waiting is not None:
+            DeliveryEventRecorder(session).rejected(waiting, EventActor.from_claims(claims))
+        await session.commit()
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _LOGGER.warning(
+            "No se pudo rechazar la solicitud", extra={"error_type": type(error).__name__}
+        )
+        return _error("No se pudo procesar la solicitud.", 500)
+    if not rejected:
+        return _error("La solicitud ya fue resuelta o no existe.", 409)
+    return JSONResponse({"ok": True}, headers=_NO_STORE)
+
