@@ -253,3 +253,88 @@ async def update_courier(
     try:
         data = CourierUpdateRequest.model_validate(body)
     except ValidationError as error:
+        if any(item["loc"] == ("status",) for item in error.errors()):
+            return _error("status debe ser AVAILABLE, ON_ROUTE u OFFLINE.", 400)
+        return _error(_string_field_error(error), 400)
+
+    fields_set = data.model_fields_set
+    values: dict[str, str | CourierStatus] = {}
+    for field in ("name", "phone"):
+        if field in fields_set:
+            value = getattr(data, field)
+            if not isinstance(value, str) or not value:
+                return _error(f"{field} debe ser un string no vacío.", 400)
+            values[field] = value
+    if "status" in fields_set:
+        if data.status is not CourierStatus.OFFLINE:
+            return _error(
+                "Disponible y En ruta se determinan con GPS autenticado "
+                "y el ciclo de vida de la ruta.",
+                400,
+            )
+        values["status"] = CourierStatus.OFFLINE
+    if not values:
+        return _error("No hay campos válidos para actualizar.", 400)
+
+    courier = await CourierRepository(session).get_courier(parsed_id)
+    if courier is None:
+        return _error("El repartidor no existe.", 404)
+    for field, value in values.items():
+        setattr(courier, field, value)
+    try:
+        await session.commit()
+        await CourierRepository(session).refresh_courier(courier)
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_db_error("No se pudo actualizar el repartidor", error)
+        return _error("No se pudo procesar el repartidor.", 500)
+    return _json(
+        CourierResponse(courier=CourierView.model_validate(courier)).model_dump(
+            mode="json", by_alias=True
+        )
+    )
+
+
+@router.delete("/{courier_id}", status_code=204)
+async def delete_courier(
+    courier_id: str,
+    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> Response:
+    parsed_id = _parse_uuid(courier_id)
+    repository = CourierRepository(session)
+    courier = await repository.get_courier(parsed_id)
+    if courier is None:
+        return _error("El repartidor no existe.", 404)
+    if await repository.has_routes(parsed_id):
+        return _error("No se puede eliminar un repartidor con rutas asociadas.", 409)
+    try:
+        await repository.delete_courier(courier)
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        return _error("No se puede eliminar un repartidor con rutas asociadas.", 409)
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_db_error("No se pudo eliminar el repartidor", error)
+        return _error("No se pudo procesar el repartidor.", 500)
+    return Response(status_code=204)
+
+
+@router.post("/{courier_id}/codigo")
+async def renew_courier_access_code(
+    courier_id: str,
+    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    parsed_id = _parse_uuid(courier_id)
+    repository = CourierRepository(session)
+    courier = await repository.get_courier(parsed_id)
+    if courier is None:
+        return _error("El repartidor no existe.", 404)
+    access_code = create_courier_access_code(str(parsed_id))
+    try:
+        access_code_hash = await run_in_threadpool(hash_courier_access_code, access_code)
+        credential = await repository.get_credential(parsed_id)
+        if credential is None:
+            repository.add_credential(
