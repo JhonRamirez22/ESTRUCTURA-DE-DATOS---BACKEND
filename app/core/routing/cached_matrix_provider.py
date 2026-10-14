@@ -120,3 +120,63 @@ def build_matrix_cache_key(
 ) -> str:
     """Conserva orden y redondea a 5 decimales para amortiguar jitter GPS."""
     rounded = [[round(longitude, 5), round(latitude, 5)] for longitude, latitude in coordinates]
+    return f"{_MATRIX_CACHE_SCHEMA}:{source}:{rounded!r}"
+
+
+def clear_matrix_cache() -> None:
+    """Limpia el caché de módulo para pruebas; no se necesita en producción."""
+    while _matrix_cache.pop_back() is not None:
+        pass
+    _matrix_cache_nodes.clear()
+
+
+def _copy_matrix_result(result: MatrixResult) -> MatrixResult:
+    copied: MatrixResult = {
+        "durations_minutes": [list(row) for row in result["durations_minutes"]],
+    }
+    if "distances_meters" in result:
+        copied["distances_meters"] = [list(row) for row in result["distances_meters"]]
+    return copied
+
+
+def _copy_result(result: MatrixResult, *, source: MatrixSource) -> MatrixProviderResult:
+    copied = _copy_matrix_result(result)
+    provider_result: MatrixProviderResult = {
+        "durations_minutes": copied["durations_minutes"],
+        "source": source,
+    }
+    if "distances_meters" in copied:
+        provider_result["distances_meters"] = copied["distances_meters"]
+    return provider_result
+
+
+def _fallback_warning(error: Exception, source: MatrixSource) -> str:
+    provider = source.upper()
+    if "RateLimit" in error.__class__.__name__:
+        reason = "alcanzó el límite de solicitudes"
+    else:
+        reason = "agotó el tiempo de espera"
+    return f"{provider} {reason}; se usó una matriz euclidiana aproximada."
+
+
+def _build_euclidean_fallback_matrix(
+    coordinates: Sequence[Coordinate],
+) -> list[list[float | None]]:
+    meters_per_minute = FALLBACK_MAX_SPEED_KMH * _METERS_PER_KILOMETER / _MINUTES_PER_HOUR
+    return [
+        [_fallback_minutes(source, target, meters_per_minute) for target in coordinates]
+        for source in coordinates
+    ]
+
+
+def _fallback_minutes(
+    source: Coordinate,
+    target: Coordinate,
+    meters_per_minute: float,
+) -> float:
+    source_lng, source_lat = source
+    target_lng, target_lat = target
+    mean_latitude = math.radians((source_lat + target_lat) / 2)
+    delta_x = (target_lng - source_lng) * _METERS_PER_DEGREE_LATITUDE * math.cos(mean_latitude)
+    delta_y = (target_lat - source_lat) * _METERS_PER_DEGREE_LATITUDE
+    return math.hypot(delta_x, delta_y) / meters_per_minute
