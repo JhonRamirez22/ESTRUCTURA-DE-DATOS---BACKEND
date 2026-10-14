@@ -248,3 +248,86 @@ async def patch_route_status(
 ) -> JSONResponse:
     authorized = _authorize_route_id(route_id, claims)
     if isinstance(authorized, JSONResponse):
+        return authorized
+    parsed_id, dispatcher = authorized
+    parsed_body = await _read_model(request, RouteStatusRequest)
+    if isinstance(parsed_body, JSONResponse):
+        return parsed_body
+    try:
+        existing_courier_id = await RouteRepository(session).get_route_courier_id(parsed_id)
+        if existing_courier_id is None:
+            return _error("La ruta no existe.", 404)
+        if not dispatcher and existing_courier_id != _claim_courier_id(cast(SessionClaims, claims)):
+            return _error("La ruta no existe.", 404)
+        route = await update_route_status(
+            session, parsed_id, parsed_body.status, EventActor.from_claims(claims)
+        )
+        return _json({"route": _route_json(route, dispatcher=dispatcher)}, headers=_NO_STORE)
+    except RoutePlanningError as error:
+        return _error(str(error), error.status_code)
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_database_error("No se pudo actualizar el estado de ruta", error)
+        return _error("No se pudo actualizar el estado de la ruta.", 500)
+
+
+@router.post("/{route_id}/recalcular")
+async def recalculate_route_endpoint(
+    route_id: str,
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    providers: Annotated[
+        tuple[CachedMatrixProvider, CachedRouteProvider],
+        Depends(get_routing_providers),
+    ],
+    advisor: Annotated[RouteTrafficAdvisor | None, Depends(get_route_traffic_advisor)],
+    traffic: Annotated[TrafficService | None, Depends(get_traffic_service)],
+    order_advisor: Annotated[RouteOrderAdvisor | None, Depends(get_route_order_advisor)],
+) -> JSONResponse:
+    if claims is None:
+        return _error("Debes iniciar sesión para continuar.", 401)
+    dispatcher = claims["role"] == "dispatcher"
+    if not dispatcher and _claim_courier_id(claims) is None:
+        return _error("La sesión de repartidor no es válida.", 403)
+    parsed_id = _parse_uuid(route_id)
+    if parsed_id is None:
+        return _error("La ruta no existe.", 404)
+    parsed_body = await _read_optional_model(request, RecalculateRouteRequest)
+    if isinstance(parsed_body, JSONResponse):
+        return parsed_body
+    try:
+        route = await RouteRepository(session).load_route(parsed_id)
+        if route is None or (not dispatcher and route.courier_id != _claim_courier_id(claims)):
+            return _error("La ruta no existe.", 404)
+        if not dispatcher and parsed_body.delivery_point_ids:
+            return _error("El repartidor solo puede optimizar sus paradas ya asignadas.", 403)
+        if route.status not in {RouteStatus.PLANNED, RouteStatus.IN_PROGRESS}:
+            return _error("Solo se pueden recalcular rutas planificadas o en progreso.", 409)
+        previous_ids = [
+            point.id
+            for point in sorted(route.delivery_points, key=lambda item: item.sequence_index or 0)
+            if point.status.value in {"PENDING", "EN_ROUTE"}
+        ]
+        requested_ids = parsed_body.delivery_point_ids or []
+        combined_ids = list(dict.fromkeys([*previous_ids, *requested_ids]))
+        if not combined_ids:
+            return _error("La ruta no tiene puntos pendientes para recalcular.", 409)
+        matrix_provider, route_provider = providers
+        plan = await build_optimized_route_plan(
+            session,
+            route.courier_id,
+            combined_ids,
+            matrix_provider=cast(MatrixProvider, matrix_provider),
+            route_provider=cast(RouteProvider, route_provider),
+            traffic_ai_advisor=advisor,
+            traffic_provider=traffic,
+            order_advisor=order_advisor,
+            allow_on_route_courier=True,
+            existing_route_id=parsed_id,
+        )
+        result = await recalculate_route(session, parsed_id, plan, previous_ids)
+        body = _operation_json(result, dispatcher=dispatcher)
+        body["recalculated"] = True
+        record_applied(parsed_id, body)
+        route_payload = body.get("route")
