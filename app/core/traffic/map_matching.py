@@ -100,3 +100,53 @@ def _find_nearest_segment(
 def _distance_to_segment_squared(point: Coordinate, segment: RoadSegment) -> float:
     point_x = point[0] * math.cos(math.radians(point[1]))
     point_y = point[1]
+    start_x = segment.start[0] * math.cos(math.radians(point[1]))
+    start_y = segment.start[1]
+    end_x = segment.end[0] * math.cos(math.radians(point[1]))
+    end_y = segment.end[1]
+    direction_x = end_x - start_x
+    direction_y = end_y - start_y
+    length_squared = direction_x**2 + direction_y**2
+    if length_squared == 0:
+        return (point_x - start_x) ** 2 + (point_y - start_y) ** 2
+    projection = min(
+        1.0,
+        max(
+            0.0,
+            ((point_x - start_x) * direction_x + (point_y - start_y) * direction_y)
+            / length_squared,
+        ),
+    )
+    closest_x = start_x + projection * direction_x
+    closest_y = start_y + projection * direction_y
+    return (point_x - closest_x) ** 2 + (point_y - closest_y) ** 2
+
+
+def _valid_segment(segment: RoadSegment) -> bool:
+    return (
+        bool(segment.id.strip())
+        and math.isfinite(segment.ors_duration_minutes)
+        and segment.ors_duration_minutes > 0
+        and _valid_coordinate(segment.start)
+        and _valid_coordinate(segment.end)
+    )
+
+
+def _valid_event(event: LocationEventPoint) -> bool:
+    return _valid_coordinate(event.coordinates) and not math.isnan(
+        _as_utc(event.recorded_at).timestamp()
+    )
+
+
+def _valid_coordinate(coordinate: Coordinate) -> bool:
+    longitude, latitude = coordinate
+    return (
+        math.isfinite(latitude)
+        and -90 <= latitude <= 90
+        and math.isfinite(longitude)
+        and -180 <= longitude <= 180
+    )
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
