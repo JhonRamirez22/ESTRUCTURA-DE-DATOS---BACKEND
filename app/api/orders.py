@@ -247,3 +247,86 @@ async def update_delivery_point(
                 DeliveryPointStatus.EN_ROUTE,
             }:
                 return _error("Esta entrega ya tiene un estado final y no puede modificarse.", 409)
+            if data.status not in {
+                DeliveryPointStatus.DELIVERED,
+                DeliveryPointStatus.FAILED,
+            }:
+                return _error("El estado de entrega no es válido para el repartidor.", 400)
+
+        next_customer_email = (
+            data.customer_email if "customer_email" in fields else point.customer_email
+        )
+        next_email_notifications_enabled = (
+            data.email_notifications_enabled
+            if data.email_notifications_enabled is not None
+            else point.email_notifications_enabled
+        )
+        if not next_email_notifications_enabled:
+            next_customer_email = None
+        if next_email_notifications_enabled and not next_customer_email:
+            return _error("Se requiere customerEmail para activar avisos por correo.", 400)
+        next_sms_notifications_enabled = (
+            data.sms_notifications_enabled
+            if data.sms_notifications_enabled is not None
+            else point.sms_notifications_enabled
+        )
+        next_customer_phone = (
+            data.customer_phone if "customer_phone" in fields else point.customer_phone
+        )
+        if not next_sms_notifications_enabled:
+            next_customer_phone = None
+        if next_sms_notifications_enabled and not next_customer_phone:
+            return _error("Se requiere customerPhone para activar avisos por SMS.", 400)
+        customer_notification_consent_changed = (
+            next_customer_email != point.customer_email
+            or next_email_notifications_enabled != point.email_notifications_enabled
+            or next_customer_phone != point.customer_phone
+            or next_sms_notifications_enabled != point.sms_notifications_enabled
+        )
+
+        previous_status = point.status
+        previous_schedule = point.scheduled_for
+        next_address = normalize_pasto_address(data.address or point.address)
+        next_latitude = point.lat if data.lat is None else data.lat
+        next_longitude = point.lng if data.lng is None else data.lng
+        invalid_location = _validate_pasto_location(
+            next_address, next_latitude, next_longitude
+        )
+        if invalid_location:
+            return _error(invalid_location, 400)
+
+        normalization: AddressNormalizationResult | None = None
+        if data.address is not None:
+            normalization = await normalize_address(
+                next_address, next_latitude, next_longitude, advisor
+            )
+            next_address = normalization.address
+
+        updates: dict[str, object] = {}
+        if "address" in fields:
+            updates["address"] = next_address
+        if data.lat is not None:
+            updates["lat"] = data.lat
+        if data.lng is not None:
+            updates["lng"] = data.lng
+        if data.order_id is not None:
+            updates["order_id"] = data.order_id
+        if "status" in fields and data.status is not None:
+            updates["status"] = data.status
+        if "time_window" in fields:
+            updates["time_window"] = data.time_window
+        if data.priority is not None:
+            updates["priority"] = data.priority
+        if "scheduled_for" in fields:
+            updates["scheduled_for"] = data.scheduled_for
+        if data.status == DeliveryPointStatus.DELIVERED:
+            updates["delivered_at"] = utc_now()
+        if "customer_email" in fields or not next_email_notifications_enabled:
+            updates["customer_email"] = next_customer_email
+        if data.email_notifications_enabled is not None:
+            updates["email_notifications_enabled"] = data.email_notifications_enabled
+        if "customer_phone" in fields or not next_sms_notifications_enabled:
+            updates["customer_phone"] = next_customer_phone
+        if data.sms_notifications_enabled is not None:
+            updates["sms_notifications_enabled"] = data.sms_notifications_enabled
+
