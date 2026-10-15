@@ -220,3 +220,77 @@ def _validate_group_proposal(
         reason = item.get("reason")
         accepted.append(
             {
+                "members": unique,
+                "spreadMeters": next(
+                    g["spreadMeters"] for g in candidates if set(unique) <= set(g["members"])
+                ),
+                "source": "groq-validated",
+                "reason": str(reason)[:200] if isinstance(reason, str) else None,
+            }
+        )
+    return accepted
+
+
+def verify_explanation(text: str, summary_numbers: Sequence[float]) -> bool:
+    """Cada cifra del texto debe coincidir con una cifra del resumen verificado."""
+    found = [
+        float(match.replace(",", "."))
+        for match in _NUMBER.findall(_NOT_FIGURES.sub(" ", text))
+    ]
+    if not found:
+        return True
+    tolerance = 0.06
+    return all(
+        any(math.isclose(value, known, abs_tol=tolerance) for known in summary_numbers)
+        for value in found
+    )
+
+
+def deterministic_explanation(summary: Mapping[str, Any]) -> str:
+    saved = summary.get("savedMinutes")
+    ladder = {step["step"]: step.get("minutes") for step in summary.get("ladder", [])}
+    if saved is None or saved <= 0.05:
+        return "El orden base ya era el mejor con los tiempos medidos; no hubo cambios."
+    base = ladder.get("nearestNeighbor")
+    final = ladder.get("aiOrder") or ladder.get("orOpt")
+    if base is None or final is None:
+        return f"La ruta optimizada ahorra {round(saved, 1)} min frente al orden base."
+    return (
+        f"El orden base tardaba {base} min y el final {final} min, "
+        f"un ahorro de {round(saved, 1)} min con la misma matriz de tiempos."
+    )
+
+
+async def explain_route(
+    summary: Mapping[str, Any], *, transport: httpx.AsyncBaseTransport | None = None
+) -> dict[str, Any]:
+    """Texto explicativo de Groq, validado contra las cifras del resumen."""
+    numbers: list[float] = []
+    for step in summary.get("ladder", []):
+        if step.get("minutes") is not None:
+            numbers.append(float(step["minutes"]))
+    if summary.get("savedMinutes") is not None:
+        numbers.append(float(summary["savedMinutes"]))
+    tomtom = summary.get("tomtom", {})
+    numbers.extend(
+        float(tomtom.get(key, 0)) for key in ("sampled", "adjusted", "closed", "segments")
+    )
+    fallback = deterministic_explanation(summary)
+    try:
+        payload = {
+            "ladder": [
+                {"step": step["step"], "minutes": step.get("minutes")}
+                for step in summary.get("ladder", [])
+            ],
+            "savedMinutes": summary.get("savedMinutes"),
+            "tomtom": tomtom,
+            "groq": {"orderAccepted": summary.get("groq", {}).get("orderAccepted")},
+        }
+        parsed = await _chat_json(_EXPLAIN_PROMPT, payload, transport=transport)
+        text = parsed.get("text")
+    except IntelligenceUnavailable:
+        return {"text": fallback, "source": "deterministic"}
+    if isinstance(text, str) and text.strip() and verify_explanation(text, numbers):
+        return {"text": text.strip()[:600], "source": "groq-validated"}
+    record_incident("groq", "inteligencia:texto-no-verificado")
+    return {"text": fallback, "source": "deterministic"}
