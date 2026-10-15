@@ -250,3 +250,87 @@ async def build_optimized_route_plan(
     traffic_ai_advisor: RouteTrafficAdvisor | None = None,
     traffic_provider: TrafficProvider | None = None,
     order_advisor: RouteOrderAdvisor | None = None,
+    allow_on_route_courier: bool = False,
+    existing_route_id: UUID | None = None,
+    now: datetime | None = None,
+) -> OptimizedRoutePlan:
+    if not delivery_point_ids:
+        raise RoutePlanningError("deliveryPointIds debe ser un array no vacío.", 400)
+    if len(delivery_point_ids) > MAX_ROUTE_STOPS:
+        raise RoutePlanningError(f"Una ruta no puede superar {MAX_ROUTE_STOPS} paradas.", 400)
+    if len(set(delivery_point_ids)) != len(delivery_point_ids):
+        raise RoutePlanningError("deliveryPointIds no puede contener duplicados.", 400)
+
+    current_time = _as_naive_utc(now or datetime.now(UTC))
+    if inputs is None:
+        inputs = await load_plan_inputs(session, courier_id, delivery_point_ids)
+    courier = inputs.courier
+    if courier is None:
+        raise RoutePlanningError("El courier solicitado no existe.", 404)
+    can_recalculate = allow_on_route_courier and courier.status == CourierStatus.ON_ROUTE
+    if courier.status != CourierStatus.AVAILABLE and not can_recalculate:
+        raise RouteConflictError("El courier no está AVAILABLE.")
+    if courier.current_lat is None or courier.current_lng is None:
+        raise RouteConflictError("El courier no tiene una posición actual registrada.")
+    if not is_courier_location_fresh(courier.last_location_at, current_time):
+        raise RouteConflictError(
+            "La ubicación GPS del repartidor está vencida. Debe compartir una posición reciente."
+        )
+    if not is_within_pasto_service_area(courier.current_lat, courier.current_lng):
+        raise RouteConflictError("La última ubicación del repartidor está fuera de Pasto.")
+
+    points = inputs.points
+    points_by_id = {point.id: point for point in points}
+    missing_id = next(
+        (point_id for point_id in delivery_point_ids if point_id not in points_by_id),
+        None,
+    )
+    if missing_id is not None:
+        raise RoutePlanningError(f"El delivery point {missing_id} no existe.", 404)
+
+    for point_id in delivery_point_ids:
+        point = points_by_id[point_id]
+        active = point.status == DeliveryPointStatus.PENDING or (
+            point.status == DeliveryPointStatus.EN_ROUTE and point.route_id == existing_route_id
+        )
+        if not active or (point.route_id is not None and point.route_id != existing_route_id):
+            raise RouteConflictError(
+                f"El delivery point {point_id} no está PENDING o ya pertenece a otra ruta."
+            )
+        if not is_within_pasto_service_area(point.lat, point.lng):
+            raise RouteConflictError(
+                f"El delivery point {point_id} está fuera de la zona de servicio de Pasto."
+            )
+
+    coordinates: list[Coordinate] = [(courier.current_lng, courier.current_lat)]
+    coordinates.extend(
+        (points_by_id[point_id].lng, points_by_id[point_id].lat) for point_id in delivery_point_ids
+    )
+
+    matrix_result = await matrix_provider.get_duration_matrix(coordinates)
+    baseline_matrix = matrix_result["durations_minutes"]
+    matrix_source = matrix_result.get("source", "osrm")
+    has_road_times = matrix_source in {"osrm", "ors"}
+    provider_name = matrix_source.upper() if has_road_times else "el proveedor vial"
+    _validate_matrix_shape(baseline_matrix, len(coordinates))
+    baseline_route = nearest_neighbor(baseline_matrix, 0)
+    optimization_matrix = baseline_matrix
+    initial_route = two_opt(baseline_matrix, baseline_route)
+    if not math.isfinite(_route_cost(baseline_matrix, initial_route)):
+        raise RouteConflictError("No existe un camino conectado que cubra todos los pedidos.")
+    ordered_coordinates = [coordinates[index] for index in initial_route]
+    route_result = await route_provider.get_route(ordered_coordinates)
+    geometry_provider = route_result["geometry_provider"]
+    if geometry_provider not in {"OSRM", "ORS"}:
+        raise RoutePlanningError(
+            "El proveedor no verificó una geometría vial; no se guardará una línea recta.", 502
+        )
+    live_traffic: dict[str, object] = {
+        "source": "osrm-baseline",
+        "configured": traffic_provider is not None,
+        "applied": False,
+        "routeSegments": len(initial_route) - 1,
+        "sampledSegments": 0,
+        "adjustedSegments": 0,
+        "closedSegments": 0,
+        "coverageRatio": 0.0,
