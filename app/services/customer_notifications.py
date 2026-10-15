@@ -257,3 +257,89 @@ async def _enqueue_customer_event(
     event_type: CustomerNotificationEvent,
     *,
     subject: str,
+    text_body: str,
+    sms_body: str,
+    now: datetime | None,
+) -> tuple[CustomerNotificationChannel, ...]:
+    if not get_settings().customer_notifications_enabled:
+        return ()
+    queued: list[CustomerNotificationChannel] = []
+    email = (point.customer_email or "").strip()
+    if point.email_notifications_enabled and email:
+        inserted = await _enqueue_notification(
+            session,
+            point,
+            route_id,
+            event_type,
+            CustomerNotificationChannel.EMAIL,
+            email,
+            subject,
+            text_body,
+            now,
+        )
+        if inserted:
+            queued.append(CustomerNotificationChannel.EMAIL)
+
+    phone = (point.customer_phone or "").strip()
+    if (
+        point.sms_notifications_enabled
+        and phone
+        and _E164_PATTERN.fullmatch(phone)
+    ):
+        inserted = await _enqueue_notification(
+            session,
+            point,
+            route_id,
+            event_type,
+            CustomerNotificationChannel.SMS,
+            phone,
+            subject,
+            sms_body,
+            now,
+        )
+        if inserted:
+            queued.append(CustomerNotificationChannel.SMS)
+    return tuple(queued)
+
+
+async def cancel_pending_customer_notifications(
+    session: AsyncSession,
+    delivery_point_id: UUID,
+) -> int:
+    """Cancela avisos aún no enviados y elimina destinatarios y contenido."""
+    result = await session.execute(
+        update(CustomerNotificationOutbox)
+        .where(
+            CustomerNotificationOutbox.delivery_point_id == delivery_point_id,
+            CustomerNotificationOutbox.status.in_(
+                (
+                    CustomerNotificationStatus.PENDING,
+                    CustomerNotificationStatus.PROCESSING,
+                )
+            ),
+        )
+        .values(
+            status=CustomerNotificationStatus.CANCELLED,
+            recipient_email=None,
+            recipient_phone=None,
+            subject="",
+            text_body="",
+            lease_expires_at=None,
+        )
+        .returning(CustomerNotificationOutbox.id)
+    )
+    return len(result.scalars().all())
+
+
+async def dispatch_pending_customer_notifications(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    settings: Settings | None = None,
+    sender: EmailSender | None = None,
+    sms_sender: SmsSender | None = None,
+    now: datetime | None = None,
+) -> DispatchSummary:
+    """Entrega canales configurados fuera de la transacción y conserva fallos para reintento."""
+    active_settings = settings or get_settings()
+    configured_channels = customer_notification_channels_configured(active_settings)
+    enabled_channels = tuple(channel for channel, enabled in configured_channels.items() if enabled)
