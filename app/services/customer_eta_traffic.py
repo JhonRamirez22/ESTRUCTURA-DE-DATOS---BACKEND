@@ -177,3 +177,62 @@ async def estimate_first_leg_with_traffic(
         duration * multiplier,
         distance,
         road_route,
+        configured=True,
+        applied=True,
+        closed=False,
+        status=traffic.cache_status,
+        warning=warning,
+    )
+
+
+async def _get_flow(
+    route_id: UUID,
+    next_stop_id: UUID,
+    coordinate: Coordinate,
+    provider: TrafficProvider,
+    monotonic: Callable[[], float],
+) -> TrafficData:
+    key = (route_id, next_stop_id)
+    now = monotonic()
+    cached = _traffic_cache.get(key)
+    if cached is not None and cached.expires_at > now:
+        _traffic_cache.move_to_end(key)
+        status: TrafficCacheStatus = (
+            "STALE" if cached.data.cache_status == "STALE" else "CACHE"
+        )
+        return replace(cached.data, cache_status=status)
+    if cached is not None:
+        del _traffic_cache[key]
+
+    traffic = await provider.get_flow_segment(coordinate)
+    _traffic_cache[key] = _TrafficCacheEntry(
+        expires_at=now + CUSTOMER_ETA_TRAFFIC_CACHE_SECONDS,
+        data=traffic,
+    )
+    _traffic_cache.move_to_end(key)
+    while len(_traffic_cache) > CUSTOMER_ETA_TRAFFIC_CACHE_MAX_ENTRIES:
+        _traffic_cache.popitem(last=False)
+    return traffic
+
+
+def _unavailable_estimate(
+    duration: float | None,
+    distance: float | None,
+    road_route: RouteResult | None,
+    warning: str,
+) -> FirstLegTrafficEstimate:
+    return FirstLegTrafficEstimate(
+        duration,
+        distance,
+        road_route,
+        configured=True,
+        applied=False,
+        closed=False,
+        status="UNAVAILABLE",
+        warning=warning,
+    )
+
+
+def clear_customer_eta_traffic_cache() -> None:
+    """Limpia el caché acotado en memoria para pruebas deterministas."""
+    _traffic_cache.clear()
