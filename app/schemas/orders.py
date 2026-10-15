@@ -197,3 +197,69 @@ class OrderUpdateRequest(BaseModel):
         if self.sms_notifications_enabled is True:
             if self.customer_phone is None:
                 raise ValueError("Se requiere customerPhone para activar avisos por SMS.")
+            self.customer_phone = _normalize_colombian_mobile(self.customer_phone)
+        elif self.customer_phone is not None:
+            raise ValueError("Se requiere consentimiento explícito para guardar customerPhone.")
+        for field_name in self.model_fields_set - nullable_fields:
+            if getattr(self, field_name) is None:
+                raise ValueError(f"{field_name} no puede ser nulo.")
+        return self
+
+
+class RouteSummaryView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    courier_id: UUID = Field(serialization_alias="courierId")
+    status: RouteStatus
+    estimated_duration_minutes: float = Field(serialization_alias="estimatedDurationMinutes")
+    estimated_distance_meters: float = Field(serialization_alias="estimatedDistanceMeters")
+    baseline_duration_minutes: float | None = Field(
+        serialization_alias="baselineDurationMinutes"
+    )
+    baseline_distance_meters: float | None = Field(
+        serialization_alias="baselineDistanceMeters"
+    )
+    geometry: JsonValue | None
+    geometry_provider: RouteGeometryProvider | None = Field(
+        serialization_alias="geometryProvider"
+    )
+    started_at: datetime | None = Field(serialization_alias="startedAt")
+    completed_at: datetime | None = Field(serialization_alias="completedAt")
+    created_at: datetime = Field(serialization_alias="createdAt")
+    updated_at: datetime = Field(serialization_alias="updatedAt")
+
+    @field_serializer("started_at", "completed_at", "created_at", "updated_at")
+    def serialize_route_dates(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return normalized.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+class DeliveryPointView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    address: str
+    lat: float
+    lng: float
+    time_window: JsonValue | None = Field(serialization_alias="timeWindow")
+    priority: int = 1
+    status: DeliveryPointStatus
+    order_id: str = Field(serialization_alias="orderId")
+    tracking_token: str | None = Field(serialization_alias="trackingToken")
+    route_id: UUID | None = Field(serialization_alias="routeId")
+    sequence_index: int | None = Field(serialization_alias="sequenceIndex")
+    scheduled_for: datetime | None = Field(default=None, serialization_alias="scheduledFor")
+    schedule_state: str | None = Field(default=None, serialization_alias="scheduleState")
+    created_at: datetime | None = Field(default=None, serialization_alias="createdAt")
+    delivered_at: datetime | None = Field(default=None, serialization_alias="deliveredAt")
+    route: RouteSummaryView | None = None
+
+    @field_serializer("scheduled_for", "created_at", "delivered_at")
+    def serialize_point_dates(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return normalized.isoformat(timespec="milliseconds").replace("+00:00", "Z")
