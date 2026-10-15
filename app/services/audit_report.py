@@ -249,3 +249,86 @@ async def collect_courier_report(
     data.sections.append(Section(
         "Entregas asignadas", ["Ruta creada", "Pedido", "Estado", "Dirección"], rows,
         [3, 3, 2, 6], note,
+    ))
+
+    per_day: dict[str, list[LocationEvent]] = defaultdict(list)
+    for event in events:
+        per_day[(event.recorded_at + BOGOTA).strftime("%Y-%m-%d")].append(event)
+    gps_rows = [
+        [day, str(len(items)), local(items[0].recorded_at)[11:], local(items[-1].recorded_at)[11:],
+         f"{_distance_km(items):.1f}"]
+        for day, items in sorted(per_day.items(), reverse=True)
+    ]
+    rows, note = _cap(gps_rows, len(gps_rows))
+    data.sections.append(Section(
+        "Actividad GPS por día", ["Día", "Eventos", "Primero", "Último", "Km"], rows,
+        [3, 2, 2, 2, 2], note,
+    ))
+
+    if account is not None:
+        data.sections.append(await _sessions_section(session, account.id, begin, end))
+        data.sections.append(await _security_section(session, account.id, begin, end))
+
+    notices = (
+        await session.scalars(
+            select(Notification)
+            .where(
+                Notification.recipient_id == str(courier_id),
+                Notification.created_at >= begin,
+                Notification.created_at < end,
+            )
+            .order_by(Notification.created_at.desc())
+            .limit(MAX_ROWS)
+        )
+    ).all()
+    data.sections.append(Section(
+        "Avisos internos recibidos", ["Fecha", "Tipo", "Título"],
+        [[local(n.created_at), n.kind.value, n.title] for n in notices], [3, 4, 6],
+    ))
+    return data
+
+
+async def collect_account_report(
+    session: AsyncSession, account_id: UUID, begin: datetime, end: datetime
+) -> ReportData | None:
+    account = await session.get(Account, account_id)
+    if account is None or account.role != "dispatcher":
+        return None
+    data = ReportData(
+        "Auditoría de cuenta de despacho",
+        [
+            ("Cuenta", account.email),
+            ("Rol", "Despachador"),
+            ("Habilitada", "Sí" if account.enabled else "No"),
+        ],
+    )
+    data.sections.append(await _sessions_section(session, account.id, begin, end))
+    data.sections.append(await _security_section(session, account.id, begin, end))
+    return data
+
+
+async def collect_order_report(
+    session: AsyncSession, point_id: UUID, begin: datetime, end: datetime
+) -> ReportData | None:
+    point = await session.get(DeliveryPoint, point_id)
+    if point is None:
+        return None
+    route = await session.get(Route, point.route_id) if point.route_id else None
+    courier = await session.get(Courier, route.courier_id) if route else None
+    data = ReportData(
+        "Auditoría de pedido y cliente",
+        [
+            ("Pedido", point.order_id),
+            ("Estado", point.status.value),
+            ("Dirección", point.address),
+            ("Prioridad", {1: "Normal", 2: "Alta", 3: "Urgente"}.get(point.priority, "Normal")),
+            ("Ventana horaria", str(point.time_window) if point.time_window else "—"),
+            ("Correo del cliente (enmascarado)", mask_email(point.customer_email)),
+            ("Teléfono del cliente (enmascarado)", mask_phone(point.customer_phone)),
+            ("Aviso por correo / SMS autorizado",
+             f"{'Sí' if point.email_notifications_enabled else 'No'} / "
+             f"{'Sí' if point.sms_notifications_enabled else 'No'}"),
+            ("Repartidor asignado", courier.name if courier else "Sin asignar"),
+            ("Ruta", f"{route.status.value} · creada {local(route.created_at)}" if route else "—"),
+        ],
+    )
