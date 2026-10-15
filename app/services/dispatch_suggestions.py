@@ -176,3 +176,62 @@ async def phrase_with_ai(
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Reescribe los textos con Groq si es posible; devuelve tarjetas públicas y el estado."""
+    status: dict[str, Any] = {"source": "deterministic", "accepted": 0}
+    result = [dict(card) for card in cards]
+    if result:
+        gate = budget if budget is not None else _BUDGET
+        if not gate.take():
+            status["reason"] = "Se alcanzó el tope diario de la IA."
+        else:
+            try:
+                payload = {
+                    "alerts": [
+                        {
+                            "id": c["id"],
+                            "kind": c["kind"],
+                            "figures": c["figures"],
+                            "namesCourier": "_name" in c,
+                        }
+                        for c in result
+                    ]
+                }
+                parsed = await _chat_json(
+                    _PHRASE_PROMPT, payload, transport=transport, text_only=True
+                )
+                texts = parsed.get("texts")
+                if isinstance(texts, dict):
+                    for card in result:
+                        text = texts.get(card["id"])
+                        if _acceptable(text, card):
+                            card["text"] = _with_courier(str(text).strip(), card)[:240]
+                            card["source"] = "groq-validated"
+                            status["accepted"] += 1
+                    if status["accepted"]:
+                        status["source"] = "groq-validated"
+            except IntelligenceUnavailable as error:
+                status["reason"] = str(error)
+    for card in result:
+        card.pop("_name", None)
+    return result, status
+
+
+def _with_courier(text: str, card: dict[str, Any]) -> str:
+    """Pone el nombre del repartidor en el texto, o al inicio si el modelo no dejó el marcador."""
+    name = card.get("_name")
+    if name is None:
+        return text
+    if _PLACEHOLDER in text:
+        return text.replace(_PLACEHOLDER, str(name))
+    return f"{name}: {text}"
+
+
+def _acceptable(text: object, card: dict[str, Any]) -> bool:
+    if not isinstance(text, str) or not text.strip() or len(text) > 240:
+        return False
+    # El marcador es opcional con repartidor (si falta, el nombre se antepone) y sobra sin él.
+    if text.count(_PLACEHOLDER) > (1 if "_name" in card else 0):
+        return False
+    if not verify_explanation(text.replace(_PLACEHOLDER, ""), _figure_values(card["figures"])):
+        record_incident("groq", "sugerencias:texto-no-verificado")
+        return False
+    return True
