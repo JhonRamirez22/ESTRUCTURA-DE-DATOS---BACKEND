@@ -220,3 +220,77 @@ class CrossRouteBalancer:
             if len(source.order) <= 1:
                 continue  # never leave a courier without stops
             for position in range(source.locked, len(source.order)):
+                node = source.order[position]
+                targets = {
+                    owner[neighbour]
+                    for neighbour, _ in grid.nearest(
+                        self._index.points[node],
+                        NEIGHBOUR_COUNT,
+                        max_metres=NEIGHBOUR_RADIUS_METRES,
+                        exclude=node,
+                    )
+                } - {source_id}
+                removal = source.removal_delta(matrix, position)
+                for target_id in sorted(targets):
+                    target = states[target_id]
+                    if len(target.order) >= cap:
+                        continue
+                    insert_at, extra = target.best_insertion(matrix, node)
+                    if not (math.isfinite(extra) and math.isfinite(removal)):
+                        continue
+                    after = dict(costs)
+                    after[source_id] = costs[source_id] - removal
+                    after[target_id] = costs[target_id] + extra
+                    gain = base - self._objective(after)
+                    if gain > 0:
+                        heap.insert(
+                            _Candidate(
+                                gain, (node, target_id), node, source_id, target_id,
+                                position, insert_at, removal, extra,
+                            )
+                        )
+        return heap.extract_min()
+
+
+@dataclass(slots=True)
+class LiveFleetReoptimizer:
+    """Builds a :class:`FleetProposal` for the routes currently in progress."""
+
+    fleet: Fleet
+    matrix: CostMatrix
+    pipeline: RoutePipeline = field(default_factory=RoutePipeline.standard)
+
+    def propose(self) -> FleetProposal:
+        index = self.fleet.index()
+        improver = RouteImprover(self.matrix, self.pipeline)
+        states: dict[str, _RouteState] = {}
+        for route in self.fleet.routes:
+            nodes = [index.stop_node[stop_id] for stop_id in route.stop_ids]
+            states[route.route_id] = _RouteState(
+                route.route_id, index.courier_node[route.route_id], nodes, route.locked_count
+            )
+        moves = CrossRouteBalancer(self.matrix, index).rebalance(states)
+        node_to_stop = {node: stop_id for stop_id, node in index.stop_node.items()}
+        proposals: list[RouteProposal] = []
+        for route in self.fleet.routes:
+            state = states[route.route_id]
+            current_nodes = [index.stop_node[stop_id] for stop_id in route.stop_ids]
+            current_minutes = self.matrix.path_cost([state.courier_node, *current_nodes])
+            moved = state.order != current_nodes and set(state.order) != set(current_nodes)
+            improved = improver.improve(state.courier_node, state.order, state.locked)
+            proposed_minutes = self.matrix.path_cost([state.courier_node, *improved])
+            if not moved and current_minutes - proposed_minutes < MIN_REORDER_GAIN_MINUTES:
+                improved, proposed_minutes = current_nodes, current_minutes
+            proposals.append(
+                RouteProposal(
+                    route.route_id,
+                    route.stop_ids,
+                    tuple(node_to_stop[node] for node in improved),
+                    current_minutes,
+                    proposed_minutes,
+                )
+            )
+        scoreboard = PlanScoreboard(self.fleet, self.matrix)
+        before = scoreboard.score(scoreboard.current_orders())
+        after = scoreboard.score({p.route_id: p.proposed_order for p in proposals})
+        return FleetProposal(tuple(proposals), tuple(moves), before, after)
