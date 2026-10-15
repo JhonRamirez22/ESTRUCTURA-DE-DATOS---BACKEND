@@ -198,3 +198,69 @@ class TrafficService:
                 "El punto de tráfico debe estar dentro de la zona de servicio de Pasto."
             )
 
+        key = build_traffic_cache_key(coordinate)
+        now = self._monotonic()
+        cached_node = self._cache_nodes.get(key)
+        if cached_node is not None and cached_node.value.fresh_until > now:
+            self._cache.move_to_front(cached_node)
+            _LOGGER.info("TomTom Traffic cache hit")
+            return replace(cached_node.value.data, cache_status="CACHE")
+        if cached_node is not None and cached_node.value.stale_until <= now:
+            self._remove_cache_node(key, cached_node)
+            cached_node = None
+
+        # TODO(MVP): coalescer consultas concurrentes iguales para evitar un thundering herd.
+        if self._rate_limited_until > now:
+            return self._use_stale_or_raise(
+                cached_node,
+                TrafficRateLimitError("TomTom Traffic está en pausa por HTTP 429.", 429),
+            )
+
+        try:
+            async with self._request_semaphore:
+                data = await self._fetch_flow_segment(latitude, longitude)
+        except TrafficServiceError as error:
+            if isinstance(error, TrafficRateLimitError):
+                self._rate_limited_until = self._monotonic() + TRAFFIC_RATE_LIMIT_COOLDOWN_SECONDS
+                _LOGGER.warning("TomTom Traffic rate limit; no se reintenta durante el cooldown")
+            else:
+                _LOGGER.warning(
+                    "TomTom Traffic request failed",
+                    extra={"error_type": type(error).__name__},
+                )
+            return self._use_stale_or_raise(cached_node, error)
+
+        self._store(key, data)
+        _LOGGER.info("TomTom Traffic cache miss")
+        if data.road_closure:
+            _LOGGER.warning("TomTom Traffic reportó una vía cerrada")
+        return data
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def _fetch_flow_segment(self, latitude: float, longitude: float) -> TrafficData:
+        try:
+            response = await self._client.get(
+                TOMTOM_TRAFFIC_ENDPOINT,
+                params={
+                    "key": self._api_key,
+                    "point": f"{latitude:.5f},{longitude:.5f}",
+                    "unit": "kmph",
+                },
+            )
+        except httpx.TimeoutException as error:
+            raise TrafficTimeoutError(
+                f"TomTom Traffic excedió el límite de {round(self._timeout_seconds * 1_000)} ms."
+            ) from error
+        except httpx.HTTPError as error:
+            raise TrafficProviderError("No se pudo conectar con TomTom Traffic.") from error
+
+        if response.status_code == 429:
+            raise TrafficRateLimitError("TomTom Traffic respondió HTTP 429.", 429)
+        if not response.is_success:
+            raise TrafficProviderError(
+                f"TomTom Traffic respondió HTTP {response.status_code}.", response.status_code
+            )
+        try:
