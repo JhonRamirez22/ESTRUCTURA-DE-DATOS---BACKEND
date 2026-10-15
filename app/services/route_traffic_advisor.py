@@ -182,3 +182,64 @@ class HttpRouteTrafficAdvisor:
             result: object = response.json()
             if self._protocol == "openai-chat":
                 content = self._read_chat_content(result)
+                if isinstance(content, dict):
+                    # El modelo utilizado proviene de la configuración, no del texto inventado.
+                    content["model"] = self._model
+                return content
+            return result
+        except (ValueError, TypeError) as error:
+            raise RouteTrafficAiError("La IA de tráfico devolvió JSON inválido.") from error
+
+    @staticmethod
+    def _read_chat_content(payload: object) -> object:
+        if not isinstance(payload, dict):
+            raise ValueError("Chat Completions devolvió una respuesta inválida.")
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise ValueError("Chat Completions no devolvió choices.")
+        message = choices[0].get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            raise ValueError("Chat Completions no devolvió contenido.")
+        content = message["content"].strip()
+        if content.startswith("```") and content.endswith("```"):
+            content = content.removeprefix("```").removesuffix("```").strip()
+            if content[:4].lower() == "json":
+                content = content[4:].strip()
+        return json.loads(content)
+
+
+def get_route_traffic_advisor() -> HttpRouteTrafficAdvisor | None:
+    settings = get_settings()
+    if not (settings.ai_allow_route_location_sharing or settings.ai_allow_location_data_sharing):
+        return None
+    api_url: str
+    api_key: str | None
+    model: str | None
+    if settings.ai_traffic_provider == "groq":
+        api_url = (settings.customer_chat_api_url or GROQ_CHAT_COMPLETIONS_URL).strip()
+        key = settings.customer_chat_api_key or settings.ai_traffic_api_key
+        api_key = key.get_secret_value().strip() if key is not None else None
+        model = (settings.customer_chat_model or DEFAULT_GROQ_TRAFFIC_MODEL).strip()
+    else:
+        api_url = (settings.ai_traffic_api_url or "").strip()
+        api_key = (
+            settings.ai_traffic_api_key.get_secret_value().strip()
+            if settings.ai_traffic_api_key is not None
+            else None
+        )
+        model = (settings.ai_traffic_model or "").strip() or None
+    if not api_url or not api_key or not model:
+        return None
+    try:
+        return HttpRouteTrafficAdvisor(
+            api_url=api_url,
+            api_key=api_key or None,
+            model=model,
+            timeout_ms=settings.ai_traffic_timeout_ms,
+        )
+    except ValueError as error:
+        _LOGGER.warning(
+            "La configuración de IA de tráfico no es válida; se usará el algoritmo determinista",
+            extra={"error_type": type(error).__name__},
+        )
+        return None
