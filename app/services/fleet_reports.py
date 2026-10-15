@@ -189,3 +189,66 @@ class FleetReportBuilder:
             .where(DeliveryPoint.created_at >= begin, DeliveryPoint.created_at < end)) or 0)
         rows = (await self._session.execute(
             select(DeliveryPoint, Courier.name)
+            .outerjoin(Route, DeliveryPoint.route_id == Route.id)
+            .outerjoin(Courier, Route.courier_id == Courier.id)
+            .where(DeliveryPoint.created_at >= begin, DeliveryPoint.created_at < end)
+            .order_by(DeliveryPoint.created_at.desc()).limit(MAX_ROWS)
+        )).all()
+        data = ReportData("Historial de envíos", [("Envíos del periodo", str(total))])
+        data.sections.append(Section(
+            "Envíos", ["Creado", "Pedido", "Estado", "Repartidor", "Entregado", "Programado"],
+            [[local(p.created_at), p.order_id, p.status.value, name or "—",
+              local(p.delivered_at), local(p.scheduled_for)] for p, name in rows],
+            [3, 3, 2, 3, 3, 3],
+            f"Se muestran {MAX_ROWS} de {total} envíos (los más recientes)."
+            if total > MAX_ROWS else None,
+        ))
+        return data
+
+    # ---- scheduled vs fulfilled ---------------------------------------------------------
+
+    async def scheduled(self, begin: datetime, end: datetime) -> ReportData:
+        points = (await self._session.scalars(
+            select(DeliveryPoint)
+            .where(DeliveryPoint.scheduled_for >= begin, DeliveryPoint.scheduled_for < end)
+            .order_by(DeliveryPoint.scheduled_for.asc())
+        )).all()
+        now = utc_now()
+        on_time = late = pending = 0
+        table: list[list[str]] = []
+        for p in points:
+            assert p.scheduled_for is not None
+            if p.delivered_at is not None:
+                gap = (p.delivered_at - p.scheduled_for).total_seconds() / 60
+                if p.delivered_at <= p.scheduled_for + ON_TIME_GRACE:
+                    on_time, outcome = on_time + 1, "A tiempo"
+                else:
+                    late, outcome = late + 1, "Tarde"
+                diff = f"{gap:+.0f}"
+            elif p.scheduled_for < now:
+                late, outcome, diff = late + 1, "Sin entregar", "—"
+            else:
+                pending, outcome, diff = pending + 1, "Pendiente", "—"
+            table.append([local(p.scheduled_for), p.order_id, p.status.value,
+                          local(p.delivered_at), diff, outcome])
+        data = ReportData(
+            "Programados frente a cumplidos",
+            [
+                ("Envíos programados", str(len(points))),
+                ("A tiempo (±15 min)", str(on_time)),
+                ("Tarde o sin entregar", str(late)),
+                ("Aún pendientes", str(pending)),
+                ("Cumplimiento", f"{100 * on_time / (on_time + late):.0f} %"
+                 if on_time + late else "—"),
+            ],
+        )
+        data.sections.append(Section(
+            "Detalle", ["Programado", "Pedido", "Estado", "Entregado", "Diferencia min",
+                        "Resultado"],
+            table[:MAX_ROWS], [3, 3, 2, 3, 2, 2],
+            f"Se muestran {MAX_ROWS} de {len(table)} envíos." if len(table) > MAX_ROWS else None,
+        ))
+        return data
+
+
+__all__ = ["FleetReportBuilder", "ReportKind", "BOGOTA"]
