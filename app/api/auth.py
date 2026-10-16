@@ -308,3 +308,80 @@ async def logout(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> JSONResponse:
     settings = get_settings()
+    secure = settings.node_env == "production"
+    cookie_header = request.headers.get("cookie")
+    requested = _requested_role(request)
+    # Sin rol explícito se cierran todas las sesiones de este navegador.
+    roles: tuple[SessionRole, ...] = (requested,) if requested else ("dispatcher", "courier")
+    for role in roles:
+        claims = await _resolve_session(request, session, role=role)
+        await revoke_access_session(session, read_session_token(cookie_header, role))
+        bearer = read_bearer_token(request.headers.get("authorization"))
+        if bearer:
+            await revoke_access_session(session, bearer)
+        if claims and claims.get("accountId"):
+            _audit(session, request, "logout", UUID(claims["accountId"]))
+    await session.commit()
+    response = JSONResponse(
+        content={"ok": True},
+        headers={"Cache-Control": "no-store, private"},
+    )
+    for role in roles:
+        response.headers.append(
+            "Set-Cookie", cleared_session_cookie(session_cookie_name(role), secure)
+        )
+    if requested is None:
+        response.headers.append(
+            "Set-Cookie", cleared_session_cookie(LEGACY_SESSION_COOKIE_NAME, secure)
+        )
+    return response
+
+
+async def get_optional_session(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> SessionClaims | None:
+    """Dependencia de FastAPI: la sesión según `X-Session-Role` o la primera válida."""
+    return await _resolve_session(request, session)
+
+
+async def _resolve_session(
+    request: Request,
+    session: AsyncSession,
+    role: SessionRole | None = None,
+) -> SessionClaims | None:
+    """Revalida cuenta y sesión en cada petición; las cookies firmadas antiguas no autorizan.
+
+    Con `role` solo se consulta la cookie de ese rol. Sin él se usa el rol indicado en
+    `X-Session-Role` y, si no llega, la primera sesión válida (despacho, luego repartidor).
+    """
+    settings = get_settings()
+    secret = _configured_secret(settings)
+    if secret is None:
+        return None
+    if role is not None:
+        roles: tuple[SessionRole, ...] = (role,)
+    elif (requested := _requested_role(request)) is not None:
+        roles = (requested,)
+    else:
+        roles = ("dispatcher", "courier")
+    cookie_header = request.headers.get("cookie")
+    bearer = read_bearer_token(request.headers.get("authorization"))
+    for candidate in roles:
+        # El token Bearer tiene prioridad; la cookie HttpOnly queda como respaldo.
+        token: str | None = bearer
+        identity = await resolve_access_session(session, token) if token else None
+        from_bearer = identity is not None and identity.role in roles
+        if not from_bearer:
+            token = read_session_token(cookie_header, candidate)
+            identity = await resolve_access_session(session, token) if token else None
+        if token is None:
+            continue
+        await session.commit()
+        if identity is None:
+            continue
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            _validate_origin(request, required=True)
+            # Con Bearer no hay credencial ambiente: el CSRF solo protege a la cookie.
+            if not from_bearer and not csrf_matches(
+                token, request.headers.get("X-CSRF-Token"), secret
