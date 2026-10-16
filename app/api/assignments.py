@@ -314,3 +314,82 @@ def _improvement_view(joint: JointAssignmentResult) -> dict[str, object]:
                 "fromCourierId": move.from_courier,
                 "toCourierId": move.to_courier,
                 "swappedDeliveryPointId": move.swapped_order_id,
+                "gainMinutes": round(move.gain, 1),
+            }
+            for move in joint.moves[:10]
+        ],
+    }
+
+
+@router.post("/aplicar", status_code=201)
+async def apply_assignments(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    session_factory: Annotated[
+        async_sessionmaker[AsyncSession], Depends(get_session_factory)
+    ],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    providers: Annotated[
+        tuple[CachedMatrixProvider, CachedRouteProvider],
+        Depends(get_routing_providers),
+    ],
+    advisor: Annotated[
+        HttpRouteTrafficAdvisor | None,
+        Depends(get_route_traffic_advisor),
+    ],
+    traffic: Annotated[TrafficService | None, Depends(get_traffic_service)],
+) -> JSONResponse:
+    if claims is None:
+        return _error("Debes iniciar sesión para continuar.", 401)
+    if claims["role"] != "dispatcher":
+        return _error("Se requiere una sesión de despacho.", 403)
+    body = await _read_object(request)
+    if isinstance(body, JSONResponse):
+        return body
+    try:
+        parsed = ApplyAssignmentsRequest.model_validate(body)
+    except ValidationError as error:
+        return _validation_error(error)
+
+    matrix_provider, route_provider = providers
+    plans: list[OptimizedRoutePlan]
+    try:
+        # La base de datos se lee en orden (una sesión no admite uso concurrente); lo lento son
+        # las consultas a proveedores externos, que sí se hacen a la vez, con tope.
+        loaded = [
+            await load_plan_inputs(session, a.courier_id, a.delivery_point_ids)
+            for a in parsed.assignments
+        ]
+        gate = asyncio.Semaphore(MAX_CONCURRENT_PLANS)
+
+        async def plan_for(index: int) -> OptimizedRoutePlan:
+            assignment = parsed.assignments[index]
+            async with gate:
+                return await build_optimized_route_plan(
+                    session,
+                    assignment.courier_id,
+                    assignment.delivery_point_ids,
+                    inputs=loaded[index],
+                    matrix_provider=cast(MatrixProvider, matrix_provider),
+                    route_provider=cast(RouteProvider, route_provider),
+                    traffic_ai_advisor=advisor,
+                    traffic_provider=traffic,
+                )
+
+        outcomes = await asyncio.gather(
+            *(plan_for(i) for i in range(len(parsed.assignments))), return_exceptions=True
+        )
+        # El primer error en el orden de la solicitud es el que se informa, como antes.
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+        plans = [outcome for outcome in outcomes if not isinstance(outcome, BaseException)]
+        results = await create_optimized_routes_batch(
+            session, plans, EventActor.from_claims(claims)
+        )
+        queued_by_channel = {
+            channel: sum(
+                count
+                for result in results
+                for queued_channel, count in result.customer_notifications_queued_by_channel
