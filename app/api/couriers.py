@@ -338,3 +338,88 @@ async def renew_courier_access_code(
         credential = await repository.get_credential(parsed_id)
         if credential is None:
             repository.add_credential(
+                CourierCredential(courier_id=parsed_id, access_code_hash=access_code_hash)
+            )
+        else:
+            credential.access_code_hash = access_code_hash
+            credential.updated_at = datetime.now(UTC).replace(tzinfo=None)
+        await session.commit()
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_db_error("No se pudo renovar el código del repartidor", error)
+        return _error("No se pudo procesar el repartidor.", 500)
+    return _json({"accessCode": access_code}, headers=_NO_STORE_PRIVATE)
+
+
+@router.post("/{courier_id}/ubicacion", status_code=201)
+async def post_courier_location(
+    courier_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    claims: Annotated[SessionClaims, Depends(require_courier_session)],
+    session_factory: Annotated[
+        async_sessionmaker[AsyncSession], Depends(get_write_session_factory)
+    ],
+    queue: Annotated[LocationQueue, Depends(get_location_event_queue)],
+) -> JSONResponse:
+    parsed_id = _parse_uuid(courier_id)
+    if str(parsed_id) != claims.get("courierId"):
+        return _error("No puedes actualizar la ubicación de otro repartidor.", 403)
+    return await _post_location(request, parsed_id, session_factory, queue, background_tasks)
+
+
+async def _post_location(
+    request: Request,
+    courier_id: UUID,
+    session_factory: async_sessionmaker[AsyncSession],
+    queue: LocationQueue,
+    background_tasks: BackgroundTasks,
+) -> JSONResponse:
+    body = await _read_json_object(request)
+    if isinstance(body, JSONResponse):
+        return body
+    try:
+        location = CourierLocationInput.model_validate(body)
+    except ValidationError as error:
+        if any(item["loc"] == ("recorded_at",) for item in error.errors()):
+            return _error("recordedAt debe ser una fecha ISO válida.", 400)
+        return _error("lat debe estar entre -90 y 90 y lng entre -180 y 180.", 400)
+
+    if not math.isfinite(location.lat) or not math.isfinite(location.lng):
+        return _error("lat debe estar entre -90 y 90 y lng entre -180 y 180.", 400)
+    if not is_within_pasto_service_area(location.lat, location.lng):
+        return _error("La ubicación debe estar dentro de la zona de servicio de Pasto.", 400)
+    recorded_at = _parse_recorded_at(location.recorded_at)
+    if isinstance(recorded_at, JSONResponse):
+        return recorded_at
+
+    try:
+        result = await queue.enqueue(
+            lambda: _write_location(
+                session_factory, courier_id, location.lat, location.lng, recorded_at
+            ),
+            key=str(courier_id),
+        )
+    except LocationQueueFullError as error:
+        return JSONResponse(
+            content={"error": str(error), "retryAfterSeconds": 1},
+            status_code=503,
+            headers={"Retry-After": "1", **_NO_STORE_PRIVATE},
+        )
+    except CourierNotFoundError:
+        return _error("El repartidor no existe.", 404)
+    except SQLAlchemyError as error:
+        _log_db_error("No se pudo registrar la ubicación", error)
+        return _error("No se pudo registrar la ubicación.", 500)
+
+    if result["accepted"] and any_customer_notification_delivery_configured():
+        background_tasks.add_task(
+            dispatch_pending_customer_notifications_background,
+            session_factory,
+        )
+
+    payload = LocationEventResponse(
+        location_event=LocationEventView.model_validate(result["event"]),
+        accepted=result["accepted"],
+    )
+    return _json(
