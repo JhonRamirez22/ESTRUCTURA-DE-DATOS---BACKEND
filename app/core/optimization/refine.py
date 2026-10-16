@@ -190,3 +190,66 @@ def _or_opt_pass(cost: list[list[float]], route: list[int]) -> bool:
 
 
 def _double_bridge(route: list[int], rng: random.Random) -> list[int]:
+    """A B C D → A C B D: reordena tramos sin invertirlos, adecuado para matrices dirigidas."""
+    size = len(route)
+    cuts = sorted(rng.sample(range(1, size), 3))
+    first, second, third = cuts
+    return route[:first] + route[second:third] + route[first:second] + route[third:]
+
+
+def iterated_local_search(
+    matrix: CostMatrix, route: Sequence[int], *, kicks: int, seed: int | None = None
+) -> list[int]:
+    """Búsqueda local iterada: perturba con double-bridge y conserva solo mejoras."""
+    _validate_matrix(matrix)
+    cost = _finite(matrix)
+    best = _descend(cost, list(route))
+    if len(best) < 8 or kicks <= 0:
+        return best
+    best_cost = _total(cost, best)
+    rng = random.Random(seed if seed is not None else len(best) * 7919 + int(best_cost * 100))
+    for _ in range(kicks):
+        candidate = _descend(cost, _double_bridge(best, rng))
+        candidate_cost = _total(cost, candidate)
+        if candidate_cost < best_cost - _EPSILON:
+            best, best_cost = candidate, candidate_cost
+    return best
+
+
+def _total(cost: list[list[float]], route: Sequence[int]) -> float:
+    return sum(cost[a][b] for a, b in zip(route, route[1:], strict=False))
+
+
+def _kicks_for(size: int) -> int:
+    """Menos reinicios cuanto más grande es la ruta, para acotar el tiempo (≈0,3 s a 50 paradas)."""
+    if size <= 20:
+        return 80
+    if size <= 35:
+        return 50
+    return 30
+
+
+def refine_route(matrix: CostMatrix, route: Sequence[int]) -> RefineResult:
+    """Mejor orden conocido: óptimo exacto si cabe, búsqueda local iterada si no.
+
+    Nunca devuelve una ruta peor que la recibida ni cambia el origen.
+    """
+    _validate_matrix(matrix)
+    current = list(route)
+    current_cost = route_cost(matrix, current)
+    if len(current) < 3:
+        return RefineResult(current, current_cost, "none", proven_optimal=len(current) < 3)
+    origin = current[0]
+    if len(matrix) == len(current) and len(current) <= MAX_EXACT_NODES:
+        exact = held_karp_path(matrix, origin)
+        if exact is not None:
+            exact_cost = route_cost(matrix, exact)
+            if exact_cost <= current_cost:
+                return RefineResult(exact, exact_cost, "exact", proven_optimal=True)
+            return RefineResult(current, current_cost, "exact", proven_optimal=True)
+    bound = spanning_tree_lower_bound(matrix)
+    improved = iterated_local_search(matrix, current, kicks=_kicks_for(len(current)))
+    improved_cost = route_cost(matrix, improved)
+    if improved_cost < current_cost and improved[0] == origin:
+        return RefineResult(improved, improved_cost, "ils", proven_optimal=False, lower_bound=bound)
+    return RefineResult(current, current_cost, "ils", proven_optimal=False, lower_bound=bound)
