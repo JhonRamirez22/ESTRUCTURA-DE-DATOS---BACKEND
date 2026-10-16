@@ -280,3 +280,73 @@ async def get_tracking(
         "courier": {
             "currentLat": shared_position[0] if shared_position is not None else None,
             "currentLng": shared_position[1] if shared_position is not None else None,
+            "lastLocationAt": courier.last_location_at if may_show_courier else None,
+        },
+        "geometry": geometry,
+        "geometryProvider": geometry_provider,
+        "estimatedMinutesFromNow": (
+            target_eta.estimated_minutes_from_now
+            if may_show_courier and target_eta is not None
+            else (
+                first_leg_traffic.duration_minutes
+                if may_show_courier and is_next_stop and first_leg_traffic is not None
+                else road_duration_minutes
+                if may_show_courier and is_next_stop
+                else None
+            )
+        ),
+        "distanceFromCourierMeters": road_distance_meters,
+        "estimateNote": (
+            "El mapa muestra solo el trayecto por calles hacia este pedido. El ETA respeta "
+            "el orden de entregas. TomTom, cuando hay señal confiable, solo ajusta "
+            "parcialmente el primer tramo; no representa tráfico completo de la ruta."
+        ),
+    }
+    if first_leg_traffic is not None:
+        response_route["liveTraffic"] = {
+            "source": "TOMTOM" if first_leg_traffic.applied else "ROAD_BASELINE",
+            "configured": first_leg_traffic.configured,
+            "applied": first_leg_traffic.applied,
+            "status": first_leg_traffic.status,
+            "scope": "FIRST_LEG_ONLY",
+            "warning": first_leg_traffic.warning,
+        }
+    if estimate_warning:
+        response_route["estimateWarning"] = estimate_warning
+    if navigation_warning:
+        response_route["navigationWarning"] = navigation_warning
+    return _json({"tracking": {**base_tracking, "route": response_route}})
+
+
+def _round_coordinate(value: float) -> float:
+    return float(f"{value:.4f}")
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        content={"error": message},
+        status_code=status_code,
+        headers=_NO_STORE,
+    )
+
+
+def _json(content: dict[str, object]) -> JSONResponse:
+    return JSONResponse(content=jsonable_encoder(content), headers=_NO_STORE)
+
+
+async def _tracking_retry_after(session: AsyncSession, guide: str) -> int | None:
+    """Límite compartido en PostgreSQL; sin AUTH_SECRET se usa el contador local."""
+    settings = get_settings()
+    secret = settings.auth_secret.get_secret_value() if settings.auth_secret is not None else ""
+    key = f"tracking:{guide}"
+    if not secret:
+        return _TRACKING_LIMITER.retry_after(key)
+    try:
+        return await _TRACKING_LIMITER.retry_after_shared(session, key, hmac_secret=secret)
+    except (SQLAlchemyError, ValueError, RuntimeError) as error:
+        await session.rollback()
+        _LOGGER.warning(
+            "No se pudo aplicar el límite compartido del seguimiento",
+            extra={"error_type": type(error).__name__},
+        )
+        return None
