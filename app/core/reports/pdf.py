@@ -190,3 +190,67 @@ class PdfReport:
             )
             objects.append(
                 b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content
+                + b"\nendstream"
+            )
+        info = f"<< /Title ({_escape(self._title)}) /Producer (Rutas Pasto) >>".encode()
+        objects.append(info)
+
+        out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        offsets: list[int] = []
+        for number, body in enumerate(objects, start=1):
+            offsets.append(len(out))
+            out += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
+        xref = len(out)
+        out += f"xref\n0 {len(objects) + 1}\n".encode() + b"0000000000 65535 f \n"
+        for offset in offsets:
+            out += f"{offset:010d} 00000 n \n".encode()
+        out += (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R /Info {len(objects)} 0 R >>\n"
+            f"startxref\n{xref}\n%%EOF\n"
+        ).encode()
+        return bytes(out)
+
+    # ---- internos --------------------------------------------------------------------
+
+    def _new_page(self) -> None:
+        self._pages.append(_Page())
+        self._y = PAGE_HEIGHT - MARGIN
+
+    def _ensure(self, height: float) -> None:
+        if self._y - height < MARGIN + 24:
+            self._new_page()
+
+    def _table_header(self, headers: Sequence[str], widths: Sequence[float]) -> None:
+        self._ensure(30)
+        self._rect(MARGIN, self._y - 16, sum(widths), 16, 0.86)
+        x = MARGIN
+        for text, width in zip(headers, widths, strict=False):
+            self._text(x + 3, self._y - 11, wrap(text, width - 6, 8, bold=True)[0], 8, bold=True)
+            x += width
+        self._y -= 18
+
+    def _rule(self) -> None:
+        self._page.ops.append(
+            f"0.6 0.6 0.6 RG 0.5 w {MARGIN} {self._y - 4:.1f} m "
+            f"{PAGE_WIDTH - MARGIN} {self._y - 4:.1f} l S"
+        )
+        self._y -= 4
+
+    def _rect(self, x: float, y: float, w: float, h: float, gray: float) -> None:
+        self._page.ops.append(f"{gray} g {x:.1f} {y:.1f} {w:.1f} {h:.1f} re f 0 g")
+
+    def _text(
+        self, x: float, y: float, text: str, size: float, *, bold: bool = False, gray: float = 0.0
+    ) -> None:
+        self._page.ops.append(self._text_op(x, y, text, size, bold, gray))
+
+    @staticmethod
+    def _text_op(x: float, y: float, text: str, size: float, bold: bool, gray: float) -> str:
+        font = "F2" if bold else "F1"
+        return (
+            f"BT {gray} g /{font} {size:g} Tf {x:.1f} {y:.1f} Td ({_escape(_clean(text))}) Tj ET"
+        )
+
+    @property
+    def _page(self) -> _Page:
+        return self._pages[-1]
