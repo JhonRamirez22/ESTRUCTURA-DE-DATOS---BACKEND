@@ -330,3 +330,85 @@ async def update_delivery_point(
         if data.sms_notifications_enabled is not None:
             updates["sms_notifications_enabled"] = data.sms_notifications_enabled
 
+        updated_in_place = await repository.try_update_delivery_point(
+            point_id=parsed_id,
+            expected_status=point.status,
+            expected_route_id=point.route_id,
+            updates=updates,
+            courier_id=UUID(courier_id) if courier_id is not None else None,
+        )
+        if not updated_in_place:
+            await session.rollback()
+            return _error(
+                "El pedido o la ruta cambió mientras se procesaba; actualiza la pantalla "
+                "e inténtalo de nuevo.",
+                409,
+            )
+
+        # El UPDATE con RETURNING puede sincronizar los atributos ORM; compara con el estado
+        # original capturado antes para cancelar avisos pendientes al revocar consentimiento.
+        if customer_notification_consent_changed:
+            await cancel_pending_customer_notifications(session, parsed_id)
+
+        recorder = DeliveryEventRecorder(session)
+        actor = EventActor.from_claims(claims)
+        if data.status is not None and data.status != previous_status:
+            recorder.status_changed(
+                point, previous_status.value, data.status.value, actor,
+                courier_id=UUID(courier_id) if courier_id is not None else None,
+            )
+        if "scheduled_for" in fields and data.scheduled_for != previous_schedule:
+            recorder.rescheduled(point, previous_schedule, data.scheduled_for, actor)
+
+        if (
+            previous_status != data.status
+            and data.status in {DeliveryPointStatus.DELIVERED, DeliveryPointStatus.FAILED}
+        ):
+            NotificationRepository(session).add(
+                Notification(
+                    id=uuid4(),
+                    kind=NotificationKind.DELIVERY_STATUS_CHANGED,
+                    recipient_id="dispatcher",
+                    title="Estado de entrega actualizado",
+                    message=f"El pedido {point.order_id} quedó en estado {data.status.value}.",
+                )
+            )
+        await session.commit()
+        updated = await repository.get_delivery_point(parsed_id, include_route=True)
+        if updated is None:
+            return _error("El pedido no existe.", 404)
+
+        content: dict[str, object] = {
+            "deliveryPoint": _point_json(
+                updated,
+                include_route=is_dispatcher,
+                include_tracking=is_dispatcher,
+            )
+        }
+        if normalization is not None:
+            content["addressNormalization"] = normalization.as_dict()
+        return _json(content, headers=_NO_STORE)
+    except IntegrityError as error:
+        await session.rollback()
+        if _is_duplicate_order(error):
+            return _error("Ya existe un pedido con esa guía.", 409)
+        _log_database_error("No se pudo actualizar el pedido", error)
+        return _error("No se pudo procesar el pedido.", 500)
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_database_error("No se pudo actualizar el pedido", error)
+        return _error("No se pudo procesar el pedido.", 500)
+
+
+@router.delete("/{delivery_point_id}", status_code=204)
+async def delete_delivery_point(
+    delivery_point_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> Response:
+    access_error = _dispatcher_access_error(claims)
+    if access_error is not None:
+        return access_error
+    parsed_id = _parse_uuid(delivery_point_id)
+    if parsed_id is None:
+        return _error("El pedido no existe.", 404)
