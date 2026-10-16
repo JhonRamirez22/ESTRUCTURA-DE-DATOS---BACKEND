@@ -199,3 +199,70 @@ def _read_number(value: object, name: str) -> float:
 def _read_matrix(value: object, name: str) -> list[list[float | None]]:
     if not isinstance(value, list) or any(not isinstance(row, list) for row in value):
         raise OsrmClientError(f"OSRM response has no valid {name} matrix")
+
+    result: list[list[float | None]] = []
+    for row in value:
+        values: list[float | None] = []
+        for cell in row:
+            if cell is None:
+                values.append(None)
+            elif (
+                isinstance(cell, bool)
+                or not isinstance(cell, (int, float))
+                or not math.isfinite(cell)
+                or cell < 0
+            ):
+                raise OsrmClientError(f"OSRM response contains an invalid {name} value")
+            else:
+                values.append(float(cell))
+        result.append(values)
+    return result
+
+
+def _validate_matrix_dimensions(matrix: Sequence[Sequence[object]], size: int, name: str) -> None:
+    if len(matrix) != size or any(len(row) != size for row in matrix):
+        raise OsrmClientError(f"OSRM response has an incomplete {name} matrix")
+
+
+def _read_coordinate(value: object, error_message: str) -> Coordinate:
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or any(
+            isinstance(part, bool) or not isinstance(part, (int, float)) or not math.isfinite(part)
+            for part in value
+        )
+    ):
+        raise OsrmClientError(error_message)
+    longitude, latitude = float(value[0]), float(value[1])
+    if not -180 <= longitude <= 180 or not -90 <= latitude <= 90:
+        raise OsrmClientError(error_message)
+    return longitude, latitude
+
+
+def _read_geometry(value: object) -> GeoJsonLineString:
+    candidate = _read_object(value, "OSRM route response has no geometry")
+    raw_coordinates = candidate.get("coordinates")
+    if candidate.get("type") != "LineString" or not isinstance(raw_coordinates, list):
+        raise OsrmClientError("OSRM route response has invalid geometry")
+    if len(raw_coordinates) < 2:
+        raise OsrmClientError("OSRM route response has invalid geometry")
+    coordinates = [
+        _read_coordinate(item, "OSRM route response has invalid geometry")
+        for item in raw_coordinates
+    ]
+    return {"type": "LineString", "coordinates": coordinates}
+
+
+def _read_waypoints(value: object, expected_count: int) -> list[tuple[Coordinate, float]]:
+    if not isinstance(value, list) or len(value) != expected_count:
+        raise OsrmClientError("OSRM route response has incomplete snapped waypoints")
+
+    waypoints: list[tuple[Coordinate, float]] = []
+    for index, waypoint in enumerate(value):
+        try:
+            candidate = _read_object(
+                waypoint,
+                f"OSRM returned an invalid waypoint at index {index}",
+            )
+            location = _read_coordinate(candidate.get("location"), "invalid snapped location")
