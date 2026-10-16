@@ -270,3 +270,71 @@ async def reject_order_request(
         return _error("La solicitud ya fue resuelta o no existe.", 409)
     return JSONResponse({"ok": True}, headers=_NO_STORE)
 
+
+NEARBY_STOP_RADIUS_M = 150.0
+
+
+def should_cache_lookup(result: dict[str, object]) -> bool:
+    """Solo se recuerdan búsquedas con candidatos: un vacío puede ser un fallo pasajero."""
+    return bool(result.get("candidates"))
+
+
+async def _nearby_stop_notice(
+    repository: DeliveryPointRepository, lat: float, lng: float
+) -> dict[str, object] | None:
+    """Aviso discreto si la dirección queda cerca de una parada ya programada."""
+    lat_delta = NEARBY_STOP_RADIUS_M / 111_000
+    lng_delta = NEARBY_STOP_RADIUS_M / (111_000 * max(0.2, math.cos(math.radians(lat))))
+    try:
+        points = await repository.active_points_near(lat, lng, lat_delta, lng_delta)
+    except SQLAlchemyError as error:
+        # El aviso es opcional: si la consulta falla, la solicitud se registra sin él.
+        _LOGGER.warning(
+            "No se pudo buscar paradas cercanas", extra={"error_type": type(error).__name__}
+        )
+        return None
+    best: tuple[DeliveryPoint, float] | None = None
+    for point in points:
+        distance = haversine_m(lat, lng, point.lat, point.lng)
+        if distance < NEARBY_STOP_RADIUS_M and (best is None or distance < best[1]):
+            best = (point, distance)
+    if best is None:
+        return None
+    point, distance = best
+    return {
+        "distanceMeters": round(distance),
+        "status": point.status.value,
+        "message": (
+            "Hay una parada programada a menos de 150 m; "
+            "el despacho puede sumar esta entrega a esa ruta."
+        ),
+    }
+
+
+_INBOX_LOCK_KEY = 727_001
+
+
+async def _lock_inbox(session: AsyncSession) -> None:
+    """Serializa contar e insertar: sin esto, peticiones paralelas superaban el tope.
+
+    El bloqueo consultivo vive hasta el commit o rollback de esta transacción. Solo existe en
+    PostgreSQL; las pruebas con SQLite no tienen concurrencia real que proteger.
+    """
+    if session.get_bind().dialect.name == "postgresql":
+        await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _INBOX_LOCK_KEY})
+
+
+def _client_key(request: Request) -> str:
+    """Cliente según la infraestructura, no según lo que declara (ver client_identity)."""
+    return client_key(request)
+
+
+def _parse_uuid(value: str) -> UUID | None:
+    try:
+        return UUID(value)
+    except ValueError:
+        return None
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse({"error": message}, status_code=status_code, headers=_NO_STORE)
