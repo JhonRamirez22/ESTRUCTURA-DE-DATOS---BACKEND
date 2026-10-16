@@ -331,3 +331,86 @@ async def recalculate_route_endpoint(
         body["recalculated"] = True
         record_applied(parsed_id, body)
         route_payload = body.get("route")
+        if dispatcher and isinstance(route_payload, dict):
+            route_payload["canUndo"] = True
+        return _json(body, headers=_NO_STORE)
+    except RoutePlanningError as error:
+        return _error(str(error), error.status_code)
+    except IntegrityError as error:
+        await session.rollback()
+        _log_database_error("Conflicto al recalcular la ruta", error)
+        return _error("Un pedido cambió mientras se recalculaba la ruta.", 409)
+    except (RoutingClientError, TimeoutError) as error:
+        _LOGGER.warning(
+            "No se pudo obtener la ruta vial",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error(
+            "El proveedor vial no pudo calcular la matriz o el trazado. "
+            "La ruta no se guardó sin calles verificadas.",
+            502,
+        )
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_database_error("No se pudo recalcular la ruta", error)
+        return _error("No se pudo recalcular la ruta.", 500)
+
+
+# Propuestas en memoria por proceso: el repartidor consulta cada 5 s, pero TomTom y Groq
+# se invocan como máximo una vez por minuto y combinación de paradas y zona de GPS.
+_PROPOSAL_TTL_SECONDS = 60.0
+# Menos que esto no justifica molestar al repartidor con un cambio de orden.
+MIN_PROPOSAL_GAIN_MINUTES = 1.0
+_PROPOSAL_CACHE_LIMIT = 256
+_ProposalKey = tuple[UUID, tuple[UUID, ...], float, float]
+_PROPOSAL_CACHE: dict[_ProposalKey, tuple[float, dict[str, object]]] = {}
+
+
+@router.post("/{route_id}/propuesta")
+async def propose_route_endpoint(
+    route_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    providers: Annotated[
+        tuple[CachedMatrixProvider, CachedRouteProvider],
+        Depends(get_routing_providers),
+    ],
+    advisor: Annotated[RouteTrafficAdvisor | None, Depends(get_route_traffic_advisor)],
+    traffic: Annotated[TrafficService | None, Depends(get_traffic_service)],
+    order_advisor: Annotated[RouteOrderAdvisor | None, Depends(get_route_order_advisor)],
+) -> JSONResponse:
+    """Calcula el orden óptimo con tráfico e IA sin guardar nada; aplicarlo usa /recalcular."""
+    if claims is None:
+        return _error("Debes iniciar sesión para continuar.", 401)
+    dispatcher = claims["role"] == "dispatcher"
+    if not dispatcher and _claim_courier_id(claims) is None:
+        return _error("La sesión de repartidor no es válida.", 403)
+    parsed_id = _parse_uuid(route_id)
+    if parsed_id is None:
+        return _error("La ruta no existe.", 404)
+    try:
+        route = await RouteRepository(session).load_route(parsed_id)
+        if route is None or (not dispatcher and route.courier_id != _claim_courier_id(claims)):
+            return _error("La ruta no existe.", 404)
+        if route.status not in {RouteStatus.PLANNED, RouteStatus.IN_PROGRESS}:
+            return _error("Solo se pueden proponer rutas planificadas o en progreso.", 409)
+        current_ids = [
+            point.id
+            for point in sorted(route.delivery_points, key=lambda item: item.sequence_index or 0)
+            if point.status.value in {"PENDING", "EN_ROUTE"}
+        ]
+        if not current_ids:
+            return _error("La ruta no tiene puntos pendientes para optimizar.", 409)
+        courier = route.courier
+        if courier.current_lat is None or courier.current_lng is None:
+            return _error("Falta la ubicación del repartidor para proponer una ruta.", 409)
+        now = time.monotonic()
+        cache_key = (
+            parsed_id, tuple(current_ids),
+            round(courier.current_lat, 3), round(courier.current_lng, 3),
+        )
+        cached = _PROPOSAL_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < _PROPOSAL_TTL_SECONDS:
+            record_proposal(parsed_id, cached[1], cached=True)
+            return _json({**cached[1], "cached": True}, headers=_NO_STORE)
+        matrix_provider, route_provider = providers
