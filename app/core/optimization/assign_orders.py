@@ -206,3 +206,72 @@ def _build_adjustment_map(
         if key in result:
             raise ValueError(
                 "No puede haber más de un ajuste para "
+                f"{adjustment.courier_id}/{adjustment.order_id}"
+            )
+        result[key] = multiplier
+    return result
+
+
+def _assignment_cost(
+    courier_coordinates: Coordinates,
+    order_coordinates: Coordinates,
+) -> float:
+    """Usa distancia geodésica solo para pruebas/compatibilidad sin matriz vial."""
+    latitude_delta = math.radians(order_coordinates.lat - courier_coordinates.lat)
+    longitude_delta = math.radians(order_coordinates.lng - courier_coordinates.lng)
+    start_latitude = math.radians(courier_coordinates.lat)
+    end_latitude = math.radians(order_coordinates.lat)
+    haversine = (
+        math.sin(latitude_delta / 2) ** 2
+        + math.cos(start_latitude)
+        * math.cos(end_latitude)
+        * math.sin(longitude_delta / 2) ** 2
+    )
+    return 2 * EARTH_RADIUS_METERS * math.atan2(
+        math.sqrt(haversine), math.sqrt(1 - haversine)
+    )
+
+
+def _validate_travel_costs(
+    travel_costs: Mapping[tuple[str, str], float | None],
+    couriers: Sequence[CourierPosition],
+    orders: Sequence[OrderPoint],
+) -> dict[tuple[str, str], float | None]:
+    valid_pairs = {
+        (courier.courier_id, order.order_id)
+        for courier in couriers
+        for order in orders
+    }
+    result = dict(travel_costs)
+    for pair, cost in result.items():
+        if pair not in valid_pairs:
+            raise ValueError("travel_costs_minutes contiene un par de courier/pedido desconocido")
+        if cost is not None and (not math.isfinite(cost) or cost < 0):
+            raise ValueError("travel_costs_minutes debe contener minutos no negativos o None")
+    return result
+
+
+def _validate_unique_ids(
+    couriers: Sequence[CourierPosition],
+    orders: Sequence[OrderPoint],
+) -> None:
+    if len({courier.courier_id for courier in couriers}) != len(couriers):
+        raise ValueError("Los courier_id deben ser únicos")
+    if len({order.order_id for order in orders}) != len(orders):
+        raise ValueError("Los order_id deben ser únicos")
+
+
+def _validate_coordinates(
+    couriers: Sequence[CourierPosition],
+    orders: Sequence[OrderPoint],
+) -> None:
+    for coordinates in [courier.coordinates for courier in couriers] + [
+        order.coordinates for order in orders
+    ]:
+        if (
+            not math.isfinite(coordinates.lat)
+            or not math.isfinite(coordinates.lng)
+            or not -90 <= coordinates.lat <= 90
+            or not -180 <= coordinates.lng <= 180
+        ):
+            raise ValueError("Las coordenadas deben ser lat/lng finitas dentro del rango global")
