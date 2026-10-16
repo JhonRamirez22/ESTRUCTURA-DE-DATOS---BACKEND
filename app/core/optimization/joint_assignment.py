@@ -195,3 +195,68 @@ def _best_move(
     sets = {c: frozenset(order_index[o] for o in orders) for c, orders in current.items()}
     route = {c: evaluator.route_minutes(courier_index[c], sets[c]) for c in current}
 
+    def objective(changed: dict[str, float]) -> float:
+        merged = {**route, **changed}
+        return sum(merged.values()) + weight * max(merged.values())
+
+    for source, orders in current.items():
+        for order in orders:
+            o = order_index[order]
+            for target in current:
+                if target == source or len(current[target]) >= load_cap:
+                    continue
+                if len(current[source]) <= 1:
+                    continue  # quien tiene pedidos sigue trabajando: no se deja a nadie sin ruta
+                if evaluator.evaluations >= MAX_EVALUATIONS:
+                    return heap.extract_min()
+                new_source = evaluator.route_minutes(courier_index[source], sets[source] - {o})
+                new_target = evaluator.route_minutes(courier_index[target], sets[target] | {o})
+                if not math.isfinite(new_target) or not math.isfinite(new_source):
+                    continue
+                gain = base_objective - objective({source: new_source, target: new_target})
+                if gain > MIN_GAIN_MINUTES:
+                    heap.insert(_Candidate(
+                        gain, ("relocate", order, target),
+                        Move("relocate", order, source, target, None, gain),
+                    ))
+            # Intercambios solo con los pedidos más cercanos: pares lejanos casi nunca ayudan.
+            for target, target_orders in current.items():
+                if target == source:
+                    continue
+                for other in _nearest(matrix, o, target_orders, order_index):
+                    if evaluator.evaluations >= MAX_EVALUATIONS:
+                        return heap.extract_min()
+                    p = order_index[other]
+                    new_source = evaluator.route_minutes(
+                        courier_index[source], (sets[source] - {o}) | {p}
+                    )
+                    new_target = evaluator.route_minutes(
+                        courier_index[target], (sets[target] - {p}) | {o}
+                    )
+                    if not math.isfinite(new_target) or not math.isfinite(new_source):
+                        continue
+                    gain = base_objective - objective({source: new_source, target: new_target})
+                    if gain > MIN_GAIN_MINUTES:
+                        heap.insert(_Candidate(
+                            gain, ("swap", order, other),
+                            Move("swap", order, source, target, other, gain),
+                        ))
+    return heap.extract_min()
+
+
+def _nearest(
+    matrix: Matrix, order: int, pool: Sequence[str], order_index: Mapping[str, int]
+) -> list[str]:
+    def distance(other: str) -> float:
+        cost = matrix[order][order_index[other]]
+        return math.inf if cost is None else cost
+
+    return sorted(pool, key=distance)[:NEIGHBOURS_FOR_SWAPS]
+
+
+def _apply(assignments: dict[str, list[str]], move: Move) -> None:
+    assignments[move.from_courier].remove(move.order_id)
+    assignments[move.to_courier].append(move.order_id)
+    if move.swapped_order_id is not None:
+        assignments[move.to_courier].remove(move.swapped_order_id)
+        assignments[move.from_courier].append(move.swapped_order_id)
