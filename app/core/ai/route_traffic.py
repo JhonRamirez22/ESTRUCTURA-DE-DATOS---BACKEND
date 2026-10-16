@@ -214,3 +214,75 @@ def parse_route_traffic_response(payload: object) -> RouteTrafficAdvice:
         seen_pairs.add(pair)
         multiplier = _read_finite_number(value, "trafficMultiplier", index)
         if not MIN_TRAFFIC_MULTIPLIER <= multiplier <= MAX_TRAFFIC_MULTIPLIER:
+            raise ValueError(
+                f"El factor de IA para {from_id}/{to_id} debe estar entre "
+                f"{MIN_TRAFFIC_MULTIPLIER} y {MAX_TRAFFIC_MULTIPLIER}."
+            )
+        confidence_value = value.get("confidence")
+        confidence: float | None = None
+        if confidence_value is not None:
+            confidence = _read_finite_number(value, "confidence", index)
+            if not 0 <= confidence <= 1:
+                raise ValueError(
+                    f"La confianza de IA en la posición {index} debe estar entre 0 y 1."
+                )
+        reason_value = value.get("reason")
+        adjustments.append(
+            RouteTrafficAdjustment(
+                from_stop_id=from_id,
+                to_stop_id=to_id,
+                traffic_multiplier=multiplier,
+                confidence=confidence,
+                reason=reason_value if isinstance(reason_value, str) else None,
+            )
+        )
+    model = payload.get("model")
+    return RouteTrafficAdvice(tuple(adjustments), model if isinstance(model, str) else None)
+
+
+def filter_route_traffic_adjustments(
+    candidates: Sequence[RouteTrafficCandidate],
+    adjustments: Sequence[RouteTrafficAdjustment],
+) -> tuple[list[RouteTrafficAdjustment], int]:
+    allowed = {(candidate.from_stop_id, candidate.to_stop_id) for candidate in candidates}
+    supported = [
+        adjustment
+        for adjustment in adjustments
+        if (adjustment.from_stop_id, adjustment.to_stop_id) in allowed
+    ]
+    return supported, len(adjustments) - len(supported)
+
+
+def apply_route_traffic_adjustments(
+    matrix: Sequence[Sequence[float | None]],
+    stop_ids: Sequence[str],
+    adjustments: Sequence[RouteTrafficAdjustment],
+) -> list[list[float | None]]:
+    index_by_stop = {stop_id: index for index, stop_id in enumerate(stop_ids)}
+    adjusted = [list(row) for row in matrix]
+    for adjustment in adjustments:
+        from_index = index_by_stop.get(adjustment.from_stop_id)
+        to_index = index_by_stop.get(adjustment.to_stop_id)
+        if from_index is None or to_index is None:
+            continue
+        current_duration = adjusted[from_index][to_index]
+        if current_duration is not None:
+            adjusted[from_index][to_index] = current_duration * adjustment.traffic_multiplier
+    return adjusted
+
+
+def _read_nonempty_string(value: dict[str, object], field: str, index: int) -> str:
+    candidate = value.get(field)
+    if not isinstance(candidate, str) or not candidate.strip():
+        raise ValueError(f"El campo {field} del ajuste de IA {index} debe ser un string.")
+    return candidate
+
+
+def _read_finite_number(value: dict[str, object], field: str, index: int) -> float:
+    candidate = value.get(field)
+    if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+        raise ValueError(f"El campo {field} del ajuste de IA {index} debe ser numérico.")
+    result = float(candidate)
+    if not math.isfinite(result):
+        raise ValueError(f"El campo {field} del ajuste de IA {index} debe ser finito.")
+    return result
