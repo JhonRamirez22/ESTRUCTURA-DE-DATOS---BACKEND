@@ -343,3 +343,89 @@ async def dispatch_pending_customer_notifications(
     active_settings = settings or get_settings()
     configured_channels = customer_notification_channels_configured(active_settings)
     enabled_channels = tuple(channel for channel, enabled in configured_channels.items() if enabled)
+    if not enabled_channels:
+        return DispatchSummary(
+            configured=False,
+            warning="Avisos en cola: configura SMTP y/o las credenciales SMS de Twilio.",
+        )
+
+    active_email_sender = sender or SmtpEmailSender(active_settings)
+    active_sms_sender = sms_sender or TwilioSmsSender(active_settings)
+    current_time = _as_naive_utc(now or datetime.now(UTC))
+    claimed = await _claim_pending_notifications(
+        session_factory,
+        current_time,
+        active_settings,
+        enabled_channels,
+    )
+    sent = 0
+    attempted = 0
+    deferred = 0
+
+    for notification_id, channel, email, phone, subject, text_body in claimed:
+        if not await _has_current_delivery_consent(session_factory, notification_id):
+            continue
+        attempted += 1
+        try:
+            if channel is CustomerNotificationChannel.EMAIL:
+                await asyncio.to_thread(
+                    active_email_sender.send,
+                    CustomerEmail(email or "", subject, text_body),
+                )
+            else:
+                await asyncio.to_thread(
+                    active_sms_sender.send,
+                    CustomerSms(phone or "", text_body),
+                )
+        except Exception as error:
+            await _record_delivery_failure(
+                session_factory,
+                notification_id,
+                current_time,
+                type(error).__name__,
+            )
+            deferred += 1
+        else:
+            if await _record_delivery_success(session_factory, notification_id, current_time):
+                sent += 1
+
+    return DispatchSummary(
+        configured=True,
+        attempted=attempted,
+        sent=sent,
+        deferred=deferred,
+    )
+
+
+async def dispatch_pending_customer_notifications_background(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Punto de entrada para BackgroundTasks; no bloquea la respuesta HTTP."""
+    summary = await dispatch_pending_customer_notifications(session_factory)
+    if summary.deferred:
+        _LOGGER.warning(
+            "Se aplazó la entrega de avisos al cliente",
+            extra={"deferred_count": summary.deferred},
+        )
+
+
+def is_courier_near_delivery_point(
+    courier_latitude: float,
+    courier_longitude: float,
+    point_latitude: float,
+    point_longitude: float,
+) -> bool:
+    """Determina proximidad geodésica aproximada; no calcula calles ni tiempo de llegada."""
+    if not all(
+        math.isfinite(value)
+        for value in (courier_latitude, courier_longitude, point_latitude, point_longitude)
+    ):
+        return False
+    latitude_delta = math.radians(point_latitude - courier_latitude)
+    longitude_delta = math.radians(point_longitude - courier_longitude)
+    start_latitude = math.radians(courier_latitude)
+    end_latitude = math.radians(point_latitude)
+    haversine = (
+        math.sin(latitude_delta / 2) ** 2
+        + math.cos(start_latitude) * math.cos(end_latitude) * math.sin(longitude_delta / 2) ** 2
+    )
