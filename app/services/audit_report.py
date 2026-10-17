@@ -332,3 +332,86 @@ async def collect_order_report(
             ("Ruta", f"{route.status.value} · creada {local(route.created_at)}" if route else "—"),
         ],
     )
+    outbox = (
+        await session.scalars(
+            select(CustomerNotificationOutbox)
+            .where(
+                CustomerNotificationOutbox.delivery_point_id == point_id,
+                CustomerNotificationOutbox.created_at >= begin,
+                CustomerNotificationOutbox.created_at < end,
+            )
+            .order_by(CustomerNotificationOutbox.created_at.desc())
+            .limit(MAX_ROWS)
+        )
+    ).all()
+    data.sections.append(Section(
+        "Avisos enviados al cliente",
+        ["Creado", "Evento", "Canal", "Estado", "Intentos", "Enviado", "Error"],
+        [[local(o.created_at), o.event_type.value, o.channel.value, o.status.value,
+          str(o.attempt_count), local(o.sent_at), o.last_error_code or "—"] for o in outbox],
+        [3, 3, 2, 2, 2, 3, 3],
+    ))
+    tracking = (
+        await session.scalars(
+            select(AccessSession)
+            .where(
+                AccessSession.delivery_point_id == point_id,
+                AccessSession.created_at >= begin,
+                AccessSession.created_at < end,
+            )
+            .order_by(AccessSession.created_at.desc())
+            .limit(MAX_ROWS)
+        )
+    ).all()
+    data.sections.append(Section(
+        "Consultas de seguimiento del cliente", ["Inicio", "Última actividad", "Revocación"],
+        [[local(s.created_at), local(s.last_seen_at), local(s.revoked_at)] for s in tracking],
+        [3, 3, 3],
+    ))
+    contact = []
+    if point.customer_email:
+        contact.append(func.lower(DeliveryPoint.customer_email) == point.customer_email.lower())
+    if point.customer_phone:
+        contact.append(DeliveryPoint.customer_phone == point.customer_phone)
+    if contact:
+        others = (
+            await session.scalars(
+                select(DeliveryPoint)
+                .where(or_(*contact), DeliveryPoint.id != point_id)
+                .order_by(DeliveryPoint.id.desc())
+                .limit(MAX_ROWS)
+            )
+        ).all()
+        data.sections.append(Section(
+            "Otros pedidos con el mismo contacto", ["Pedido", "Estado", "Dirección"],
+            [[o.order_id, o.status.value, o.address] for o in others], [3, 2, 6],
+        ))
+    return data
+
+
+def render_report(
+    data: ReportData, *, begin: datetime, end: datetime, generated_by: str, generated_at: datetime
+) -> bytes:
+    period = f"{local(begin)[:10]} a {local(end - timedelta(seconds=1))[:10]}"
+    subtitle = (
+        f"Periodo: {period} (hora de Bogotá). Generado el {local(generated_at)} por "
+        f"{generated_by}. Documento confidencial: contiene datos personales."
+    )
+    report = PdfReport(data.title, subtitle, "Rutas Pasto · Auditoría de datos")
+    report.heading("Datos del sujeto")
+    report.key_values(data.subject)
+    for section in data.sections:
+        report.heading(f"{section.title} ({len(section.rows)})")
+        report.table(section.headers, section.rows, section.fractions)
+        if section.note:
+            report.paragraph(section.note, gray=0.4)
+    report.heading("Alcance y límites")
+    report.paragraph(
+        "Este informe refleja lo registrado en el sistema durante el periodo. La actividad "
+        "GPS se resume por día (no se listan coordenadas) y los contactos de clientes van "
+        "enmascarados. No incluye contraseñas ni credenciales. Los eventos de seguridad "
+        "dependen de lo que el sistema audita en cada momento.",
+        gray=0.3,
+    )
+    return report.build()
+
