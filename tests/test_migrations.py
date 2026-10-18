@@ -246,3 +246,126 @@ def test_sms_migration_preserves_existing_email_outbox_records(
     try:
         with engine.connect() as connection:
             row = connection.exec_driver_sql(
+                "SELECT channel, recipient_email, recipient_phone "
+                "FROM customer_notification_outbox WHERE id = 'legacy-id'"
+            ).one()
+        assert row == ("EMAIL", "cliente@example.com", None)
+        assert next(
+            column["nullable"]
+            for column in inspect(engine).get_columns("customer_notification_outbox")
+            if column["name"] == "recipient_email"
+        )
+    finally:
+        engine.dispose()
+
+
+def test_route_revision_migration_adds_durable_undo_history_to_an_adopted_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "route-revisions.sqlite3"
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        Base.metadata.create_all(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP TABLE route_revisions")
+    finally:
+        engine.dispose()
+
+
+def test_chat_rate_limit_migration_adds_shared_hashed_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "chat-rate-limit.sqlite3"
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        Base.metadata.create_all(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP TABLE customer_chat_rate_limit_windows")
+    finally:
+        engine.dispose()
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database_path}")
+    get_settings.cache_clear()
+    config = Config(str(BACKEND_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+    try:
+        command.stamp(config, "0006_persist_route_revisions")
+        command.upgrade(config, "head")
+    finally:
+        get_settings.cache_clear()
+
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        inspector = inspect(engine)
+        assert {"guide_hash", "window_started_at", "request_count"} <= {
+            column["name"] for column in inspector.get_columns("customer_chat_rate_limit_windows")
+        }
+        assert {"customer_chat_rate_limit_windows_started_at_idx"} <= {
+            index["name"] for index in inspector.get_indexes("customer_chat_rate_limit_windows")
+        }
+    finally:
+        engine.dispose()
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database_path}")
+    get_settings.cache_clear()
+    config = Config(str(BACKEND_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+    try:
+        command.stamp(config, "0005_customer_notify_deadletter")
+        command.upgrade(config, "head")
+    finally:
+        get_settings.cache_clear()
+
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        inspector = inspect(engine)
+        assert {
+            "id",
+            "route_id",
+            "revision_number",
+            "snapshot",
+            "created_at",
+        } <= {column["name"] for column in inspector.get_columns("route_revisions")}
+        assert (
+            "route_revisions_route_number_key",
+            ("route_id", "revision_number"),
+        ) in actual_unique_signatures(inspector, "route_revisions")
+        foreign_key = inspector.get_foreign_keys("route_revisions")[0]
+        assert foreign_key["referred_table"] == "routes"
+        assert foreign_key["options"]["ondelete"].upper() == "CASCADE"
+    finally:
+        engine.dispose()
+
+
+def test_prisma_unique_indexes_satisfy_unique_constraint_validation() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    try:
+        Base.metadata.create_all(engine)
+        with engine.connect() as connection:
+            inspector = inspect(connection)
+            prisma_inspector = Mock(wraps=inspector)
+            prisma_inspector.get_unique_constraints.side_effect = lambda _table_name: []
+            prisma_inspector.get_indexes.side_effect = lambda table_name: [
+                *inspector.get_indexes(table_name),
+                *(
+                    {
+                        "name": constraint["name"],
+                        "column_names": constraint["column_names"],
+                        "unique": True,
+                    }
+                    for constraint in inspector.get_unique_constraints(table_name)
+                ),
+            ]
+
+            actual = actual_unique_signatures(prisma_inspector, "delivery_points")
+    finally:
+        engine.dispose()
+
+    expected = {
+        (constraint.name, tuple(column.name for column in constraint.columns))
+        for constraint in DeliveryPoint.__table__.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert expected <= actual
