@@ -390,3 +390,199 @@ async def _post_location(
 
     try:
         result = await queue.enqueue(
+            lambda: _write_location(
+                session_factory, courier_id, location.lat, location.lng, recorded_at
+            )
+        )
+    except LocationQueueFullError as error:
+        return JSONResponse(
+            content={"error": str(error), "retryAfterSeconds": 1},
+            status_code=503,
+            headers={"Retry-After": "1", **_NO_STORE_PRIVATE},
+        )
+    except CourierNotFoundError:
+        return _error("El repartidor no existe.", 404)
+    except SQLAlchemyError as error:
+        _log_db_error("No se pudo registrar la ubicación", error)
+        return _error("No se pudo registrar la ubicación.", 500)
+
+    if result["accepted"] and any_customer_notification_delivery_configured():
+        background_tasks.add_task(
+            dispatch_pending_customer_notifications_background,
+            session_factory,
+        )
+
+    payload = LocationEventResponse(
+        location_event=LocationEventView.model_validate(result["event"]),
+        accepted=result["accepted"],
+    )
+    return _json(
+        payload.model_dump(mode="json", by_alias=True),
+        status_code=201,
+        headers=_NO_STORE_PRIVATE,
+    )
+
+
+async def _write_location(
+    session_factory: async_sessionmaker[AsyncSession],
+    courier_id: UUID,
+    latitude: float,
+    longitude: float,
+    recorded_at: datetime,
+) -> _LocationWriteResult:
+    async with session_factory() as session:
+        async with session.begin():
+            repository = CourierRepository(session)
+            if not await repository.courier_exists(courier_id):
+                raise CourierNotFoundError
+            event, accepted = await repository.record_location(
+                courier_id=courier_id,
+                latitude=latitude,
+                longitude=longitude,
+                recorded_at=recorded_at,
+            )
+            nearby_notification_queued = False
+            if accepted:
+                next_point = await repository.get_next_delivery_point_for_route(courier_id)
+                if next_point is not None and next_point.route_id is not None:
+                    if is_courier_near_delivery_point(
+                        latitude,
+                        longitude,
+                        next_point.lat,
+                        next_point.lng,
+                    ):
+                        nearby_notification_queued = bool(
+                            await enqueue_courier_near_notification(
+                                session,
+                                next_point,
+                                next_point.route_id,
+                                now=recorded_at,
+                            )
+                        )
+            return {
+                "event": event,
+                "accepted": accepted,
+                "nearby_notification_queued": nearby_notification_queued,
+            }
+
+
+@router.delete("/{courier_id}/ubicacion")
+async def stop_courier_location(
+    courier_id: str,
+    claims: Annotated[SessionClaims, Depends(require_courier_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    parsed_id = _parse_uuid(courier_id)
+    if str(parsed_id) != claims.get("courierId"):
+        return _error("No puedes detener el seguimiento de otro repartidor.", 403)
+    return await _stop_location(parsed_id, session)
+
+
+async def _stop_location(courier_id: UUID, session: AsyncSession) -> JSONResponse:
+    try:
+        async with session.begin():
+            repository = CourierRepository(session)
+            active_route_id = await repository.get_active_route_id(courier_id)
+            courier = await repository.get_courier(courier_id)
+            if courier is None:
+                return _error("El repartidor no existe.", 404)
+            courier.status = (
+                CourierStatus.ON_ROUTE if active_route_id is not None else CourierStatus.OFFLINE
+            )
+        payload = {
+            "courier": {
+                "status": courier.status.value,
+                "lastLocationAt": _iso_utc(courier.last_location_at),
+            }
+        }
+        return _json(payload, headers=_NO_STORE_PRIVATE)
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_db_error("No se pudo detener el seguimiento", error)
+        return _error("No se pudo detener el seguimiento.", 500)
+
+
+async def _read_json_object(request: Request) -> dict[str, object] | JSONResponse:
+    try:
+        value: object = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error("El body debe ser JSON válido.", 400)
+    if not isinstance(value, dict):
+        return _error("El body debe ser un objeto JSON.", 400)
+    return {str(key): item for key, item in value.items()}
+
+
+def _parse_uuid(
+    value: str | None, message: str = "El identificador del repartidor no es válido."
+) -> UUID:
+    if not value:
+        raise HTTPException(status_code=400, detail=message)
+    try:
+        return UUID(value)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=message) from error
+
+
+def _parse_recorded_at(value: str | None) -> datetime | JSONResponse:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    if value is None:
+        return now
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return _error("recordedAt debe ser una fecha ISO válida.", 400)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+    if parsed < now - COURIER_LOCATION_MAX_AGE or parsed > now + timedelta(seconds=15):
+        return _error(
+            "La ubicación está desactualizada o tiene una fecha futura; vuelve a obtener GPS.",
+            400,
+        )
+    return parsed
+
+
+def _courier_view(courier: Courier, now: datetime) -> CourierView:
+    view = CourierView.model_validate(courier)
+    if is_courier_location_fresh(courier.last_location_at, now):
+        return view
+    return view.model_copy(update={"current_lat": None, "current_lng": None})
+
+
+def _string_field_error(error: ValidationError) -> str:
+    location = error.errors()[0].get("loc", ())
+    field = str(location[0]) if location else "name"
+    return f"{field} debe ser un string no vacío."
+
+
+def _iso_utc(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return normalized.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        content={"error": message},
+        status_code=status_code,
+        headers=_NO_STORE_PRIVATE,
+    )
+
+
+def _json(
+    content: object,
+    status_code: int = 200,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    return JSONResponse(content=content, status_code=status_code, headers=headers)
+
+
+def _log_db_error(message: str, error: Exception) -> None:
+    _LOGGER.error(message, extra={"error_type": type(error).__name__})
+
+
+class CourierNotFoundError(Exception):
+    pass
+
+
+_NO_STORE_PRIVATE = {"Cache-Control": "no-store, private"}
