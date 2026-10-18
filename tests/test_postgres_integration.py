@@ -231,3 +231,236 @@ async def test_route_revision_stack_persists_and_undoes_atomically_in_postgres()
                         delete(DeliveryPoint).where(
                             DeliveryPoint.id.in_({original_point_id, appended_point_id})
                         )
+                    )
+                    await session.execute(
+                        delete(Notification).where(Notification.recipient_id == str(courier_id))
+                    )
+                    await session.execute(delete(Courier).where(Courier.id == courier_id))
+                    await session.commit()
+        finally:
+            await engine.dispose()
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_POSTGRES_INTEGRATION") != "1",
+    reason="Activa RUN_POSTGRES_INTEGRATION=1 para usar la base PostgreSQL configurada.",
+)
+@pytest.mark.asyncio
+async def test_route_creation_persists_atomically_in_postgres() -> None:
+    settings = get_settings()
+    engine = create_async_engine(settings.sqlalchemy_database_url, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        async with session_factory() as session:
+            yield session
+
+    monkeypatch_values = {
+        "AUTH_SECRET": _INTEGRATION_SECRET,
+        "NODE_ENV": "test",
+        "AI_ALLOW_LOCATION_DATA_SHARING": "false",
+    }
+    original_values = {name: os.environ.get(name) for name in monkeypatch_values}
+    os.environ.update(monkeypatch_values)
+    get_settings.cache_clear()
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_routing_providers] = lambda: (
+        _MatrixProvider(),
+        _RouteProvider(),
+    )
+    app.dependency_overrides[get_route_traffic_advisor] = lambda: None
+    app.dependency_overrides[get_traffic_service] = lambda: None
+    seeded = False
+
+    try:
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+
+        async with session_factory() as session:
+            session.add(
+                Courier(
+                    id=_COURIER_ID,
+                    name="Integración automatizada",
+                    phone=f"test-{_COURIER_ID.hex[:20]}",
+                    status=CourierStatus.AVAILABLE,
+                    current_lat=1.2136,
+                    current_lng=-77.2811,
+                    last_location_at=datetime.now(UTC).replace(tzinfo=None),
+                )
+            )
+            session.add(
+                DeliveryPoint(
+                    id=_POINT_ID,
+                    address="Carrera 25 # 4 Sur-65, Pasto",
+                    lat=1.214,
+                    lng=-77.28,
+                    status=DeliveryPointStatus.PENDING,
+                    order_id=f"INTEGRATION-{_POINT_ID}",
+                    tracking_token=f"INTEGRATION-{_POINT_ID}",
+                )
+            )
+            await session.commit()
+            seeded = True
+
+        expires_at = int(datetime.now(UTC).timestamp()) + SESSION_MAX_AGE_SECONDS
+        token = create_session_token("dispatcher", expires_at, _INTEGRATION_SECRET)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://postgres-integration",
+        ) as client:
+            response = await client.post(
+                "/api/rutas",
+                headers={"Cookie": f"{SESSION_COOKIE_NAME}={token}"},
+                json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(_POINT_ID)]},
+            )
+
+        assert response.status_code == 201, response.text
+        route_id = UUID(response.json()["route"]["id"])
+        assert response.json()["orderedDeliveryPointIds"] == [str(_POINT_ID)]
+
+        async with session_factory() as session:
+            route = await session.scalar(select(Route).where(Route.id == route_id))
+            point = await session.get(DeliveryPoint, _POINT_ID)
+            assert route is not None
+            assert route.courier_id == _COURIER_ID
+            assert point is not None
+            assert point.route_id == route_id
+            assert point.sequence_index == 0
+            assert point.status is DeliveryPointStatus.PENDING
+    finally:
+        try:
+            if seeded:
+                async with session_factory() as session:
+                    await session.execute(
+                        delete(Route).where(Route.courier_id == _COURIER_ID)
+                    )
+                    await session.execute(
+                        delete(DeliveryPoint).where(DeliveryPoint.id == _POINT_ID)
+                    )
+                    await session.execute(
+                        delete(Notification).where(Notification.recipient_id == str(_COURIER_ID))
+                    )
+                    await session.execute(delete(Courier).where(Courier.id == _COURIER_ID))
+                    await session.commit()
+        finally:
+            app.dependency_overrides.pop(get_session, None)
+            app.dependency_overrides.pop(get_routing_providers, None)
+            app.dependency_overrides.pop(get_route_traffic_advisor, None)
+            app.dependency_overrides.pop(get_traffic_service, None)
+            for name, value in original_values.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            get_settings.cache_clear()
+            await engine.dispose()
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_POSTGRES_INTEGRATION") != "1",
+    reason="Activa RUN_POSTGRES_INTEGRATION=1 para usar la base PostgreSQL configurada.",
+)
+@pytest.mark.asyncio
+async def test_route_batch_failure_rolls_back_partial_assignments_in_postgres() -> None:
+    settings = get_settings()
+    engine = create_async_engine(settings.sqlalchemy_database_url, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    seeded = False
+
+    try:
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+
+        async with session_factory() as session:
+            session.add_all(
+                [
+                    Courier(
+                        id=_COURIER_ID,
+                        name="Courier transaccional",
+                        phone=f"test-{_COURIER_ID.hex[:20]}",
+                        status=CourierStatus.AVAILABLE,
+                        current_lat=1.2136,
+                        current_lng=-77.2811,
+                        last_location_at=datetime.now(UTC).replace(tzinfo=None),
+                    ),
+                    Courier(
+                        id=_COMPETING_COURIER_ID,
+                        name="Courier con reserva",
+                        phone=f"test-{_COMPETING_COURIER_ID.hex[:20]}",
+                        status=CourierStatus.AVAILABLE,
+                        current_lat=1.2136,
+                        current_lng=-77.2811,
+                        last_location_at=datetime.now(UTC).replace(tzinfo=None),
+                    ),
+                ]
+            )
+            await session.flush()
+            session.add(
+                Route(
+                    id=_EXISTING_ROUTE_ID,
+                    courier_id=_COMPETING_COURIER_ID,
+                    status=RouteStatus.PLANNED,
+                    estimated_duration_minutes=8.0,
+                    estimated_distance_meters=900.0,
+                )
+            )
+            await session.flush()
+            session.add_all(
+                [
+                    DeliveryPoint(
+                        id=_FIRST_POINT_ID,
+                        address="Carrera 25 # 4 Sur-65, Pasto",
+                        lat=1.214,
+                        lng=-77.28,
+                        status=DeliveryPointStatus.PENDING,
+                        order_id=f"INTEGRATION-{_FIRST_POINT_ID}",
+                        tracking_token=f"INTEGRATION-{_FIRST_POINT_ID}",
+                    ),
+                    DeliveryPoint(
+                        id=_CONFLICTING_POINT_ID,
+                        address="Calle 18 # 20-30, Pasto",
+                        lat=1.215,
+                        lng=-77.279,
+                        status=DeliveryPointStatus.PENDING,
+                        order_id=f"INTEGRATION-{_CONFLICTING_POINT_ID}",
+                        tracking_token=f"INTEGRATION-{_CONFLICTING_POINT_ID}",
+                        route_id=_EXISTING_ROUTE_ID,
+                        sequence_index=0,
+                    ),
+                ]
+            )
+            await session.commit()
+            seeded = True
+
+        plan = OptimizedRoutePlan(
+            courier_id=_COURIER_ID,
+            planned_courier_location=(-77.2811, 1.2136),
+            ordered_delivery_point_ids=(_FIRST_POINT_ID, _CONFLICTING_POINT_ID),
+            planned_delivery_point_coordinates=(
+                (_FIRST_POINT_ID, (-77.28, 1.214)),
+                (_CONFLICTING_POINT_ID, (-77.279, 1.215)),
+            ),
+            estimated_duration_minutes=12.0,
+            estimated_distance_meters=1_200.0,
+            baseline_duration_minutes=12.0,
+            baseline_distance_meters=1_200.0,
+            geometry={
+                "type": "LineString",
+                "coordinates": [(-77.2811, 1.2136), (-77.28, 1.214), (-77.279, 1.215)],
+            },
+            geometry_provider=RouteGeometryProvider.OSRM,
+            matrix_source="osrm",
+            warning=None,
+            traffic_ai={"source": "deterministic", "applied": False},
+        )
+
+        async with session_factory() as session:
+            with pytest.raises(RouteConflictError, match="cambió mientras se guardaba"):
+                await create_optimized_routes_batch(session, [plan])
+
+        async with session_factory() as session:
+            created_routes = await session.scalars(
+                select(Route).where(Route.courier_id == _COURIER_ID)
+            )
+            first_point = await session.get(DeliveryPoint, _FIRST_POINT_ID)
+            conflicting_point = await session.get(DeliveryPoint, _CONFLICTING_POINT_ID)
