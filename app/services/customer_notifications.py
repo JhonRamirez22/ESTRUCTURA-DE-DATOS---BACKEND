@@ -456,3 +456,232 @@ async def _enqueue_notification(
         "recipient_phone": recipient if channel is CustomerNotificationChannel.SMS else None,
         "subject": subject,
         "text_body": text_body,
+        "status": CustomerNotificationStatus.PENDING,
+        "attempt_count": 0,
+        "available_at": _as_naive_utc(now or datetime.now(UTC)),
+    }
+    dialect_name = session.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        result = await session.execute(
+            postgres_insert(CustomerNotificationOutbox)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=[CustomerNotificationOutbox.event_key])
+            .returning(CustomerNotificationOutbox.id)
+        )
+    elif dialect_name == "sqlite":
+        result = await session.execute(
+            sqlite_insert(CustomerNotificationOutbox)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=[CustomerNotificationOutbox.event_key])
+            .returning(CustomerNotificationOutbox.id)
+        )
+    else:
+        existing = await session.scalar(
+            select(CustomerNotificationOutbox.id).where(
+                CustomerNotificationOutbox.event_key == event_key
+            )
+        )
+        if existing is not None:
+            return False
+        session.add(CustomerNotificationOutbox(**values))
+        await session.flush()
+        return True
+
+    return result.scalar_one_or_none() is not None
+
+
+async def _claim_pending_notifications(
+    session_factory: async_sessionmaker[AsyncSession],
+    now: datetime,
+    settings: Settings,
+    enabled_channels: tuple[CustomerNotificationChannel, ...],
+) -> list[tuple[UUID, CustomerNotificationChannel, str | None, str | None, str, str]]:
+    lease_seconds = max(
+        OUTBOX_LEASE_SECONDS,
+        math.ceil(
+            max(
+                settings.notification_smtp_timeout_ms,
+                settings.notification_sms_timeout_ms,
+            )
+            / 1_000
+        )
+        * 2,
+    )
+    ready = or_(
+        and_(
+            CustomerNotificationOutbox.status == CustomerNotificationStatus.PENDING,
+            CustomerNotificationOutbox.available_at <= now,
+        ),
+        and_(
+            CustomerNotificationOutbox.status == CustomerNotificationStatus.PROCESSING,
+            CustomerNotificationOutbox.lease_expires_at.is_not(None),
+            CustomerNotificationOutbox.lease_expires_at <= now,
+        ),
+    )
+    claimed: list[tuple[UUID, CustomerNotificationChannel, str | None, str | None, str, str]] = []
+    async with session_factory() as session:
+        async with session.begin():
+            exhausted = or_(
+                and_(
+                    CustomerNotificationOutbox.status == CustomerNotificationStatus.PENDING,
+                    CustomerNotificationOutbox.attempt_count >= MAX_NOTIFICATION_ATTEMPTS,
+                ),
+                and_(
+                    CustomerNotificationOutbox.status == CustomerNotificationStatus.PROCESSING,
+                    CustomerNotificationOutbox.attempt_count >= MAX_NOTIFICATION_ATTEMPTS,
+                    CustomerNotificationOutbox.lease_expires_at.is_not(None),
+                    CustomerNotificationOutbox.lease_expires_at <= now,
+                ),
+            )
+            await session.execute(
+                update(CustomerNotificationOutbox)
+                .where(exhausted)
+                .values(
+                    status=CustomerNotificationStatus.FAILED,
+                    lease_expires_at=None,
+                    last_error_code="MaxAttemptsExceeded",
+                    recipient_email=None,
+                    recipient_phone=None,
+                    subject="",
+                    text_body="",
+                )
+            )
+            rows = await session.scalars(
+                select(CustomerNotificationOutbox)
+                .where(
+                    ready,
+                    CustomerNotificationOutbox.attempt_count < MAX_NOTIFICATION_ATTEMPTS,
+                    CustomerNotificationOutbox.channel.in_(enabled_channels),
+                )
+                .order_by(
+                    CustomerNotificationOutbox.available_at,
+                    CustomerNotificationOutbox.created_at,
+                )
+                .limit(OUTBOX_BATCH_LIMIT)
+                .with_for_update(skip_locked=True)
+            )
+            for row in rows:
+                row.status = CustomerNotificationStatus.PROCESSING
+                row.lease_expires_at = now + timedelta(seconds=lease_seconds)
+                row.attempt_count += 1
+                claimed.append(
+                    (
+                        row.id,
+                        row.channel,
+                        row.recipient_email,
+                        row.recipient_phone,
+                        row.subject,
+                        row.text_body,
+                    )
+                )
+    return claimed
+
+
+async def _has_current_delivery_consent(
+    session_factory: async_sessionmaker[AsyncSession],
+    notification_id: UUID,
+) -> bool:
+    """Rechecks opt-in and address after leasing, before disclosing data to a provider."""
+    async with session_factory() as session:
+        async with session.begin():
+            result = await session.execute(
+                select(CustomerNotificationOutbox, DeliveryPoint)
+                .join(
+                    DeliveryPoint,
+                    DeliveryPoint.id == CustomerNotificationOutbox.delivery_point_id,
+                )
+                .where(CustomerNotificationOutbox.id == notification_id)
+            )
+            entry = result.one_or_none()
+            if entry is None:
+                return False
+            notification, point = entry
+            if notification.status is not CustomerNotificationStatus.PROCESSING:
+                return False
+
+            if notification.channel is CustomerNotificationChannel.EMAIL:
+                authorized = (
+                    point.email_notifications_enabled
+                    and point.customer_email is not None
+                    and point.customer_email.strip() == notification.recipient_email
+                )
+            else:
+                authorized = (
+                    point.sms_notifications_enabled
+                    and point.customer_phone is not None
+                    and point.customer_phone.strip() == notification.recipient_phone
+                )
+
+            if not authorized:
+                notification.status = CustomerNotificationStatus.CANCELLED
+                notification.lease_expires_at = None
+                notification.recipient_email = None
+                notification.recipient_phone = None
+                notification.subject = ""
+                notification.text_body = ""
+            return authorized
+
+
+async def _record_delivery_success(
+    session_factory: async_sessionmaker[AsyncSession],
+    notification_id: UUID,
+    now: datetime,
+) -> bool:
+    async with session_factory() as session:
+        async with session.begin():
+            row = await session.scalar(
+                select(CustomerNotificationOutbox)
+                .where(CustomerNotificationOutbox.id == notification_id)
+                .with_for_update()
+            )
+            if row is None or row.status is not CustomerNotificationStatus.PROCESSING:
+                return False
+            row.status = CustomerNotificationStatus.SENT
+            row.sent_at = now
+            row.lease_expires_at = None
+            # Se conserva idempotencia, pero se borran destinatario y contenido ya enviados.
+            row.recipient_email = None
+            row.recipient_phone = None
+            row.subject = ""
+            row.text_body = ""
+            row.last_error_code = None
+    return True
+
+
+async def _record_delivery_failure(
+    session_factory: async_sessionmaker[AsyncSession],
+    notification_id: UUID,
+    now: datetime,
+    error_code: str,
+) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            row = await session.scalar(
+                select(CustomerNotificationOutbox)
+                .where(CustomerNotificationOutbox.id == notification_id)
+                .with_for_update()
+            )
+            if row is None or row.status is not CustomerNotificationStatus.PROCESSING:
+                return
+            row.last_error_code = error_code[:100]
+            row.lease_expires_at = None
+            if row.attempt_count >= MAX_NOTIFICATION_ATTEMPTS:
+                row.status = CustomerNotificationStatus.FAILED
+                # Un aviso agotado ya no se enviará automáticamente; no retener PII.
+                row.recipient_email = None
+                row.recipient_phone = None
+                row.subject = ""
+                row.text_body = ""
+                return
+
+            retry_seconds = min(
+                RETRY_BASE_SECONDS * (2 ** min(row.attempt_count - 1, 10)),
+                RETRY_MAX_SECONDS,
+            )
+            row.status = CustomerNotificationStatus.PENDING
+            row.available_at = now + timedelta(seconds=retry_seconds)
+
+
+def _as_naive_utc(value: datetime) -> datetime:
+    normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return normalized.replace(tzinfo=None)
