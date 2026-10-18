@@ -227,3 +227,232 @@ async def enqueue_order_assigned_notification(
 async def enqueue_courier_near_notification(
     session: AsyncSession,
     point: DeliveryPoint,
+    route_id: UUID,
+    *,
+    now: datetime | None = None,
+) -> tuple[CustomerNotificationChannel, ...]:
+    return await _enqueue_customer_event(
+        session,
+        point,
+        route_id,
+        CustomerNotificationEvent.COURIER_NEAR,
+        subject="Tu repartidor está cerca",
+        text_body=(
+            "El repartidor asignado a tu pedido está a menos de "
+            f"{NEARBY_DELIVERY_RADIUS_METERS} m del destino. La distancia es aproximada "
+            "y no representa una hora exacta de llegada."
+        ),
+        sms_body=(
+            "Rutas Pasto: el repartidor asignado a tu pedido está a menos de "
+            f"{NEARBY_DELIVERY_RADIUS_METERS} m. Distancia aproximada, no es una hora exacta."
+        ),
+        now=now,
+    )
+
+
+async def _enqueue_customer_event(
+    session: AsyncSession,
+    point: DeliveryPoint,
+    route_id: UUID,
+    event_type: CustomerNotificationEvent,
+    *,
+    subject: str,
+    text_body: str,
+    sms_body: str,
+    now: datetime | None,
+) -> tuple[CustomerNotificationChannel, ...]:
+    queued: list[CustomerNotificationChannel] = []
+    email = (point.customer_email or "").strip()
+    if point.email_notifications_enabled and email:
+        inserted = await _enqueue_notification(
+            session,
+            point,
+            route_id,
+            event_type,
+            CustomerNotificationChannel.EMAIL,
+            email,
+            subject,
+            text_body,
+            now,
+        )
+        if inserted:
+            queued.append(CustomerNotificationChannel.EMAIL)
+
+    phone = (point.customer_phone or "").strip()
+    if (
+        point.sms_notifications_enabled
+        and phone
+        and _E164_PATTERN.fullmatch(phone)
+    ):
+        inserted = await _enqueue_notification(
+            session,
+            point,
+            route_id,
+            event_type,
+            CustomerNotificationChannel.SMS,
+            phone,
+            subject,
+            sms_body,
+            now,
+        )
+        if inserted:
+            queued.append(CustomerNotificationChannel.SMS)
+    return tuple(queued)
+
+
+async def cancel_pending_customer_notifications(
+    session: AsyncSession,
+    delivery_point_id: UUID,
+) -> int:
+    """Cancela avisos aún no enviados y elimina destinatarios y contenido."""
+    result = await session.execute(
+        update(CustomerNotificationOutbox)
+        .where(
+            CustomerNotificationOutbox.delivery_point_id == delivery_point_id,
+            CustomerNotificationOutbox.status.in_(
+                (
+                    CustomerNotificationStatus.PENDING,
+                    CustomerNotificationStatus.PROCESSING,
+                )
+            ),
+        )
+        .values(
+            status=CustomerNotificationStatus.CANCELLED,
+            recipient_email=None,
+            recipient_phone=None,
+            subject="",
+            text_body="",
+            lease_expires_at=None,
+        )
+        .returning(CustomerNotificationOutbox.id)
+    )
+    return len(result.scalars().all())
+
+
+async def dispatch_pending_customer_notifications(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    settings: Settings | None = None,
+    sender: EmailSender | None = None,
+    sms_sender: SmsSender | None = None,
+    now: datetime | None = None,
+) -> DispatchSummary:
+    """Entrega canales configurados fuera de la transacción y conserva fallos para reintento."""
+    active_settings = settings or get_settings()
+    configured_channels = customer_notification_channels_configured(active_settings)
+    enabled_channels = tuple(channel for channel, enabled in configured_channels.items() if enabled)
+    if not enabled_channels:
+        return DispatchSummary(
+            configured=False,
+            warning="Avisos en cola: configura SMTP y/o las credenciales SMS de Twilio.",
+        )
+
+    active_email_sender = sender or SmtpEmailSender(active_settings)
+    active_sms_sender = sms_sender or TwilioSmsSender(active_settings)
+    current_time = _as_naive_utc(now or datetime.now(UTC))
+    claimed = await _claim_pending_notifications(
+        session_factory,
+        current_time,
+        active_settings,
+        enabled_channels,
+    )
+    sent = 0
+    attempted = 0
+    deferred = 0
+
+    for notification_id, channel, email, phone, subject, text_body in claimed:
+        if not await _has_current_delivery_consent(session_factory, notification_id):
+            continue
+        attempted += 1
+        try:
+            if channel is CustomerNotificationChannel.EMAIL:
+                await asyncio.to_thread(
+                    active_email_sender.send,
+                    CustomerEmail(email or "", subject, text_body),
+                )
+            else:
+                await asyncio.to_thread(
+                    active_sms_sender.send,
+                    CustomerSms(phone or "", text_body),
+                )
+        except Exception as error:
+            await _record_delivery_failure(
+                session_factory,
+                notification_id,
+                current_time,
+                type(error).__name__,
+            )
+            deferred += 1
+        else:
+            if await _record_delivery_success(session_factory, notification_id, current_time):
+                sent += 1
+
+    return DispatchSummary(
+        configured=True,
+        attempted=attempted,
+        sent=sent,
+        deferred=deferred,
+    )
+
+
+async def dispatch_pending_customer_notifications_background(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Punto de entrada para BackgroundTasks; no bloquea la respuesta HTTP."""
+    summary = await dispatch_pending_customer_notifications(session_factory)
+    if summary.deferred:
+        _LOGGER.warning(
+            "Se aplazó la entrega de avisos al cliente",
+            extra={"deferred_count": summary.deferred},
+        )
+
+
+def is_courier_near_delivery_point(
+    courier_latitude: float,
+    courier_longitude: float,
+    point_latitude: float,
+    point_longitude: float,
+) -> bool:
+    """Determina proximidad geodésica aproximada; no calcula calles ni tiempo de llegada."""
+    if not all(
+        math.isfinite(value)
+        for value in (courier_latitude, courier_longitude, point_latitude, point_longitude)
+    ):
+        return False
+    latitude_delta = math.radians(point_latitude - courier_latitude)
+    longitude_delta = math.radians(point_longitude - courier_longitude)
+    start_latitude = math.radians(courier_latitude)
+    end_latitude = math.radians(point_latitude)
+    haversine = (
+        math.sin(latitude_delta / 2) ** 2
+        + math.cos(start_latitude) * math.cos(end_latitude) * math.sin(longitude_delta / 2) ** 2
+    )
+    distance_meters = 2 * EARTH_RADIUS_METERS * math.asin(min(1.0, math.sqrt(haversine)))
+    return distance_meters <= NEARBY_DELIVERY_RADIUS_METERS
+
+
+async def _enqueue_notification(
+    session: AsyncSession,
+    point: DeliveryPoint,
+    route_id: UUID,
+    event_type: CustomerNotificationEvent,
+    channel: CustomerNotificationChannel,
+    recipient: str,
+    subject: str,
+    text_body: str,
+    now: datetime | None,
+) -> bool:
+    # Mantener la clave de email histórica preserva idempotencia al migrar desde 0002.
+    event_key = f"{event_type.value.lower()}:{route_id}:{point.id}"
+    if channel is CustomerNotificationChannel.SMS:
+        event_key = f"{event_key}:sms"
+    values = {
+        "id": uuid4(),
+        "delivery_point_id": point.id,
+        "event_key": event_key,
+        "event_type": event_type,
+        "channel": channel,
+        "recipient_email": recipient if channel is CustomerNotificationChannel.EMAIL else None,
+        "recipient_phone": recipient if channel is CustomerNotificationChannel.SMS else None,
+        "subject": subject,
+        "text_body": text_body,
