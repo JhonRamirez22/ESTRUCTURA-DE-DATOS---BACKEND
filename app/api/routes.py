@@ -601,3 +601,304 @@ async def get_route_traffic_profile(
                 409,
             )
         segments = derive_road_segments(geometry, route.estimated_duration_minutes)
+        route_end = route.completed_at or datetime.now(UTC).replace(tzinfo=None)
+        event_rows = await repository.list_location_events(
+            courier_id=route.courier_id,
+            start_at=route.started_at,
+            end_at=route_end,
+        )
+        samples = match_location_events_to_segments(
+            [LocationEventPoint((event.lng, event.lat), event.recorded_at) for event in event_rows],
+            segments,
+        )
+        factors = calculate_congestion_factors(samples)
+        return _json(
+            {
+                "factors": [{"factor": factor, "key": key} for key, factor in factors.items()],
+                "routeId": str(route_uuid),
+                "eventCount": len(event_rows),
+                "sampleCount": len(samples),
+                "segmentCount": len(segments),
+                "warning": (
+                    "El perfil solo usa GPS de esta ruta; generalizarlo a toda la ciudad "
+                    "requiere un catálogo vial persistido."
+                ),
+            },
+            headers=_NO_STORE,
+        )
+    except (ValueError, SQLAlchemyError) as error:
+        if isinstance(error, SQLAlchemyError):
+            _log_database_error("No se pudo leer el perfil de tráfico", error)
+            return _error("No se pudo calcular el perfil histórico de tráfico.", 500)
+        _LOGGER.warning(
+            "La geometría de ruta no cumple el contrato de tráfico",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error("No se pudo calcular el perfil histórico de tráfico.", 409)
+
+
+@router.get("/{route_id}/trafico-vivo")
+async def get_route_live_traffic(
+    route_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    traffic: Annotated[TrafficService | None, Depends(get_traffic_service)],
+) -> JSONResponse:
+    """Devuelve muestras TomTom recientes solo sobre la geometría vial de la ruta."""
+    authorized = _authorize_route_id(route_id, claims)
+    if isinstance(authorized, JSONResponse):
+        return authorized
+    route_uuid, _dispatcher = authorized
+    try:
+        route = await RouteRepository(session).load_route(route_uuid)
+        if route is None:
+            return _error("La ruta no existe.", 404)
+        if (
+            claims is not None
+            and claims["role"] == "courier"
+            and route.courier_id != _claim_courier_id(claims)
+        ):
+            return _error("La ruta no existe.", 404)
+        if route.status not in {RouteStatus.PLANNED, RouteStatus.IN_PROGRESS}:
+            return _error("El tráfico en vivo solo está disponible para rutas activas.", 409)
+        geometry = _read_route_geometry(route.geometry)
+        if (
+            geometry is None
+            or route.geometry_provider is None
+            or any(
+                not is_within_pasto_service_area(lat, lon)
+                for lon, lat in geometry["coordinates"]
+            )
+        ):
+            return _error("La ruta no tiene geometría vial válida dentro de Pasto.", 409)
+        overlay = await sample_route_traffic_overlay(geometry, traffic)
+        return _json(overlay, headers=_NO_STORE)
+    except SQLAlchemyError as error:
+        _log_database_error("No se pudo cargar el tráfico de la ruta", error)
+        return _error("No se pudo cargar el tráfico de la ruta.", 500)
+
+
+def _route_json(
+    route: Route,
+    *,
+    dispatcher: bool,
+    can_undo: bool = False,
+) -> dict[str, object]:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    courier = route.courier
+    fresh = (
+        courier.current_lat is not None
+        and courier.current_lng is not None
+        and is_courier_location_fresh(courier.last_location_at, now)
+        and is_within_pasto_service_area(courier.current_lat, courier.current_lng)
+    )
+    ordered_points = sorted(
+        route.delivery_points,
+        key=lambda point: (
+            point.sequence_index is None,
+            point.sequence_index if point.sequence_index is not None else 0,
+        ),
+    )
+    courier_json: dict[str, object] = {
+        "currentLat": courier.current_lat if fresh else None,
+        "currentLng": courier.current_lng if fresh else None,
+    }
+    if dispatcher:
+        courier_json.update(
+            {
+                "id": str(courier.id),
+                "name": courier.name,
+                "phone": courier.phone,
+                "status": courier.status.value,
+                "lastLocationAt": _date_json(courier.last_location_at),
+            }
+        )
+    route_data: dict[str, object] = {
+        "id": str(route.id),
+        "status": route.status.value,
+        "estimatedDurationMinutes": route.estimated_duration_minutes,
+        "estimatedDistanceMeters": route.estimated_distance_meters,
+        "baselineDurationMinutes": route.baseline_duration_minutes,
+        "baselineDistanceMeters": route.baseline_distance_meters,
+        "geometry": route.geometry,
+        "geometryProvider": route.geometry_provider.value if route.geometry_provider else None,
+        "startedAt": _date_json(route.started_at),
+        "completedAt": _date_json(route.completed_at),
+        "optimizedAt": _date_json(route.optimized_at or route.created_at),
+        "createdAt": _date_json(route.created_at),
+        "updatedAt": _date_json(route.updated_at),
+        "courier": courier_json,
+        "deliveryPoints": [_point_json(point, dispatcher=dispatcher) for point in ordered_points],
+    }
+    if dispatcher:
+        route_data["courierId"] = str(route.courier_id)
+        route_data["canUndo"] = can_undo
+    return route_data
+
+
+def _point_json(point: DeliveryPoint, *, dispatcher: bool) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "id": str(point.id),
+        "address": point.address,
+        "lat": point.lat,
+        "lng": point.lng,
+        "timeWindow": point.time_window,
+        "status": point.status.value,
+        "sequenceIndex": point.sequence_index,
+    }
+    if dispatcher:
+        payload.update(
+            {
+                "orderId": point.order_id,
+                "trackingToken": point.tracking_token,
+                "routeId": str(point.route_id) if point.route_id else None,
+            }
+        )
+    return payload
+
+
+def _read_route_geometry(value: object) -> GeoJsonLineString | None:
+    if not isinstance(value, dict) or value.get("type") != "LineString":
+        return None
+    coordinates = value.get("coordinates")
+    if not isinstance(coordinates, list):
+        return None
+    parsed: list[Coordinate] = []
+    for coordinate in coordinates:
+        if (
+            not isinstance(coordinate, (list, tuple))
+            or len(coordinate) != 2
+            or any(
+                isinstance(part, bool) or not isinstance(part, (int, float)) for part in coordinate
+            )
+        ):
+            return None
+        parsed.append((float(coordinate[0]), float(coordinate[1])))
+    return {"type": "LineString", "coordinates": parsed}
+
+
+def _operation_json(result: RouteOperationResult) -> dict[str, object]:
+    route = result.route
+    point_ids = result.ordered_delivery_point_ids
+    return {
+        "matrixSource": result.matrix_source,
+        "orderedDeliveryPointIds": [str(point_id) for point_id in point_ids],
+        "trafficAi": result.traffic_ai,
+        "liveTraffic": result.live_traffic,
+        "route": _route_json(route, dispatcher=True),
+        **({"warning": result.warning} if result.warning is not None else {}),
+    }
+
+
+def _authorize_route_id(
+    route_id: str,
+    claims: SessionClaims | None,
+) -> tuple[UUID, bool] | JSONResponse:
+    parsed = _parse_uuid(route_id)
+    if parsed is None:
+        return _error("La ruta no existe.", 404)
+    if claims is None:
+        return _error("Debes iniciar sesión para consultar rutas.", 401)
+    if claims["role"] == "courier" and _claim_courier_id(claims) is None:
+        return _error("La sesión de repartidor no es válida.", 403)
+    return parsed, claims["role"] == "dispatcher"
+
+
+def _claim_courier_id(claims: SessionClaims) -> UUID | None:
+    try:
+        value = claims.get("courierId")
+        return UUID(value) if value else None
+    except ValueError:
+        return None
+
+
+def _parse_query_courier_id(raw: str | None) -> UUID | None | JSONResponse:
+    if raw is None:
+        return None
+    parsed = _parse_uuid(raw)
+    return parsed if parsed is not None else _error("courierId debe ser un UUID válido.", 400)
+
+
+def _parse_uuid(value: str) -> UUID | None:
+    try:
+        return UUID(value)
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+async def _read_model[T: BaseModel](request: Request, model: type[T]) -> T | JSONResponse:
+    try:
+        raw: object = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error("El body debe ser JSON válido.", 400)
+    if not isinstance(raw, dict):
+        return _error("El body debe ser un objeto JSON.", 400)
+    try:
+        return model.model_validate(raw)
+    except ValidationError as error:
+        return _validation_error(error)
+
+
+async def _read_optional_model[T: BaseModel](
+    request: Request,
+    model: type[T],
+) -> T | JSONResponse:
+    raw_body = await request.body()
+    if not raw_body.strip():
+        return model.model_validate({})
+    try:
+        raw: object = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error("El body debe ser JSON válido.", 400)
+    if not isinstance(raw, dict):
+        return _error("El body debe ser un objeto JSON.", 400)
+    try:
+        return model.model_validate(raw)
+    except ValidationError as error:
+        return _validation_error(error)
+
+
+def _validation_error(error: ValidationError) -> JSONResponse:
+    first = error.errors()[0]
+    field = str(first.get("loc", ["body"])[-1])
+    if field == "courier_id":
+        message = "courierId debe ser un UUID válido."
+    elif field == "delivery_point_ids":
+        message = f"deliveryPointIds debe contener entre 1 y {MAX_ROUTE_STOPS} UUID válidos."
+    elif field == "status":
+        message = "status debe ser PLANNED, IN_PROGRESS, COMPLETED o CANCELLED."
+    else:
+        message = "El body de la solicitud no es válido."
+    return _error(message, 400)
+
+
+def _date_json(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return normalized.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _log_database_error(message: str, error: Exception) -> None:
+    _LOGGER.warning(message, extra={"error_type": type(error).__name__})
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        content={"error": message},
+        status_code=status_code,
+        headers=_NO_STORE,
+    )
+
+
+def _json(
+    content: dict[str, object],
+    *,
+    status_code: int = 200,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    return JSONResponse(
+        content=content,
+        status_code=status_code,
+        headers=headers or _NO_STORE,
+    )
