@@ -733,3 +733,248 @@ async def test_route_creation_rejects_coordinates_changed_after_optimization(
 
 @pytest.mark.asyncio
 async def test_route_creation_rejects_courier_moved_after_optimization(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    plan = OptimizedRoutePlan(
+        courier_id=_COURIER_ID,
+        planned_courier_location=(-77.2811, 1.2136),
+        ordered_delivery_point_ids=(point_id,),
+        planned_delivery_point_coordinates=((point_id, (-77.28, 1.214)),),
+        estimated_duration_minutes=7.0,
+        estimated_distance_meters=800.0,
+        baseline_duration_minutes=7.0,
+        baseline_distance_meters=800.0,
+        geometry={
+            "type": "LineString",
+            "coordinates": [(-77.2811, 1.2136), (-77.28, 1.214)],
+        },
+        geometry_provider=RouteGeometryProvider.OSRM,
+        matrix_source="osrm",
+        warning=None,
+        traffic_ai={"source": "deterministic", "applied": False},
+    )
+
+    async with session_factory() as session:
+        courier = await session.get(Courier, _COURIER_ID)
+        assert courier is not None
+        courier.current_lat = 1.22
+        courier.current_lng = -77.27
+        courier.last_location_at = datetime.now(UTC).replace(tzinfo=None)
+        await session.commit()
+
+    async with session_factory() as session:
+        with pytest.raises(RouteConflictError, match="ubicación del repartidor cambió"):
+            await create_optimized_routes_batch(session, [plan])
+
+    async with session_factory() as session:
+        assert list(await session.scalars(select(Route))) == []
+        point = await session.get(DeliveryPoint, point_id)
+        assert point is not None
+        assert point.route_id is None
+        assert point.sequence_index is None
+
+
+@pytest.mark.asyncio
+async def test_route_recalculation_rejects_a_stop_added_during_routing(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    first_id = await _create_point(session_factory)
+    created = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(first_id)]},
+    )
+    assert created.status_code == 201, created.text
+    route_id = UUID(created.json()["route"]["id"])
+    newly_added_id = await _create_point(session_factory, address="Calle 18 # 20-30")
+
+    # Simula otra operación que agrega una parada después de construir el plan vial.
+    async with session_factory() as session:
+        added_point = await session.get(DeliveryPoint, newly_added_id)
+        assert added_point is not None
+        added_point.route_id = route_id
+        added_point.sequence_index = 1
+        await session.commit()
+
+    plan = OptimizedRoutePlan(
+        courier_id=_COURIER_ID,
+        planned_courier_location=(-77.2811, 1.2136),
+        ordered_delivery_point_ids=(first_id,),
+        planned_delivery_point_coordinates=((first_id, (-77.28, 1.214)),),
+        estimated_duration_minutes=7.0,
+        estimated_distance_meters=800.0,
+        baseline_duration_minutes=7.0,
+        baseline_distance_meters=800.0,
+        geometry={
+            "type": "LineString",
+            "coordinates": [(-77.2811, 1.2136), (-77.28, 1.214)],
+        },
+        geometry_provider=RouteGeometryProvider.OSRM,
+        matrix_source="osrm",
+        warning=None,
+        traffic_ai={"source": "deterministic", "applied": False},
+    )
+
+    async with session_factory() as session:
+        with pytest.raises(RouteConflictError, match="Un pedido cambió"):
+            await recalculate_route(session, route_id, plan, [first_id])
+
+    async with session_factory() as session:
+        added_point = await session.get(DeliveryPoint, newly_added_id)
+        assert added_point is not None
+        assert added_point.route_id == route_id
+        assert added_point.sequence_index == 1
+
+
+@pytest.mark.asyncio
+async def test_route_recalculation_rejects_courier_moved_after_optimization(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    created = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(point_id)]},
+    )
+    assert created.status_code == 201, created.text
+    route_id = UUID(created.json()["route"]["id"])
+    plan = OptimizedRoutePlan(
+        courier_id=_COURIER_ID,
+        planned_courier_location=(-77.2811, 1.2136),
+        ordered_delivery_point_ids=(point_id,),
+        planned_delivery_point_coordinates=((point_id, (-77.28, 1.214)),),
+        estimated_duration_minutes=7.0,
+        estimated_distance_meters=800.0,
+        baseline_duration_minutes=7.0,
+        baseline_distance_meters=800.0,
+        geometry={
+            "type": "LineString",
+            "coordinates": [(-77.2811, 1.2136), (-77.28, 1.214)],
+        },
+        geometry_provider=RouteGeometryProvider.OSRM,
+        matrix_source="osrm",
+        warning=None,
+        traffic_ai={"source": "deterministic", "applied": False},
+    )
+
+    async with session_factory() as session:
+        courier = await session.get(Courier, _COURIER_ID)
+        assert courier is not None
+        courier.current_lat = 1.22
+        courier.current_lng = -77.27
+        courier.last_location_at = datetime.now(UTC).replace(tzinfo=None)
+        await session.commit()
+
+    async with session_factory() as session:
+        with pytest.raises(RouteConflictError, match="ubicación del repartidor cambió"):
+            await recalculate_route(session, route_id, plan, [point_id])
+
+    async with session_factory() as session:
+        route = await session.get(Route, route_id)
+        point = await session.get(DeliveryPoint, point_id)
+        assert route is not None
+        assert route.estimated_duration_minutes == created.json()["route"][
+            "estimatedDurationMinutes"
+        ]
+        assert route.geometry == created.json()["route"]["geometry"]
+        assert point is not None
+        assert point.route_id == route_id
+        assert point.sequence_index == 0
+
+
+@pytest.mark.asyncio
+async def test_navigation_and_eta_use_verified_road_geometry_and_matrix_minutes(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    created = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(point_id)]},
+    )
+    route_id = created.json()["route"]["id"]
+    cookie = {"Cookie": _cookie("courier", _COURIER_ID)}
+
+    navigation = await client.get(f"/api/rutas/{route_id}/navegacion", headers=cookie)
+    assert navigation.status_code == 200, navigation.text
+    navigation_payload = navigation.json()["navigation"]
+    assert navigation_payload["geometryProvider"] == "OSRM"
+    assert navigation_payload["nextDeliveryPointId"] == str(point_id)
+
+    eta = await client.get(f"/api/rutas/{route_id}/eta", headers=cookie)
+    assert eta.status_code == 200, eta.text
+    eta_payload = eta.json()
+    assert eta_payload["approximate"] is True
+    assert eta_payload["matrixSource"] == "osrm"
+    assert eta_payload["etas"] == [
+        {
+            "stopId": str(point_id),
+            "distanceFromCourierMeters": 501.0,
+            "estimatedMinutesFromNow": 6.0,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_route_traffic_profile_only_uses_events_during_that_route(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    created = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(point_id)]},
+    )
+    route_id = UUID(created.json()["route"]["id"])
+    started_at = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+    async with session_factory() as session:
+        route = await session.get(Route, route_id)
+        assert route is not None
+        route.started_at = started_at
+        route.completed_at = started_at + timedelta(minutes=2)
+        session.add_all(
+            [
+                LocationEvent(
+                    courier_id=_COURIER_ID,
+                    lat=1.2136 + (index * 0.0001),
+                    lng=-77.2811 + (index * 0.0003),
+                    recorded_at=started_at + timedelta(seconds=30 * index),
+                )
+                for index in range(3)
+            ]
+        )
+        await session.commit()
+
+    response = await client.get(
+        f"/api/rutas/{route_id}/trafico",
+        headers={"Cookie": _cookie("dispatcher")},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["eventCount"] == 3
+    assert response.json()["segmentCount"] == 1
+    assert response.json()["sampleCount"] == 1
+    assert response.json()["factors"][0]["factor"] == 1
+
+
+@pytest.mark.asyncio
+async def test_route_write_requires_dispatcher_and_rejects_malformed_body(
+    client: httpx.AsyncClient,
+) -> None:
+    denied = await client.post("/api/rutas", json={})
+    assert denied.status_code == 401
+    malformed = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": "not-a-uuid", "deliveryPointIds": []},
+    )
+    assert malformed.status_code == 400
