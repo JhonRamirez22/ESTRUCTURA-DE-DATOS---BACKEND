@@ -392,3 +392,200 @@ async def test_customer_sms_requires_explicit_consent_and_normalizes_colombian_m
         headers=headers,
         json={"smsNotificationsEnabled": False},
     )
+    assert revoked.status_code == 200, revoked.text
+    async with session_factory() as session:
+        saved = await session.get(DeliveryPoint, point_id)
+        assert saved is not None
+        assert saved.customer_phone is None
+        assert saved.sms_notifications_enabled is False
+        notification = await session.scalar(
+            select(CustomerNotificationOutbox).where(
+                CustomerNotificationOutbox.delivery_point_id == point_id
+            )
+        )
+        assert notification is not None
+        assert notification.channel is CustomerNotificationChannel.SMS
+        assert notification.status is CustomerNotificationStatus.CANCELLED
+        assert notification.recipient_phone is None
+        assert notification.subject == ""
+        assert notification.text_body == ""
+
+
+@pytest.mark.asyncio
+async def test_duplicate_order_id_returns_conflict_and_get_is_private(
+    client: httpx.AsyncClient,
+) -> None:
+    headers = {"Cookie": _cookie("dispatcher")}
+    body = {
+        "address": "Calle 10",
+        "lat": 1.2136,
+        "lng": -77.2811,
+        "orderId": "DUPLICATE",
+    }
+    created = await client.post("/api/pedidos", headers=headers, json=body)
+    duplicate = await client.post("/api/pedidos", headers=headers, json=body)
+    point_id = created.json()["deliveryPoint"]["id"]
+    anonymous_read = await client.get(f"/api/pedidos/{point_id}")
+    dispatcher_read = await client.get(f"/api/pedidos/{point_id}", headers=headers)
+
+    assert created.status_code == 201
+    assert duplicate.status_code == 409
+    assert anonymous_read.status_code == 401
+    assert dispatcher_read.status_code == 200
+    assert (
+        dispatcher_read.json()["deliveryPoint"]["trackingToken"]
+        == created.json()["trackingGuide"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_courier_can_only_close_own_active_route_delivery_and_token_is_hidden(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier_id = await _create_courier(session_factory)
+    route_id = uuid4()
+    async with session_factory() as session:
+        session.add(
+            Route(
+                id=route_id,
+                courier_id=courier_id,
+                status=RouteStatus.IN_PROGRESS,
+                estimated_duration_minutes=10,
+                estimated_distance_meters=1_000,
+            )
+        )
+        await session.commit()
+    point_id = await _create_delivery_point(session_factory, route_id=route_id)
+    own_cookie = {"Cookie": _cookie("courier", str(courier_id))}
+    other_cookie = {"Cookie": _cookie("courier", str(uuid4()))}
+
+    forbidden = await client.patch(
+        f"/api/pedidos/{point_id}", headers=other_cookie, json={"status": "DELIVERED"}
+    )
+    changed_fields = await client.patch(
+        f"/api/pedidos/{point_id}",
+        headers=own_cookie,
+        json={"status": "DELIVERED", "orderId": "spoof"},
+    )
+    completed = await client.patch(
+        f"/api/pedidos/{point_id}", headers=own_cookie, json={"status": "DELIVERED"}
+    )
+    repeated = await client.patch(
+        f"/api/pedidos/{point_id}", headers=own_cookie, json={"status": "FAILED"}
+    )
+
+    assert forbidden.status_code == 404
+    assert changed_fields.status_code == 403
+    assert completed.status_code == 200
+    assert completed.json()["deliveryPoint"]["status"] == "DELIVERED"
+    assert "trackingToken" not in completed.json()["deliveryPoint"]
+    assert repeated.status_code == 409
+    async with session_factory() as session:
+        notifications = list((await session.scalars(select(Notification))).all())
+        persisted = await session.get(DeliveryPoint, point_id)
+        assert persisted is not None
+        assert persisted.status is DeliveryPointStatus.DELIVERED
+        assert len(notifications) == 1
+        assert notifications[0].recipient_id == "dispatcher"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_can_edit_and_delete_only_unassigned_pending_orders(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dispatcher = {"Cookie": _cookie("dispatcher")}
+    created = await client.post(
+        "/api/pedidos",
+        headers=dispatcher,
+        json={
+            "address": "Calle 2",
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "orderId": "EDIT-ME",
+            "timeWindow": {"start": "09:00", "end": "12:00"},
+        },
+    )
+    point_id = UUID(created.json()["deliveryPoint"]["id"])
+    updated = await client.patch(
+        f"/api/pedidos/{point_id}",
+        headers=dispatcher,
+        json={"address": "cra 3", "timeWindow": None},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["deliveryPoint"]["address"] == "Carrera 3"
+    assert updated.json()["deliveryPoint"]["timeWindow"] is None
+
+    assigned_id = uuid4()
+    courier_id = await _create_courier(session_factory)
+    async with session_factory() as session:
+        session.add(
+            Route(
+                id=assigned_id,
+                courier_id=courier_id,
+                status=RouteStatus.PLANNED,
+                estimated_duration_minutes=10,
+                estimated_distance_meters=1_000,
+            )
+        )
+        await session.commit()
+    assigned_point_id = await _create_delivery_point(session_factory, route_id=assigned_id)
+
+    blocked_delete = await client.delete(f"/api/pedidos/{assigned_point_id}", headers=dispatcher)
+    blocked_location_edit = await client.patch(
+        f"/api/pedidos/{assigned_point_id}",
+        headers=dispatcher,
+        json={"lat": 1.215, "lng": -77.279},
+    )
+    deleted = await client.delete(f"/api/pedidos/{point_id}", headers=dispatcher)
+    assert blocked_delete.status_code == 409
+    assert blocked_location_edit.status_code == 409
+    assert deleted.status_code == 204
+    async with session_factory() as session:
+        assert await session.get(DeliveryPoint, point_id) is None
+        assigned_point = await session.get(DeliveryPoint, assigned_point_id)
+        assert assigned_point is not None
+        assert assigned_point.lat == 1.2136
+        assert assigned_point.lng == -77.2811
+
+
+@pytest.mark.asyncio
+async def test_address_ai_requires_opt_in_and_rejects_location_outside_pasto(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeAdvisor:
+        async def normalize_address(self, _request: AddressAiRequest) -> AddressAiResponse:
+            return AddressAiResponse(
+                normalizedAddress="Calle 100, Quito",
+                isInPasto=True,
+                confidence=0.99,
+                city="Pasto",
+                department="Nariño",
+                country="Colombia",
+            )
+
+    monkeypatch.setenv("AI_ALLOW_LOCATION_DATA_SHARING", "true")
+    get_settings.cache_clear()
+    app.dependency_overrides[get_address_ai_advisor] = lambda: FakeAdvisor()
+    try:
+        response = await client.post(
+            "/api/pedidos",
+            headers={"Cookie": _cookie("dispatcher")},
+            json={
+                "address": "Calle 100",
+                "lat": 1.2136,
+                "lng": -77.2811,
+                "orderId": "AI-OUTSIDE",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_address_ai_advisor, None)
+        get_settings.cache_clear()
+
+    payload = response.json()
+    assert response.status_code == 201
+    assert payload["deliveryPoint"]["address"] == "Calle 100"
+    assert payload["addressNormalization"]["source"] == "deterministic"
+    assert "no confirmó" in payload["addressNormalization"]["warning"]
