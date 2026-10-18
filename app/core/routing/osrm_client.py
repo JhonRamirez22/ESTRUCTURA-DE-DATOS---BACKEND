@@ -222,3 +222,114 @@ def _read_matrix(value: object, name: str) -> list[list[float | None]]:
 def _validate_matrix_dimensions(matrix: Sequence[Sequence[object]], size: int, name: str) -> None:
     if len(matrix) != size or any(len(row) != size for row in matrix):
         raise OsrmClientError(f"OSRM response has an incomplete {name} matrix")
+
+
+def _read_coordinate(value: object, error_message: str) -> Coordinate:
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or any(
+            isinstance(part, bool) or not isinstance(part, (int, float)) or not math.isfinite(part)
+            for part in value
+        )
+    ):
+        raise OsrmClientError(error_message)
+    longitude, latitude = float(value[0]), float(value[1])
+    if not -180 <= longitude <= 180 or not -90 <= latitude <= 90:
+        raise OsrmClientError(error_message)
+    return longitude, latitude
+
+
+def _read_geometry(value: object) -> GeoJsonLineString:
+    candidate = _read_object(value, "OSRM route response has no geometry")
+    raw_coordinates = candidate.get("coordinates")
+    if candidate.get("type") != "LineString" or not isinstance(raw_coordinates, list):
+        raise OsrmClientError("OSRM route response has invalid geometry")
+    if len(raw_coordinates) < 2:
+        raise OsrmClientError("OSRM route response has invalid geometry")
+    coordinates = [
+        _read_coordinate(item, "OSRM route response has invalid geometry")
+        for item in raw_coordinates
+    ]
+    return {"type": "LineString", "coordinates": coordinates}
+
+
+def _read_waypoints(value: object, expected_count: int) -> list[tuple[Coordinate, float]]:
+    if not isinstance(value, list) or len(value) != expected_count:
+        raise OsrmClientError("OSRM route response has incomplete snapped waypoints")
+
+    waypoints: list[tuple[Coordinate, float]] = []
+    for index, waypoint in enumerate(value):
+        try:
+            candidate = _read_object(
+                waypoint,
+                f"OSRM returned an invalid waypoint at index {index}",
+            )
+            location = _read_coordinate(candidate.get("location"), "invalid snapped location")
+            distance = _read_number(candidate.get("distance"), "waypoint distance")
+        except OsrmClientError as error:
+            raise OsrmClientError(f"OSRM returned an invalid waypoint at index {index}") from error
+
+        if not 0 <= distance <= OSRM_MAX_SNAP_DISTANCE_METERS:
+            raise OsrmClientError(
+                f"OSRM could not snap waypoint {index + 1} to a nearby street within "
+                f"{OSRM_MAX_SNAP_DISTANCE_METERS} m"
+            )
+        waypoints.append((location, distance))
+    return waypoints
+
+
+def _validate_geometry_covers_waypoints(
+    geometry: GeoJsonLineString,
+    waypoints: Sequence[tuple[Coordinate, float]],
+) -> None:
+    first_segment_to_check = 0
+    route_coordinates = geometry["coordinates"]
+    for waypoint_index, (location, _) in enumerate(waypoints):
+        closest_distance = math.inf
+        closest_segment_index = -1
+        for segment_index in range(first_segment_to_check, len(route_coordinates) - 1):
+            distance = _distance_to_segment_meters(
+                location,
+                route_coordinates[segment_index],
+                route_coordinates[segment_index + 1],
+            )
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_segment_index = segment_index
+
+        if closest_segment_index < 0 or closest_distance > _WAYPOINT_GEOMETRY_TOLERANCE_METERS:
+            raise OsrmClientError(
+                f"OSRM route geometry does not pass through waypoint {waypoint_index + 1}"
+            )
+        # La búsqueda monotónica impide que una línea que omite una parada se acepte como ruta.
+        first_segment_to_check = closest_segment_index
+
+
+def _distance_to_segment_meters(
+    point: Coordinate,
+    start: Coordinate,
+    end: Coordinate,
+) -> float:
+    reference_latitude = math.radians((point[1] + start[1] + end[1]) / 3)
+    meters_per_longitude_degree = 111_320 * math.cos(reference_latitude)
+    point_x, point_y = point[0] * meters_per_longitude_degree, point[1] * 110_540
+    start_x, start_y = start[0] * meters_per_longitude_degree, start[1] * 110_540
+    end_x, end_y = end[0] * meters_per_longitude_degree, end[1] * 110_540
+    segment_x, segment_y = end_x - start_x, end_y - start_y
+    length_squared = segment_x**2 + segment_y**2
+    projection = (
+        0.0
+        if length_squared == 0
+        else max(
+            0.0,
+            min(
+                1.0,
+                ((point_x - start_x) * segment_x + (point_y - start_y) * segment_y)
+                / length_squared,
+            ),
+        )
+    )
+    closest_x = start_x + projection * segment_x
+    closest_y = start_y + projection * segment_y
+    return math.hypot(point_x - closest_x, point_y - closest_y)
