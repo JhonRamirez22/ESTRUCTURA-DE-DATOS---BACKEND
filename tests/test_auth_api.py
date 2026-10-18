@@ -306,3 +306,156 @@ async def test_email_login_invalid_unknown_disabled_and_rate_limit(
     limited = await client.post(
         "/api/auth/login", json={"email": "unknown@example.com", "password": "x"}
     )
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == "60"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_provisions_courier_account_and_courier_cannot_escalate(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await client.post("/api/auth/login", json={"accessCode": DISPATCHER_CODE})
+    invalid = await client.put(
+        "/api/auth/courier-account",
+        json={
+            "courierId": "invalid",
+            "email": "courier@example.com",
+            "password": "LEAK-ME",
+        },
+    )
+    assert invalid.status_code == 400
+    assert "LEAK-ME" not in invalid.text
+    created = await client.post(
+        "/api/repartidores",
+        json={
+            "name": "Repartidor",
+            "phone": "3000000000",
+            "account": {
+                "email": "courier@example.com",
+                "password": "Contraseña privada para reparto",
+            },
+        },
+    )
+    assert created.status_code == 201
+    assert "accessCode" not in created.json()
+    duplicate = await client.post(
+        "/api/repartidores",
+        json={
+            "name": "Duplicado",
+            "phone": "3000000001",
+            "account": {
+                "email": "courier@example.com",
+                "password": "Contraseña privada para reparto",
+            },
+        },
+    )
+    assert duplicate.status_code == 409
+    await client.post("/api/auth/logout")
+    login = await client.post(
+        "/api/auth/login",
+        json={
+            "email": "courier@example.com",
+            "password": "Contraseña privada para reparto",
+            "role": "dispatcher",
+            "returnTo": "/dashboard",
+        },
+    )
+    assert login.json()["redirectTo"] == "/repartidor"
+    forbidden = await client.put(
+        "/api/auth/courier-account",
+        json={
+            "courierId": created.json()["courier"]["id"],
+            "email": "other@example.com",
+            "password": "Otra contraseña privada 2026",
+        },
+    )
+    assert forbidden.status_code == 403
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Courier)) == 1
+
+
+@pytest.mark.asyncio
+async def test_page_access_is_decided_by_backend_without_exposing_role(
+    client: httpx.AsyncClient,
+) -> None:
+    anonymous_access = await client.get("/api/auth/access", params={"path": "/dashboard"})
+    anonymous_login = await client.get("/api/auth/access", params={"path": "/acceso"})
+    assert anonymous_access.json() == {"allowed": False, "redirectTo": "/acceso"}
+    assert anonymous_login.json() == {"allowed": True, "redirectTo": None}
+
+    await client.post("/api/auth/login", json={"accessCode": DISPATCHER_CODE})
+    dispatcher_access = await client.get("/api/auth/access", params={"path": "/dashboard"})
+    courier_access = await client.get("/api/auth/access", params={"path": "/repartidor"})
+    access_page = await client.get("/api/auth/access", params={"path": "/acceso"})
+
+    assert dispatcher_access.json() == {"allowed": True, "redirectTo": None}
+    assert courier_access.json() == {"allowed": False, "redirectTo": "/dashboard"}
+    assert access_page.json() == {"allowed": False, "redirectTo": "/dashboard"}
+    assert "role" not in courier_access.json()
+    assert "courierId" not in courier_access.json()
+
+
+@pytest.mark.asyncio
+async def test_page_access_rejects_unmanaged_paths(client: httpx.AsyncClient) -> None:
+    response = await client.get("/api/auth/access", params={"path": "/api/pedidos"})
+
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_courier_login_verifies_database_hash_and_limits_redirect_scope(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier_id = "f8fbc95f-643e-4fb3-9b82-8c42e0707311"
+    access_code = create_courier_access_code(courier_id)
+    async with session_factory() as session:
+        courier = Courier(
+            id=UUID(courier_id),
+            name="Repartidor de prueba",
+            phone="3000000000",
+            status=CourierStatus.AVAILABLE,
+            credential=CourierCredential(access_code_hash=hash_courier_access_code(access_code)),
+        )
+        session.add(courier)
+        await session.commit()
+
+    response = await client.post(
+        "/api/auth/login",
+        json={"accessCode": access_code, "returnTo": "/dashboard"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"authenticated": True, "redirectTo": "/repartidor"}
+    assert "courierId" not in response.json()
+    assert "role" not in response.json()
+    assert (await client.get("/api/auth/session")).json() == {"authenticated": True}
+
+
+@pytest.mark.asyncio
+async def test_invalid_code_and_logout_preserve_existing_http_contract(
+    client: httpx.AsyncClient,
+) -> None:
+    invalid = await client.post("/api/auth/login", json={"accessCode": "incorrecto"})
+    logout = await client.post("/api/auth/logout")
+
+    assert invalid.status_code == 401
+    assert invalid.json() == {"error": "Código de acceso inválido."}
+    assert logout.status_code == 200
+    assert logout.json() == {"ok": True}
+    assert "Max-Age=0" in logout.headers["set-cookie"]
+    assert "HttpOnly" in logout.headers["set-cookie"]
+    assert logout.headers["cache-control"] == "no-store, private"
+
+
+@pytest.mark.asyncio
+async def test_external_return_to_is_rejected(
+    client: httpx.AsyncClient,
+) -> None:
+    response = await client.post(
+        "/api/auth/login",
+        json={"accessCode": DISPATCHER_CODE, "returnTo": "//evil.example"},
+    )
+
+    assert response.json() == {"authenticated": True, "redirectTo": "/dashboard"}
