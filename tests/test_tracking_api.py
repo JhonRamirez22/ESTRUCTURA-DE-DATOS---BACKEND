@@ -249,3 +249,128 @@ async def test_stale_location_and_delivered_point_never_expose_courier_or_route(
     client: httpx.AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
     providers: tuple[FakeMatrixProvider, FakeRouteProvider],
+) -> None:
+    courier, _route, target, _private_point = await _create_active_route(
+        session_factory,
+        location_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=10),
+    )
+
+    stale = await client.get(f"/api/seguimiento?guia={target.tracking_token}")
+    stale_route = stale.json()["tracking"]["route"]
+    assert stale_route["courier"]["currentLat"] is None
+    assert stale_route["geometry"] is None
+    assert "ubicación reciente" in stale_route["navigationWarning"]
+    assert providers[0].calls == 0
+    assert providers[1].calls == []
+
+    async with session_factory() as session:
+        point = await session.get(DeliveryPoint, target.id)
+        assert point is not None
+        point.status = DeliveryPointStatus.DELIVERED
+        await session.commit()
+
+    delivered = await client.get(f"/api/seguimiento?guia={target.tracking_token}")
+    delivered_route = delivered.json()["tracking"]["route"]
+    assert delivered_route["courier"]["currentLat"] is None
+    assert delivered_route["geometry"] is None
+    assert delivered_route["estimatedMinutesFromNow"] is None
+    assert str(courier.id) not in delivered.text
+    assert providers[0].calls == 0
+    assert providers[1].calls == []
+
+
+@pytest.mark.asyncio
+async def test_routing_failures_return_warnings_without_straight_line_geometry(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier, route, target, _private_point = await _create_active_route(session_factory)
+    del courier, route
+    matrix = FakeMatrixProvider(fails=True)
+    road_route = FakeRouteProvider(fails=True)
+    app.dependency_overrides[get_routing_providers] = lambda: (matrix, road_route)
+    try:
+        response = await client.get(f"/api/seguimiento?guia={target.tracking_token}")
+    finally:
+        app.dependency_overrides.pop(get_routing_providers, None)
+
+    tracking_route = response.json()["tracking"]["route"]
+    assert response.status_code == 200
+    assert tracking_route["geometry"] is None
+    assert "no se muestra una línea recta" in tracking_route["navigationWarning"].lower()
+    assert "no se estimó con distancias en línea recta" in tracking_route["estimateWarning"]
+    assert tracking_route["estimatedMinutesFromNow"] is None
+
+
+async def _create_delivery_point(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    address: str = "Carrera 25 #18-20",
+) -> DeliveryPoint:
+    point = DeliveryPoint(
+        id=uuid4(),
+        address=address,
+        lat=1.215,
+        lng=-77.279,
+        status=DeliveryPointStatus.PENDING,
+        order_id=f"ORDER-{uuid4()}",
+        tracking_token=f"TRACK-{uuid4()}",
+    )
+    async with session_factory() as session:
+        session.add(point)
+        await session.commit()
+        await session.refresh(point)
+    return point
+
+
+async def _create_active_route(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    location_at: datetime | None = None,
+) -> tuple[Courier, Route, DeliveryPoint, DeliveryPoint]:
+    courier = Courier(
+        id=_COURIER_ID,
+        name="Nombre de repartidor privado",
+        phone="+573001234567",
+        status=CourierStatus.ON_ROUTE,
+        current_lat=1.213612,
+        current_lng=-77.281145,
+        last_location_at=location_at or datetime.now(UTC).replace(tzinfo=None),
+    )
+    route = Route(
+        id=uuid4(),
+        courier_id=courier.id,
+        status=RouteStatus.IN_PROGRESS,
+        estimated_duration_minutes=16,
+        estimated_distance_meters=2_000,
+    )
+    target = DeliveryPoint(
+        id=uuid4(),
+        address="Destino que corresponde a la guía",
+        lat=1.215,
+        lng=-77.279,
+        status=DeliveryPointStatus.EN_ROUTE,
+        order_id=f"ORDER-{uuid4()}",
+        tracking_token=f"TRACK-{uuid4()}",
+        customer_email="cliente-privado@example.com",
+        email_notifications_enabled=True,
+        customer_phone="+573009876543",
+        sms_notifications_enabled=True,
+        route_id=route.id,
+        sequence_index=0,
+    )
+    private_point = DeliveryPoint(
+        id=uuid4(),
+        address="Otra dirección privada que no se debe revelar",
+        lat=1.216,
+        lng=-77.276,
+        status=DeliveryPointStatus.PENDING,
+        order_id=f"ORDER-{uuid4()}",
+        tracking_token=f"TRACK-{uuid4()}",
+        route_id=route.id,
+        sequence_index=1,
+    )
+    async with session_factory() as session:
+        session.add_all([courier, route, target, private_point])
+        await session.commit()
+    return courier, route, target, private_point
