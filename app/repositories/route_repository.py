@@ -144,3 +144,148 @@ class RouteRepository:
         return await self._session.scalar(
             select(Route).where(Route.id == route_id).with_for_update()
         )
+
+    async def lock_route_with_delivery_points(self, route_id: UUID) -> Route | None:
+        return await self._session.scalar(
+            select(Route)
+            .where(Route.id == route_id)
+            .options(selectinload(Route.delivery_points))
+            .with_for_update()
+        )
+
+    async def lock_route_delivery_points(self, route_id: UUID) -> list[DeliveryPoint]:
+        points = await self._session.scalars(
+            select(DeliveryPoint)
+            .where(DeliveryPoint.route_id == route_id)
+            .with_for_update()
+        )
+        return list(points.all())
+
+    async def release_active_delivery_points(
+        self,
+        route_id: UUID,
+        active_statuses: Sequence[DeliveryPointStatus],
+        *,
+        reset_to_pending: bool,
+    ) -> None:
+        if reset_to_pending:
+            await self._session.execute(
+                update(DeliveryPoint)
+                .where(
+                    DeliveryPoint.route_id == route_id,
+                    DeliveryPoint.status.in_(active_statuses),
+                )
+                .values(
+                    route_id=None,
+                    sequence_index=None,
+                    status=DeliveryPointStatus.PENDING,
+                )
+            )
+            return
+        await self._session.execute(
+            update(DeliveryPoint)
+            .where(
+                DeliveryPoint.route_id == route_id,
+                DeliveryPoint.status.in_(active_statuses),
+            )
+            .values(route_id=None, sequence_index=None)
+        )
+
+    async def mark_pending_delivery_points_en_route(self, route_id: UUID) -> None:
+        await self._session.execute(
+            update(DeliveryPoint)
+            .where(
+                DeliveryPoint.route_id == route_id,
+                DeliveryPoint.status == DeliveryPointStatus.PENDING,
+            )
+            .values(status=DeliveryPointStatus.EN_ROUTE)
+        )
+
+    async def try_assign_delivery_point(
+        self,
+        *,
+        route_id: UUID,
+        point_id: UUID,
+        allowed_statuses: Sequence[DeliveryPointStatus],
+        expected_latitude: float,
+        expected_longitude: float,
+        sequence_index: int,
+    ) -> bool:
+        updated_id = await self._session.scalar(
+            update(DeliveryPoint)
+            .where(
+                DeliveryPoint.id == point_id,
+                DeliveryPoint.route_id.is_(None),
+                DeliveryPoint.status.in_(allowed_statuses),
+                DeliveryPoint.lat == expected_latitude,
+                DeliveryPoint.lng == expected_longitude,
+            )
+            .values(route_id=route_id, sequence_index=sequence_index)
+            .returning(DeliveryPoint.id)
+        )
+        return updated_id == point_id
+
+    async def load_route(self, route_id: UUID) -> Route | None:
+        return await self._session.scalar(
+            select(Route)
+            .where(Route.id == route_id)
+            .options(selectinload(Route.courier), selectinload(Route.delivery_points))
+            .execution_options(populate_existing=True)
+        )
+
+    async def list_route_revisions(self, route_id: UUID) -> list[RouteRevision]:
+        revisions = await self._session.scalars(
+            select(RouteRevision)
+            .where(RouteRevision.route_id == route_id)
+            .order_by(RouteRevision.revision_number.asc())
+        )
+        return list(revisions.all())
+
+    async def route_ids_with_revisions(self, route_ids: Sequence[UUID]) -> set[UUID]:
+        if not route_ids:
+            return set()
+        revision_route_ids = await self._session.scalars(
+            select(RouteRevision.route_id)
+            .where(RouteRevision.route_id.in_(route_ids))
+            .distinct()
+        )
+        return set(revision_route_ids.all())
+
+    async def next_route_revision_number(self, route_id: UUID) -> int:
+        latest_number = await self._session.scalar(
+            select(func.max(RouteRevision.revision_number)).where(
+                RouteRevision.route_id == route_id
+            )
+        )
+        return (latest_number or 0) + 1
+
+    def add_route_revision(self, revision: RouteRevision) -> None:
+        self._session.add(revision)
+
+    async def prune_route_revisions(self, route_id: UUID, keep: int) -> None:
+        revision_ids = list(
+            (
+                await self._session.scalars(
+                    select(RouteRevision.id)
+                    .where(RouteRevision.route_id == route_id)
+                    .order_by(RouteRevision.revision_number.desc())
+                    .limit(keep)
+                )
+            ).all()
+        )
+        await self._session.execute(
+            delete(RouteRevision).where(
+                RouteRevision.route_id == route_id,
+                RouteRevision.id.not_in(revision_ids),
+            )
+        )
+
+    async def delete_route_revision(self, revision_id: UUID) -> None:
+        await self._session.execute(
+            delete(RouteRevision).where(RouteRevision.id == revision_id)
+        )
+
+    async def delete_route_revisions(self, route_id: UUID) -> None:
+        await self._session.execute(
+            delete(RouteRevision).where(RouteRevision.route_id == route_id)
+        )
