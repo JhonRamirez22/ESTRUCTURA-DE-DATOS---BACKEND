@@ -300,3 +300,304 @@ async def recalculate_route_endpoint(
         matrix_provider, route_provider = providers
         plan = await build_optimized_route_plan(
             session,
+            route.courier_id,
+            combined_ids,
+            matrix_provider=cast(MatrixProvider, matrix_provider),
+            route_provider=cast(RouteProvider, route_provider),
+            traffic_ai_advisor=advisor,
+            traffic_provider=traffic,
+            allow_on_route_courier=True,
+            existing_route_id=parsed_id,
+        )
+        result = await recalculate_route(session, parsed_id, plan, previous_ids)
+        body = _operation_json(result)
+        body["recalculated"] = True
+        route_payload = body.get("route")
+        if isinstance(route_payload, dict):
+            route_payload["canUndo"] = True
+        return _json(body, headers=_NO_STORE)
+    except RoutePlanningError as error:
+        return _error(str(error), error.status_code)
+    except IntegrityError as error:
+        await session.rollback()
+        _log_database_error("Conflicto al recalcular la ruta", error)
+        return _error("Un pedido cambió mientras se recalculaba la ruta.", 409)
+    except (RoutingClientError, TimeoutError) as error:
+        _LOGGER.warning(
+            "No se pudo obtener la ruta vial",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error(
+            "El proveedor vial no pudo calcular la matriz o el trazado. "
+            "La ruta no se guardó sin calles verificadas.",
+            502,
+        )
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_database_error("No se pudo recalcular la ruta", error)
+        return _error("No se pudo recalcular la ruta.", 500)
+
+
+@router.post("/{route_id}/deshacer-recalculo")
+async def undo_route_recalculation_endpoint(
+    route_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> JSONResponse:
+    if claims is None:
+        return _error("Debes iniciar sesión para continuar.", 401)
+    if claims["role"] != "dispatcher":
+        return _error("Se requiere una sesión de despacho.", 403)
+    parsed_id = _parse_uuid(route_id)
+    if parsed_id is None:
+        return _error("La ruta no existe.", 404)
+    try:
+        result = await undo_route_recalculation(session, parsed_id)
+        return _json(
+            {
+                "route": _route_json(result.route, dispatcher=True, can_undo=result.can_undo),
+                "undone": True,
+                "canUndo": result.can_undo,
+                "releasedDeliveryPointIds": [
+                    str(point_id) for point_id in result.released_delivery_point_ids
+                ],
+            },
+            headers=_NO_STORE,
+        )
+    except RoutePlanningError as error:
+        return _error(str(error), error.status_code)
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_database_error("No se pudo restaurar el recálculo de la ruta", error)
+        return _error("No se pudo restaurar el recálculo de la ruta.", 500)
+
+
+@router.get("/{route_id}/navegacion")
+async def get_route_navigation(
+    route_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    providers: Annotated[
+        tuple[CachedMatrixProvider, CachedRouteProvider],
+        Depends(get_routing_providers),
+    ],
+) -> JSONResponse:
+    authorized = _authorize_route_id(route_id, claims)
+    if isinstance(authorized, JSONResponse):
+        return authorized
+    route_uuid, _dispatcher = authorized
+    try:
+        route = await RouteRepository(session).load_route(route_uuid)
+        if route is None:
+            return _error("La ruta no existe.", 404)
+        if (
+            claims is not None
+            and claims["role"] == "courier"
+            and route.courier_id != _claim_courier_id(claims)
+        ):
+            return _error("La ruta no existe.", 404)
+        if route.status not in {RouteStatus.PLANNED, RouteStatus.IN_PROGRESS}:
+            return _error("La ruta no está disponible para navegación.", 409)
+
+        courier = route.courier
+        if courier.current_lat is None or courier.current_lng is None:
+            return _error("El repartidor todavía no tiene una ubicación actual.", 409)
+        if not is_courier_location_fresh(courier.last_location_at):
+            return _error(
+                "La ubicación GPS está desactualizada. Comparte una posición reciente "
+                "para actualizar el trazado.",
+                409,
+            )
+        if not is_within_pasto_service_area(courier.current_lat, courier.current_lng):
+            return _error("La última ubicación está fuera de Pasto.", 409)
+
+        remaining = sorted(
+            (
+                point
+                for point in route.delivery_points
+                if point.status.value in {"PENDING", "EN_ROUTE"}
+            ),
+            key=lambda point: point.sequence_index if point.sequence_index is not None else 0,
+        )
+        if not remaining:
+            return _json({"navigation": None})
+        coordinates: list[Coordinate] = [(courier.current_lng, courier.current_lat)]
+        coordinates.extend((point.lng, point.lat) for point in remaining)
+        _matrix_provider, route_provider = providers
+        result = await cast(RouteProvider, route_provider).get_route(coordinates)
+        if result["geometry_provider"] not in {"OSRM", "ORS"}:
+            return _error(
+                "El proveedor no verificó una geometría vial; no se mostrará una línea recta.",
+                503,
+            )
+        return _json(
+            {
+                "navigation": {
+                    "geometry": result["geometry"],
+                    "geometryProvider": result["geometry_provider"],
+                    "distanceMeters": result["distance_meters"],
+                    "durationMinutes": result["duration_minutes"],
+                    "source": result["geometry_provider"].lower(),
+                    "nextDeliveryPointId": str(remaining[0].id),
+                    "remainingDeliveryPointIds": [str(point.id) for point in remaining],
+                }
+            },
+            headers=_NO_STORE,
+        )
+    except RoutingClientError as error:
+        _LOGGER.warning(
+            "No se pudo actualizar la navegación vial",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error(
+            "No se pudo obtener una ruta por calles. "
+            "La navegación no se reemplazó por una línea recta.",
+            503,
+        )
+    except SQLAlchemyError as error:
+        _log_database_error("No se pudo consultar la navegación", error)
+        return _error("No se pudo actualizar la navegación de la ruta.", 500)
+
+
+@router.get("/{route_id}/eta")
+async def get_route_eta(
+    route_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    providers: Annotated[
+        tuple[CachedMatrixProvider, CachedRouteProvider],
+        Depends(get_routing_providers),
+    ],
+) -> JSONResponse:
+    authorized = _authorize_route_id(route_id, claims)
+    if isinstance(authorized, JSONResponse):
+        return authorized
+    route_uuid, _dispatcher = authorized
+    try:
+        route = await RouteRepository(session).load_route(route_uuid)
+        if route is None:
+            return _error("La ruta no existe.", 404)
+        if (
+            claims is not None
+            and claims["role"] == "courier"
+            and route.courier_id != _claim_courier_id(claims)
+        ):
+            return _error("La ruta no existe.", 404)
+
+        points = sorted(
+            (
+                point
+                for point in route.delivery_points
+                if point.status.value in {"PENDING", "EN_ROUTE"}
+            ),
+            key=lambda point: point.sequence_index if point.sequence_index is not None else 0,
+        )
+        estimated_at = _date_json(datetime.now(UTC))
+        if not points:
+            return _json(
+                {
+                    "approximate": False,
+                    "estimatedAt": estimated_at,
+                    "etas": [],
+                    "matrixSource": None,
+                    "routeId": str(route.id),
+                    "warning": "No hay paradas pendientes para estimar.",
+                }
+            )
+
+        courier = route.courier
+        if (
+            courier.current_lat is None
+            or courier.current_lng is None
+            or not is_courier_location_fresh(courier.last_location_at)
+            or not is_within_pasto_service_area(courier.current_lat, courier.current_lng)
+        ):
+            return _error(
+                "El courier no tiene una posición reciente dentro de Pasto para calcular el ETA.",
+                409,
+            )
+
+        coordinates: list[Coordinate] = [(courier.current_lng, courier.current_lat)]
+        coordinates.extend((point.lng, point.lat) for point in points)
+        matrix_provider, _route_provider = providers
+        matrix_result = await cast(MatrixProvider, matrix_provider).get_duration_matrix(coordinates)
+        etas = estimate_stop_etas_from_matrix(
+            [str(point.id) for point in points],
+            matrix_result["durations_minutes"],
+            matrix_result.get("distances_meters"),
+        )
+        warnings = [
+            matrix_result.get("warning"),
+            "Los tiempos son estimaciones de la red vial; no incluyen tráfico en vivo.",
+        ]
+        if any(eta.estimated_minutes_from_now is None for eta in etas):
+            warnings.append("No se encontró conexión vial para una o más paradas de la secuencia.")
+        return _json(
+            {
+                "approximate": True,
+                "estimatedAt": estimated_at,
+                "etas": [
+                    {
+                        "stopId": eta.stop_id,
+                        "distanceFromCourierMeters": eta.distance_from_courier_meters,
+                        "estimatedMinutesFromNow": eta.estimated_minutes_from_now,
+                    }
+                    for eta in etas
+                ],
+                "matrixSource": matrix_result["source"],
+                "routeId": str(route.id),
+                "warning": " ".join(item for item in warnings if item),
+            }
+        )
+    except RoutingClientError as error:
+        _LOGGER.warning(
+            "No se pudo calcular la matriz del ETA",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error(
+            "El ETA vial no está disponible temporalmente; no se estimó en línea recta.", 503
+        )
+    except ValueError as error:
+        _LOGGER.warning(
+            "La matriz del ETA no cumple el contrato",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error("El ETA vial no está disponible temporalmente.", 503)
+    except SQLAlchemyError as error:
+        _log_database_error("No se pudo calcular el ETA de la ruta", error)
+        return _error("No se pudo calcular el ETA de la ruta.", 500)
+
+
+@router.get("/{route_id}/trafico")
+async def get_route_traffic_profile(
+    route_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> JSONResponse:
+    authorized = _authorize_route_id(route_id, claims)
+    if isinstance(authorized, JSONResponse):
+        return authorized
+    route_uuid, _dispatcher = authorized
+    try:
+        repository = RouteRepository(session)
+        route = await repository.get_route_record(route_uuid)
+        if route is None:
+            return _error("La ruta no existe.", 404)
+        if (
+            claims is not None
+            and claims["role"] == "courier"
+            and route.courier_id != _claim_courier_id(claims)
+        ):
+            return _error("La ruta no existe.", 404)
+        if route.started_at is None:
+            return _error(
+                "La ruta no tiene un inicio registrado; no se puede aislar su historial GPS.",
+                409,
+            )
+        geometry = _read_route_geometry(route.geometry)
+        if geometry is None:
+            return _error(
+                "La ruta no tiene geometría vial para construir segmentos.",
+                409,
+            )
+        segments = derive_road_segments(geometry, route.estimated_duration_minutes)
