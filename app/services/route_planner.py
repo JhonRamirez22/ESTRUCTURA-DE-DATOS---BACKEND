@@ -554,3 +554,281 @@ async def create_optimized_routes_batch(
                 raise RuntimeError("La ruta recién creada no pudo volver a consultarse.")
             results.append(
                 RouteOperationResult(
+                    saved_route,
+                    plan.ordered_delivery_point_ids,
+                    plan.matrix_source,
+                    plan.warning,
+                    plan.traffic_ai,
+                    sum(queued_by_channel.values()),
+                    tuple(queued_by_channel.items()),
+                    plan.live_traffic,
+                )
+            )
+    return results
+
+
+async def recalculate_route(
+    session: AsyncSession,
+    route_id: UUID,
+    plan: OptimizedRoutePlan,
+    previous_active_ids: Sequence[UUID],
+) -> RouteOperationResult:
+    await session.rollback()
+    async with session.begin():
+        repository = RouteRepository(session)
+        notification_repository = NotificationRepository(session)
+        route = await repository.lock_route(route_id)
+        if route is None:
+            raise RoutePlanningError("La ruta no existe.", 404)
+        if route.status not in _ACTIVE_ROUTE_STATUSES:
+            raise RouteConflictError("Solo se pueden recalcular rutas planificadas o en progreso.")
+        if route.courier_id != plan.courier_id:
+            raise RouteConflictError("La ruta cambió de repartidor mientras se recalculaba.")
+
+        courier = await repository.get_courier(route.courier_id, for_update=True)
+        if courier is None:
+            raise RoutePlanningError("El courier de la ruta ya no existe.", 404)
+        _validate_courier_position(courier, plan, datetime.now(UTC).replace(tzinfo=None))
+
+        all_route_points = await repository.lock_route_delivery_points(route_id)
+        active_points = [
+            point for point in all_route_points if point.status in _ACTIVE_POINT_STATUSES
+        ]
+        currently_active_ids = {point.id for point in active_points}
+        if currently_active_ids != set(previous_active_ids):
+            raise RouteConflictError("Un pedido cambió mientras se recalculaba la ruta.")
+        snapshot = _build_route_revision_snapshot(route, active_points)
+        repository.add_route_revision(
+            RouteRevision(
+                route_id=route_id,
+                revision_number=await repository.next_route_revision_number(route_id),
+                snapshot=snapshot,
+            )
+        )
+        await session.flush()
+        await repository.prune_route_revisions(route_id, MAX_ROUTE_REVISIONS)
+        next_sequence_index = max(
+            (
+                point.sequence_index
+                for point in all_route_points
+                if point.status in _TERMINAL_POINT_STATUSES
+                and point.sequence_index is not None
+            ),
+            default=-1,
+        ) + 1
+
+        # Las paradas terminales conservan su vínculo e índice como historial de la ruta.
+        await repository.release_active_delivery_points(
+            route_id,
+            _ACTIVE_POINT_STATUSES,
+            reset_to_pending=False,
+        )
+        await _assign_delivery_points(
+            session,
+            route_id,
+            plan.ordered_delivery_point_ids,
+            expected_coordinates=dict(plan.planned_delivery_point_coordinates),
+            allowed_statuses=_ACTIVE_POINT_STATUSES,
+            sequence_start=next_sequence_index,
+        )
+        optimized_at = datetime.now(UTC).replace(tzinfo=None)
+        route.estimated_duration_minutes = plan.estimated_duration_minutes
+        route.estimated_distance_meters = plan.estimated_distance_meters
+        route.baseline_duration_minutes = plan.baseline_duration_minutes
+        route.baseline_distance_meters = plan.baseline_distance_meters
+        route.geometry = plan.geometry
+        route.geometry_provider = plan.geometry_provider
+        route.updated_at = optimized_at
+        route.optimized_at = optimized_at
+        notification_repository.add(
+            Notification(
+                kind=NotificationKind.ROUTE_RECALCULATED,
+                recipient_id=str(route.courier_id),
+                title="Ruta recalculada",
+                message=(
+                    f"La ruta ahora tiene {len(plan.ordered_delivery_point_ids)} paradas activas."
+                ),
+            )
+        )
+        await session.flush()
+        updated = await repository.load_route(route_id)
+        if updated is None:
+            raise RuntimeError("La ruta recalculada no pudo volver a consultarse.")
+        result = RouteOperationResult(
+            updated,
+            plan.ordered_delivery_point_ids,
+            plan.matrix_source,
+            plan.warning,
+            plan.traffic_ai,
+            live_traffic=plan.live_traffic,
+        )
+    return result
+
+
+async def undo_route_recalculation(
+    session: AsyncSession,
+    route_id: UUID,
+) -> RouteUndoResult:
+    """Restaura el snapshot persistido más reciente de una ruta activa, en orden LIFO."""
+    await session.rollback()
+    async with session.begin():
+        repository = RouteRepository(session)
+        route = await repository.lock_route_with_delivery_points(route_id)
+        if route is None:
+            raise RoutePlanningError("La ruta no existe.", 404)
+        if route.status not in _ACTIVE_ROUTE_STATUSES:
+            raise RouteConflictError("Solo se puede restaurar una ruta planificada o en progreso.")
+
+        revisions = await repository.list_route_revisions(route_id)
+        history: Stack[RouteRevision] = Stack()
+        for revision in revisions:
+            history.push(revision)
+        revision_to_restore = history.pop()
+        if revision_to_restore is None:
+            raise RouteConflictError("La ruta no tiene un recálculo anterior para restaurar.")
+        snapshot = _read_route_revision_snapshot(revision_to_restore.snapshot)
+
+        points = await repository.lock_route_delivery_points(route_id)
+        active_points = [point for point in points if point.status in _ACTIVE_POINT_STATUSES]
+        points_by_id = {point.id: point for point in active_points}
+        snapshot_ids = {point_id for point_id, _sequence in snapshot.active_stops}
+        if not snapshot_ids.issubset(points_by_id):
+            raise RouteConflictError(
+                "No se puede restaurar: una parada anterior ya cambió de estado o salió de la ruta."
+            )
+
+        released_points = [
+            point for point in active_points if point.id not in snapshot_ids
+        ]
+        if any(point.status != DeliveryPointStatus.PENDING for point in released_points):
+            raise RouteConflictError(
+                "No se puede restaurar: una parada agregada ya inició su entrega."
+            )
+
+        # Liberar índices primero evita colisiones con la restricción única route_id/sequence_index.
+        for point in active_points:
+            point.sequence_index = None
+        for point in released_points:
+            point.route_id = None
+        await session.flush()
+
+        for point_id, sequence_index in snapshot.active_stops:
+            points_by_id[point_id].sequence_index = sequence_index
+        restored_at = datetime.now(UTC).replace(tzinfo=None)
+        route.estimated_duration_minutes = snapshot.estimated_duration_minutes
+        route.estimated_distance_meters = snapshot.estimated_distance_meters
+        route.baseline_duration_minutes = snapshot.baseline_duration_minutes
+        route.baseline_distance_meters = snapshot.baseline_distance_meters
+        route.geometry = snapshot.geometry
+        route.geometry_provider = snapshot.geometry_provider
+        route.updated_at = restored_at
+        route.optimized_at = restored_at
+        await repository.delete_route_revision(revision_to_restore.id)
+        await session.flush()
+
+        remaining_revisions = await repository.list_route_revisions(route_id)
+        updated = await repository.load_route(route_id)
+        if updated is None:
+            raise RuntimeError("La ruta restaurada no pudo volver a consultarse.")
+        result = RouteUndoResult(
+            route=updated,
+            can_undo=bool(remaining_revisions),
+            released_delivery_point_ids=tuple(point.id for point in released_points),
+        )
+    return result
+
+
+async def update_route_status(
+    session: AsyncSession,
+    route_id: UUID,
+    next_status: RouteStatus,
+) -> Route:
+    await session.rollback()
+    async with session.begin():
+        repository = RouteRepository(session)
+        route = await repository.lock_route_with_delivery_points(route_id)
+        if route is None:
+            raise RoutePlanningError("La ruta no existe.", 404)
+        _validate_transition(route.status, next_status)
+        if next_status == RouteStatus.COMPLETED and any(
+            point.status in _ACTIVE_POINT_STATUSES for point in route.delivery_points
+        ):
+            raise RouteConflictError("No se puede completar una ruta con pedidos pendientes.")
+
+        now = datetime.now(UTC).replace(tzinfo=None)
+        if next_status == RouteStatus.CANCELLED:
+            await repository.release_active_delivery_points(
+                route_id,
+                _ACTIVE_POINT_STATUSES,
+                reset_to_pending=True,
+            )
+        elif next_status == RouteStatus.IN_PROGRESS:
+            await repository.mark_pending_delivery_points_en_route(route_id)
+            if route.started_at is None:
+                route.started_at = now
+
+        route.status = next_status
+        if next_status in {RouteStatus.COMPLETED, RouteStatus.CANCELLED}:
+            route.completed_at = route.completed_at or now
+            await repository.delete_route_revisions(route_id)
+            courier = await repository.get_courier(route.courier_id, for_update=True)
+            if courier is not None:
+                courier.status = CourierStatus.AVAILABLE
+        elif next_status == RouteStatus.IN_PROGRESS:
+            courier = await repository.get_courier(route.courier_id, for_update=True)
+            if courier is not None:
+                courier.status = CourierStatus.ON_ROUTE
+        await session.flush()
+        updated = await repository.load_route(route_id)
+        if updated is None:
+            raise RuntimeError("La ruta actualizada no pudo volver a consultarse.")
+    return updated
+
+
+async def _assign_delivery_points(
+    session: AsyncSession,
+    route_id: UUID,
+    ordered_ids: Sequence[UUID],
+    *,
+    expected_coordinates: Mapping[UUID, Coordinate],
+    allowed_statuses: Sequence[DeliveryPointStatus],
+    sequence_start: int = 0,
+) -> None:
+    repository = RouteRepository(session)
+    for sequence_index, point_id in enumerate(ordered_ids, start=sequence_start):
+        expected_coordinate = expected_coordinates.get(point_id)
+        if expected_coordinate is None:
+            raise RoutePlanningError(
+                f"El plan no contiene las coordenadas originales del punto {point_id}."
+            )
+        longitude, latitude = expected_coordinate
+        assigned = await repository.try_assign_delivery_point(
+            route_id=route_id,
+            point_id=point_id,
+            allowed_statuses=allowed_statuses,
+            expected_latitude=latitude,
+            expected_longitude=longitude,
+            sequence_index=sequence_index,
+        )
+        if not assigned:
+            raise RouteConflictError(
+                f"El delivery point {point_id} cambió mientras se guardaba o calculaba la ruta."
+            )
+
+
+def _validate_courier_position(
+    courier: Courier,
+    plan: OptimizedRoutePlan,
+    now: datetime,
+) -> None:
+    current_location = (
+        (courier.current_lng, courier.current_lat)
+        if courier.current_lng is not None and courier.current_lat is not None
+        else None
+    )
+    if current_location != plan.planned_courier_location:
+        raise RouteConflictError(
+            "La ubicación del repartidor cambió mientras se calculaba la ruta."
+        )
+    if not is_courier_location_fresh(courier.last_location_at, now):
+        raise RouteConflictError(
