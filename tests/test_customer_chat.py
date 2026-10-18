@@ -537,3 +537,272 @@ async def test_http_assistant_accepts_natural_order_follow_up_questions(question
             200,
             json={"choices": [{"message": {"content": "Tu pedido está en seguimiento."}}]},
         )
+
+    assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
+        api_key="test-key",
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(respond),
+    )
+
+    answer = await assistant.answer(
+        delivery_status="EN_ROUTE",
+        route_status="IN_PROGRESS",
+        messages=[CustomerChatTurn(role="user", content=question)],
+    )
+
+    assert answer == "Tu pedido está en seguimiento."
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_http_assistant_accepts_short_follow_up_only_after_an_order_question() -> None:
+    captured: dict[str, object] = {}
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "La guía sigue en ruta."}}]},
+        )
+
+    assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
+        api_key="test-key",
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(respond),
+    )
+    answer = await assistant.answer(
+        delivery_status="EN_ROUTE",
+        route_status="IN_PROGRESS",
+        messages=[
+            CustomerChatTurn(role="user", content="¿Ya fue asignado?"),
+            CustomerChatTurn(role="user", content="¿Y a qué hora?"),
+        ],
+    )
+
+    body = captured["body"]
+    assert isinstance(body, dict)
+    sent_messages = body["messages"]
+    assert isinstance(sent_messages, list)
+    assert [message["content"] for message in sent_messages[1:]] == [
+        "¿Mi pedido ya fue asignado?",
+        "¿Cuánto falta para que llegue mi pedido?",
+    ]
+    assert answer == "La guía sigue en ruta."
+
+
+@pytest.mark.asyncio
+async def test_unrelated_question_breaks_context_for_later_short_follow_up() -> None:
+    calls = 0
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
+        api_key="test-key",
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(respond),
+    )
+    answer = await assistant.answer(
+        delivery_status="PENDING",
+        route_status=None,
+        messages=[
+            CustomerChatTurn(role="user", content="¿Qué pasa con mi pedido?"),
+            CustomerChatTurn(role="user", content="Escríbeme una canción de rock"),
+            CustomerChatTurn(role="user", content="¿Y a qué hora?"),
+        ],
+    )
+
+    assert "Solo puedo ayudarte" in answer
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_old_order_question_does_not_authorize_a_later_unrelated_question() -> None:
+    calls = 0
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
+        api_key="test-key",
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(respond),
+    )
+    answer = await assistant.answer(
+        delivery_status="PENDING",
+        route_status=None,
+        messages=[
+            CustomerChatTurn(role="user", content="¿Qué pasa con mi pedido?"),
+            CustomerChatTurn(role="user", content="Escríbeme una canción de rock"),
+        ],
+    )
+
+    assert "Solo puedo ayudarte" in answer
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_http_assistant_reports_rate_limit_and_timeout_without_remote_details() -> None:
+    async def rate_limited(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, text="private vendor payload")
+
+    assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
+        api_key="test-key",
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(rate_limited),
+    )
+    messages = [CustomerChatTurn(role="user", content="¿Dónde va mi pedido?")]
+
+    with pytest.raises(CustomerChatRateLimitError) as rate_error:
+        await assistant.answer(
+            delivery_status="EN_ROUTE", route_status="IN_PROGRESS", messages=messages
+        )
+    assert "private vendor payload" not in str(rate_error.value)
+
+    async def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("private vendor payload", request=request)
+
+    timed_assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
+        api_key="test-key",
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(timeout),
+    )
+    with pytest.raises(CustomerChatTimeoutError) as timeout_error:
+        await timed_assistant.answer(
+            delivery_status="EN_ROUTE", route_status="IN_PROGRESS", messages=messages
+        )
+    assert "private vendor payload" not in str(timeout_error.value)
+
+
+@pytest.mark.asyncio
+async def test_chat_endpoint_scopes_provider_call_to_tracking_guide_and_order_status(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_order(session_factory)
+    assistant = _FakeAssistant()
+    app.dependency_overrides[get_customer_order_chat] = lambda: assistant
+
+    response = await client.post(
+        "/api/cliente/chat",
+        json={
+            "guide": "secret-guide-123",
+            "messages": [{"role": "user", "content": "¿Qué pasa con mi pedido?"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reply"] == "Tu pedido está registrado."
+    assert response.json()["scope"] == "order"
+    assert "el texto original no se comparte" in response.json()["providerNotice"]
+    assert "TomTom, si está disponible" in response.json()["providerNotice"]
+    assert "El chat se limita a este pedido" in response.json()["providerNotice"]
+    assert assistant.calls[0]["delivery_status"] == "PENDING"
+    assert assistant.calls[0]["route_status"] is None
+    assert assistant.calls[0]["estimated_minutes_from_now"] is None
+    assert response.headers["cache-control"] == "private, no-store, max-age=0"
+
+
+@pytest.mark.asyncio
+async def test_eta_question_gets_only_road_minutes_for_the_matching_order(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    routing_providers: tuple[_FakeMatrixProvider, _FakeRouteProvider],
+) -> None:
+    guide = f"ETA-{uuid4()}"
+    await _create_active_order(session_factory, guide)
+    assistant = _FakeAssistant()
+    app.dependency_overrides[get_customer_order_chat] = lambda: assistant
+
+    response = await client.post(
+        "/api/cliente/chat",
+        json={
+            "guide": guide,
+            "messages": [{"role": "user", "content": "¿Cuánto falta?"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert assistant.calls[0]["estimated_minutes_from_now"] == 7.5
+    assert "TomTom no está configurado" in assistant.calls[0]["estimate_basis"]
+    assert assistant.calls[0]["delivery_status"] == "EN_ROUTE"
+    assert assistant.calls[0]["route_status"] == "IN_PROGRESS"
+    assert routing_providers[0].coordinates == [[(-77.2811, 1.2136), (-77.279, 1.215)]]
+    assert routing_providers[1].coordinates == [[(-77.2811, 1.2136), (-77.279, 1.215)]]
+
+
+@pytest.mark.asyncio
+async def test_eta_question_passes_partial_tomtom_adjustment_to_customer_chat(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    routing_providers: tuple[_FakeMatrixProvider, _FakeRouteProvider],
+) -> None:
+    guide = f"ETA-TOMTOM-{uuid4()}"
+    await _create_active_order(session_factory, guide)
+    assistant = _FakeAssistant()
+    app.dependency_overrides[get_customer_order_chat] = lambda: assistant
+    app.dependency_overrides[get_traffic_service] = lambda: _FakeTrafficProvider()
+
+    response = await client.post(
+        "/api/cliente/chat",
+        json={
+            "guide": guide,
+            "messages": [{"role": "user", "content": "¿Cuánto falta?"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert assistant.calls[0]["estimated_minutes_from_now"] == 11.25
+    assert "TomTom parcial solo al primer tramo" in assistant.calls[0]["estimate_basis"]
+    assert "posteriores usan tiempos viales base" in assistant.calls[0]["estimate_basis"]
+
+
+@pytest.mark.asyncio
+async def test_eta_question_does_not_guess_when_gps_is_stale(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    routing_providers: tuple[_FakeMatrixProvider, _FakeRouteProvider],
+) -> None:
+    guide = f"STALE-ETA-{uuid4()}"
+    await _create_active_order(
+        session_factory,
+        guide,
+        location_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=10),
+    )
+    assistant = _FakeAssistant()
+    app.dependency_overrides[get_customer_order_chat] = lambda: assistant
+
+    response = await client.post(
+        "/api/cliente/chat",
+        json={
+            "guide": guide,
+            "messages": [{"role": "user", "content": "¿Cuánto falta?"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert assistant.calls[0]["estimated_minutes_from_now"] is None
+    assert routing_providers[0].coordinates == []
+    assert routing_providers[1].coordinates == []
+
+
+@pytest.mark.asyncio
+async def test_eta_provider_failure_keeps_order_chat_available_without_guessing(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
