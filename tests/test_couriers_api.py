@@ -301,3 +301,154 @@ async def test_old_location_is_recorded_but_cannot_replace_newer_fix_and_stop_go
             "recordedAt": (latest - timedelta(seconds=2)).isoformat() + "Z",
         },
     )
+    stopped = await client.delete(
+        "/api/repartidores/me/ubicacion",
+        headers={"Cookie": _cookie("courier", str(courier_id))},
+    )
+
+    assert older.status_code == 201
+    assert older.json()["accepted"] is False
+    assert stopped.status_code == 200
+    assert stopped.json()["courier"]["status"] == CourierStatus.OFFLINE.value
+    async with session_factory() as session:
+        courier = await session.get(Courier, courier_id)
+        assert courier is not None
+        assert courier.current_lat == 1.22
+        assert courier.current_lng == -77.27
+        assert courier.last_location_at == latest
+
+
+@pytest.mark.asyncio
+async def test_accepted_gps_queues_one_nearby_notice_per_opted_in_channel(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier_id = await _create_courier(session_factory)
+    route_id = uuid4()
+    point_id = uuid4()
+    async with session_factory() as session:
+        session.add(
+            Route(
+                id=route_id,
+                courier_id=courier_id,
+                status=RouteStatus.IN_PROGRESS,
+                estimated_duration_minutes=8,
+                estimated_distance_meters=900,
+            )
+        )
+        session.add(
+            DeliveryPoint(
+                id=point_id,
+                address="Carrera 25 # 4 sur 65, Pasto",
+                lat=1.214,
+                lng=-77.2811,
+                status=DeliveryPointStatus.EN_ROUTE,
+                order_id="PEDIDO-CERCA",
+                customer_email="cliente@example.com",
+                email_notifications_enabled=True,
+                customer_phone="+573001234567",
+                sms_notifications_enabled=True,
+                tracking_token="guide-nearby-test",
+                route_id=route_id,
+                sequence_index=0,
+            )
+        )
+        await session.commit()
+
+    headers = {"Cookie": _cookie("courier", str(courier_id))}
+    response = await client.post(
+        "/api/repartidores/me/ubicacion",
+        headers=headers,
+        json={
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "recordedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        },
+    )
+    repeated_position = await client.post(
+        "/api/repartidores/me/ubicacion",
+        headers=headers,
+        json={
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "recordedAt": (datetime.now(UTC) + timedelta(seconds=1))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["accepted"] is True
+    assert repeated_position.status_code == 201
+    assert repeated_position.json()["accepted"] is True
+    assert "cliente@example.com" not in response.text
+    assert "+573001234567" not in response.text
+    async with session_factory() as session:
+        notices = list((await session.scalars(select(CustomerNotificationOutbox))).all())
+        assert len(notices) == 2
+        assert {
+            (notice.channel, notice.event_type, notice.delivery_point_id, notice.status)
+            for notice in notices
+        } == {
+            (
+                CustomerNotificationChannel.EMAIL,
+                CustomerNotificationEvent.COURIER_NEAR,
+                point_id,
+                CustomerNotificationStatus.PENDING,
+            ),
+            (
+                CustomerNotificationChannel.SMS,
+                CustomerNotificationEvent.COURIER_NEAR,
+                point_id,
+                CustomerNotificationStatus.PENDING,
+            ),
+        }
+
+
+@pytest.mark.asyncio
+async def test_gps_does_not_notify_nearby_customer_before_route_starts(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier_id = await _create_courier(session_factory)
+    async with session_factory() as session:
+        route = Route(
+            id=uuid4(),
+            courier_id=courier_id,
+            status=RouteStatus.PLANNED,
+            estimated_duration_minutes=8,
+            estimated_distance_meters=900,
+        )
+        point = DeliveryPoint(
+            id=uuid4(),
+            address="Carrera 25 # 4 sur 65, Pasto",
+            lat=1.2136,
+            lng=-77.2811,
+            status=DeliveryPointStatus.PENDING,
+            order_id="INTERNAL-REFERENCE-MUST-NOT-BE-SENT",
+            customer_email="cliente@example.com",
+            email_notifications_enabled=True,
+            customer_phone="+573001234567",
+            sms_notifications_enabled=True,
+            tracking_token="guide-planned-route-test",
+            route_id=route.id,
+            sequence_index=0,
+        )
+        session.add_all([route, point])
+        await session.commit()
+
+    response = await client.post(
+        "/api/repartidores/me/ubicacion",
+        headers={"Cookie": _cookie("courier", str(courier_id))},
+        json={
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "recordedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["accepted"] is True
+    async with session_factory() as session:
+        notices = list((await session.scalars(select(CustomerNotificationOutbox))).all())
+    assert notices == []
