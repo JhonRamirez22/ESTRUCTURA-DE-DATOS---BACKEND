@@ -152,3 +152,157 @@ async def session_factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[As
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'auth.sqlite'}")
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        yield factory
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def client(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[httpx.AsyncClient]:
+    monkeypatch.setenv("AUTH_SECRET", SESSION_SECRET)
+    monkeypatch.setenv("DISPATCHER_ACCESS_CODE", DISPATCHER_CODE)
+    monkeypatch.setenv("NODE_ENV", "test")
+    monkeypatch.setenv("AUTH_LEGACY_CODE_LOGIN_ENABLED", "true")
+    get_settings.cache_clear()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test",
+            headers={"Origin": "http://test"},
+        ) as test_client:
+            async def remember_csrf(response: httpx.Response) -> None:
+                proof = response.headers.get("X-CSRF-Token")
+                if proof:
+                    test_client.headers["X-CSRF-Token"] = proof
+
+            test_client.event_hooks["response"].append(remember_csrf)
+            yield test_client
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_login_rejects_invalid_json_and_non_object_body(
+    client: httpx.AsyncClient,
+) -> None:
+    malformed = await client.post("/api/auth/login", content="{")
+    null_body = await client.post(
+        "/api/auth/login", content="null", headers={"Content-Type": "application/json"}
+    )
+
+    assert malformed.status_code == 400
+    assert malformed.json() == {"error": "El body debe ser JSON válido."}
+    assert null_body.status_code == 400
+    assert null_body.json() == {"error": "El body debe ser un objeto JSON."}
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_login_sets_private_cookie_and_does_not_disclose_claims(
+    client: httpx.AsyncClient,
+) -> None:
+    response = await client.post(
+        "/api/auth/login",
+        json={
+            "role": "courier",
+            "accessCode": DISPATCHER_CODE,
+            "returnTo": "/repartidor",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"authenticated": True, "redirectTo": "/dashboard"}
+    assert "rutas-pasto-session=" in response.headers["set-cookie"]
+    assert "HttpOnly" in response.headers["set-cookie"]
+    assert "SameSite=Strict" in response.headers["set-cookie"]
+    assert response.headers["cache-control"] == "no-store, private"
+    assert "role" not in response.json()
+    assert "courierId" not in response.json()
+    session_response = await client.get("/api/auth/session")
+    assert session_response.json() == {"authenticated": True}
+
+
+@pytest.mark.asyncio
+async def test_email_login_uses_account_role_and_private_session(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTH_LEGACY_CODE_LOGIN_ENABLED", "false")
+    get_settings.cache_clear()
+    async with session_factory() as session:
+        session.add(
+            Account(
+                email="despacho@example.com",
+                password_hash=hash_password("Una contraseña privada 2026"),
+                role="dispatcher",
+            )
+        )
+        await session.commit()
+    rejected = await client.post("/api/auth/login", json={"accessCode": DISPATCHER_CODE})
+    assert rejected.status_code == 400
+    response = await client.post(
+        "/api/auth/login",
+        json={
+            "email": " DESPACHO@EXAMPLE.COM ",
+            "password": "Una contraseña privada 2026",
+            "role": "courier",
+            "returnTo": "//evil.example",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {"authenticated": True, "redirectTo": "/dashboard"}
+    assert "HttpOnly" in response.headers["set-cookie"]
+    assert "password" not in response.text
+    for _ in range(12):
+        successful = await client.post(
+            "/api/auth/login",
+            json={
+                "email": "despacho@example.com",
+                "password": "Una contraseña privada 2026",
+            },
+        )
+        assert successful.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_email_login_invalid_unknown_disabled_and_rate_limit(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        session.add(
+            Account(
+                email="disabled@example.com",
+                password_hash=hash_password("Una contraseña privada 2026"),
+                role="dispatcher",
+                enabled=False,
+            )
+        )
+        await session.commit()
+    malformed = await client.post("/api/auth/login", json={"email": "invalid", "password": "x"})
+    assert malformed.status_code == 400
+    for email in ("disabled@example.com", "unknown@example.com"):
+        response = await client.post(
+            "/api/auth/login",
+            json={
+                "email": email,
+                "password": "Una contraseña privada 2026",
+            },
+        )
+        assert response.status_code == 401
+        assert response.json() == {"error": "Correo o contraseña incorrectos."}
+    for _ in range(9):
+        await client.post("/api/auth/login", json={"email": "unknown@example.com", "password": "x"})
+    limited = await client.post(
+        "/api/auth/login", json={"email": "unknown@example.com", "password": "x"}
+    )
