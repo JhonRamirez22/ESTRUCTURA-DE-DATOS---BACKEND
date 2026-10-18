@@ -276,3 +276,281 @@ async def build_optimized_route_plan(
             "IA de tráfico no configurada o permiso de ubicaciones desactivado; "
             f"se optimizó con tiempos viales de {provider_name}, no con distancia en línea recta."
         ),
+    }
+
+    if traffic_ai_advisor is None and traffic_provider is not None and has_road_times:
+        traffic_ai = {
+            "source": "tomtom-live",
+            "applied": False,
+            "warning": "Se usa TomTom en los tramos muestreados y OSRM para el resto.",
+        }
+    elif traffic_ai_advisor is not None and not has_road_times:
+        traffic_ai["warning"] = (
+            "La IA no se consultó porque la matriz es un fallback, "
+            "no tiempos de calles verificados."
+        )
+    elif traffic_ai_advisor is not None:
+        try:
+            stop_ids = [f"stop-{index}" for index in range(len(coordinates))]
+            road_distances = matrix_result.get("distances_meters")
+            all_candidates = build_route_traffic_candidates(
+                stop_ids,
+                coordinates,
+                baseline_matrix,
+                distance_matrix=(
+                    road_distances
+                    if road_distances is not None
+                    else [[None for _ in coordinates] for _ in coordinates]
+                ),
+                distance_source=matrix_source,
+            )
+            baseline_stop_ids = [stop_ids[index] for index in baseline_route]
+            candidates = select_route_traffic_candidates(
+                all_candidates,
+                baseline_stop_ids,
+                MAX_ROUTE_TRAFFIC_AI_CANDIDATES,
+            )
+            if not candidates:
+                raise ValueError("No hay pares con conexión vial para asesoría de IA.")
+            advice = await traffic_ai_advisor.get_route_advice(
+                RouteTrafficAiRequest(tuple(candidates), current_time.replace(tzinfo=UTC))
+            )
+            supported, ignored_count = filter_route_traffic_adjustments(
+                candidates, advice.adjustments
+            )
+            optimization_matrix = apply_route_traffic_adjustments(
+                baseline_matrix, stop_ids, supported
+            )
+            warnings: list[str] = []
+            if supported:
+                warnings.append(
+                    "El factor de IA es una estimación; el proveedor vial no proporciona "
+                    "tráfico en vivo."
+                )
+            elif ignored_count:
+                warnings.append(
+                    "La IA devolvió tramos ajenos a la ruta; se usaron tiempos base "
+                    "del proveedor vial."
+                )
+            else:
+                warnings.append(
+                    "La IA respondió sin ajustes; se usaron tiempos base del proveedor vial."
+                )
+            if len(candidates) < len(all_candidates):
+                warnings.append(
+                    f"La IA evaluó {len(candidates)} pares priorizados; "
+                    "los demás conservaron tiempos base."
+                )
+            traffic_ai = {
+                "source": "external-ai",
+                "applied": bool(supported),
+                "model": advice.model,
+                "warning": " ".join(warnings),
+            }
+        except Exception as error:
+            # El payload puede incluir coordenadas; solo se registra el tipo del error.
+            _LOGGER.warning(
+                "Falló el asesor de tráfico; se usan tiempos viales base",
+                extra={"error_type": type(error).__name__},
+            )
+            traffic_ai = {
+                "source": "deterministic",
+                "applied": False,
+                "warning": (
+                    "La IA de tráfico no respondió de forma utilizable; se optimizó con "
+                    "tiempos viales base."
+                ),
+            }
+
+    optimized_route = two_opt(optimization_matrix, nearest_neighbor(optimization_matrix, 0))
+    baseline_duration = _route_cost(baseline_matrix, baseline_route)
+    optimized_duration = _route_cost(optimization_matrix, optimized_route)
+    if not math.isfinite(baseline_duration) or not math.isfinite(optimized_duration):
+        raise RouteConflictError("No existe un camino conectado que cubra todos los pedidos.")
+
+    if traffic_provider is None:
+        initial_traffic_warning = (
+            "TomTom Traffic no está configurado; la ruta usa los tiempos viales de base."
+        )
+    elif not has_road_times:
+        initial_traffic_warning = (
+            "TomTom no se consultó porque la matriz no contiene tiempos viales verificados."
+        )
+    else:
+        initial_traffic_warning = (
+            "No se pudo muestrear tráfico vial; se conservan los tiempos de base."
+        )
+    live_traffic: dict[str, object] = {
+        "source": "osrm-baseline",
+        "configured": traffic_provider is not None,
+        "applied": False,
+        "routeSegments": max(0, len(optimized_route) - 1),
+        "sampledSegments": 0,
+        "adjustedSegments": 0,
+        "closedSegments": 0,
+        "coverageRatio": 0.0,
+        "warning": initial_traffic_warning,
+    }
+    ordered_coordinates = [coordinates[index] for index in optimized_route]
+    route_result = await route_provider.get_route(ordered_coordinates)
+    geometry_provider = route_result["geometry_provider"]
+    if geometry_provider not in {"OSRM", "ORS"}:
+        raise RoutePlanningError(
+            "El proveedor no verificó una geometría vial; no se guardará una línea recta.", 502
+        )
+    if traffic_provider is not None and has_road_times:
+        optimization_matrix, live_traffic = await _apply_live_traffic_to_route(
+            traffic_provider,
+            optimization_matrix,
+            optimized_route,
+            ordered_coordinates,
+            route_result["geometry"],
+            baseline_matrix=baseline_matrix,
+        )
+        if live_traffic["applied"]:
+            optimized_route = two_opt(
+                optimization_matrix,
+                nearest_neighbor(optimization_matrix, 0),
+            )
+            optimized_duration = _route_cost(optimization_matrix, optimized_route)
+            if not math.isfinite(optimized_duration):
+                raise RouteConflictError(
+                    "TomTom reportó cierres que impiden conectar todas las paradas con "
+                    "los tramos disponibles. Revisa la ruta antes de asignarla."
+                )
+            final_coordinates = [coordinates[index] for index in optimized_route]
+            if final_coordinates != ordered_coordinates:
+                route_result = await route_provider.get_route(final_coordinates)
+                geometry_provider = route_result["geometry_provider"]
+                if geometry_provider not in {"OSRM", "ORS"}:
+                    raise RoutePlanningError(
+                        "El proveedor no verificó una geometría vial; "
+                        "no se guardará una línea recta.",
+                        502,
+                    )
+        else:
+            traffic_ai["warning"] = (
+                f"{traffic_ai['warning']} {live_traffic['warning']}"
+            ).strip()
+
+    ordered_ids = tuple(delivery_point_ids[index - 1] for index in optimized_route[1:])
+    distances = matrix_result.get("distances_meters")
+    baseline_distance = (
+        _route_cost(distances, baseline_route)
+        if distances is not None and has_road_times
+        else math.inf
+    )
+
+    return OptimizedRoutePlan(
+        courier_id=courier_id,
+        planned_courier_location=(courier.current_lng, courier.current_lat),
+        ordered_delivery_point_ids=ordered_ids,
+        planned_delivery_point_coordinates=tuple(
+            (point_id, (points_by_id[point_id].lng, points_by_id[point_id].lat))
+            for point_id in delivery_point_ids
+        ),
+        estimated_duration_minutes=(
+            optimized_duration
+            if live_traffic["applied"]
+            else route_result["duration_minutes"]
+        ),
+        estimated_distance_meters=route_result["distance_meters"],
+        baseline_duration_minutes=(
+            baseline_duration if has_road_times else None
+        ),
+        baseline_distance_meters=baseline_distance if math.isfinite(baseline_distance) else None,
+        geometry=route_result["geometry"],
+        geometry_provider=RouteGeometryProvider(geometry_provider),
+        matrix_source=str(matrix_source),
+        warning=matrix_result.get("warning"),
+        traffic_ai=traffic_ai,
+        live_traffic=live_traffic,
+    )
+
+
+async def create_optimized_route(
+    session: AsyncSession,
+    plan: OptimizedRoutePlan,
+) -> RouteOperationResult:
+    results = await create_optimized_routes_batch(session, [plan])
+    return results[0]
+
+
+async def create_optimized_routes_batch(
+    session: AsyncSession,
+    plans: Sequence[OptimizedRoutePlan],
+) -> list[RouteOperationResult]:
+    if not plans:
+        raise RoutePlanningError("Se requiere al menos una asignación para aplicar.", 400)
+    courier_ids = [plan.courier_id for plan in plans]
+    if len(set(courier_ids)) != len(courier_ids):
+        raise RouteConflictError("Cada courier solo puede aparecer una vez en assignments.")
+
+    # Preflight SELECTs used an implicit read transaction; restart before locking/persisting.
+    await session.rollback()
+    results: list[RouteOperationResult] = []
+    async with session.begin():
+        repository = RouteRepository(session)
+        notification_repository = NotificationRepository(session)
+        couriers_by_id = await repository.lock_couriers(courier_ids)
+        if len(couriers_by_id) != len(courier_ids):
+            raise RoutePlanningError("Un courier solicitado ya no existe.", 404)
+        if any(
+            couriers_by_id[courier_id].status != CourierStatus.AVAILABLE
+            for courier_id in courier_ids
+        ):
+            raise RouteConflictError("Un courier ya no está AVAILABLE.")
+        planned_at = datetime.now(UTC).replace(tzinfo=None)
+        for plan in plans:
+            _validate_courier_position(couriers_by_id[plan.courier_id], plan, planned_at)
+        if await repository.has_active_route(courier_ids, _ACTIVE_ROUTE_STATUSES):
+            raise RouteConflictError("Un courier ya tiene una ruta planificada o en progreso.")
+
+        for plan in plans:
+            route = Route(
+                courier_id=plan.courier_id,
+                status=RouteStatus.PLANNED,
+                estimated_duration_minutes=plan.estimated_duration_minutes,
+                estimated_distance_meters=plan.estimated_distance_meters,
+                baseline_duration_minutes=plan.baseline_duration_minutes,
+                baseline_distance_meters=plan.baseline_distance_meters,
+                geometry=plan.geometry,
+                geometry_provider=plan.geometry_provider,
+                optimized_at=planned_at,
+            )
+            repository.add_route(route)
+            await session.flush()
+            await _assign_delivery_points(
+                session,
+                route.id,
+                plan.ordered_delivery_point_ids,
+                expected_coordinates=dict(plan.planned_delivery_point_coordinates),
+                allowed_statuses=(DeliveryPointStatus.PENDING,),
+            )
+            assigned_points = await repository.get_delivery_points(
+                plan.ordered_delivery_point_ids
+            )
+            queued_by_channel = {
+                CustomerNotificationChannel.EMAIL: 0,
+                CustomerNotificationChannel.SMS: 0,
+            }
+            for point in assigned_points:
+                for channel in await enqueue_order_assigned_notification(session, point, route.id):
+                    queued_by_channel[channel] += 1
+            notification_repository.add(
+                Notification(
+                    kind=NotificationKind.ROUTE_CREATED,
+                    recipient_id=str(plan.courier_id),
+                    title="Ruta asignada",
+                    message=(
+                        f"Se asignó una ruta con "
+                        f"{len(plan.ordered_delivery_point_ids)} paradas."
+                    ),
+                )
+            )
+            await session.flush()
+            saved_route = await repository.load_route(route.id)
+            if saved_route is None:
+                raise RuntimeError("La ruta recién creada no pudo volver a consultarse.")
+            results.append(
+                RouteOperationResult(
