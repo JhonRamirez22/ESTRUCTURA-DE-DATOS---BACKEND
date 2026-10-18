@@ -316,3 +316,162 @@ async def test_apply_persists_optimized_routes_and_point_order(
     assert result["route"]["status"] == "PLANNED"
     assert result["route"]["geometryProvider"] == "OSRM"
     route_id = UUID(result["route"]["id"])
+    async with session_factory() as session:
+        route = await session.get(Route, route_id)
+        assert route is not None
+        assert route.status == RouteStatus.PLANNED
+        saved_points = list(
+            (
+                await session.scalars(
+                    select(DeliveryPoint)
+                    .where(DeliveryPoint.route_id == route_id)
+                    .order_by(DeliveryPoint.sequence_index)
+                )
+            ).all()
+        )
+        assert len(saved_points) == 2
+        assert [point.sequence_index for point in saved_points] == [0, 1]
+        assert all(point.status == DeliveryPointStatus.PENDING for point in saved_points)
+        assert await session.scalar(select(func.count()).select_from(Notification)) == 1
+
+
+@pytest.mark.asyncio
+async def test_assignment_queues_opted_in_customer_email_and_sms_without_exposing_contact(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier = await _create_courier(session_factory, latitude=1.2136, longitude=-77.2811)
+    point = await _create_point(
+        session_factory,
+        latitude=1.214,
+        longitude=-77.28,
+        customer_email="cliente@example.com",
+        email_notifications_enabled=True,
+        customer_phone="+573001234567",
+        sms_notifications_enabled=True,
+    )
+
+    response = await client.post(
+        "/api/asignaciones/aplicar",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={
+            "assignments": [
+                {"courierId": str(courier.id), "deliveryPointIds": [str(point.id)]}
+            ]
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["customerNotifications"] == {
+        "queued": 2,
+        "channels": {
+            "email": {"queued": 1, "configured": False},
+            "sms": {"queued": 1, "configured": False},
+        },
+        "warning": "Configura SMTP y Twilio SMS para entregar los avisos.",
+    }
+    assert "cliente@example.com" not in response.text
+    assert "3001234567" not in response.text
+    async with session_factory() as session:
+        events = list((await session.scalars(select(CustomerNotificationOutbox))).all())
+        assert len(events) == 2
+        assert {event.channel.value for event in events} == {"EMAIL", "SMS"}
+        assert all(event.event_type is CustomerNotificationEvent.ORDER_ASSIGNED for event in events)
+        assert all(event.status is CustomerNotificationStatus.PENDING for event in events)
+        assert all("cliente@example.com" not in event.text_body for event in events)
+        assert all("3001234567" not in event.text_body for event in events)
+
+
+@pytest.mark.asyncio
+async def test_apply_rolls_back_all_routes_if_a_later_insert_fails(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    couriers = [
+        await _create_courier(session_factory, latitude=1.2136, longitude=-77.2811),
+        await _create_courier(session_factory, latitude=1.22, longitude=-77.27),
+    ]
+    points = [
+        await _create_point(session_factory, latitude=1.214, longitude=-77.28),
+        await _create_point(session_factory, latitude=1.221, longitude=-77.269),
+    ]
+    async with session_factory() as session:
+        await session.execute(
+            text(
+                "CREATE TRIGGER reject_second_route BEFORE INSERT ON routes "
+                "WHEN (SELECT COUNT(*) FROM routes) >= 1 "
+                "BEGIN SELECT RAISE(ABORT, 'simulated insert failure'); END"
+            )
+        )
+        await session.commit()
+
+    response = await client.post(
+        "/api/asignaciones/aplicar",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={
+            "assignments": [
+                {"courierId": str(couriers[0].id), "deliveryPointIds": [str(points[0].id)]},
+                {"courierId": str(couriers[1].id), "deliveryPointIds": [str(points[1].id)]},
+            ]
+        },
+    )
+
+    assert response.status_code == 409
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Route)) == 0
+        assert await session.scalar(select(func.count()).select_from(Notification)) == 0
+        saved_points = list((await session.scalars(select(DeliveryPoint))).all())
+        assert len(saved_points) == 2
+        assert all(point.route_id is None for point in saved_points)
+        assert all(point.sequence_index is None for point in saved_points)
+
+
+async def _create_courier(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    latitude: float,
+    longitude: float,
+    status: CourierStatus = CourierStatus.AVAILABLE,
+) -> Courier:
+    courier = Courier(
+        id=uuid4(),
+        name="Courier de prueba",
+        phone=f"+57300{uuid4().int % 10_000_000:07d}",
+        status=status,
+        current_lat=latitude,
+        current_lng=longitude,
+        last_location_at=datetime.now(UTC).replace(tzinfo=None),
+    )
+    async with session_factory() as session:
+        session.add(courier)
+        await session.commit()
+    return courier
+
+
+async def _create_point(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    latitude: float,
+    longitude: float,
+    customer_email: str | None = None,
+    email_notifications_enabled: bool = False,
+    customer_phone: str | None = None,
+    sms_notifications_enabled: bool = False,
+) -> DeliveryPoint:
+    point = DeliveryPoint(
+        id=uuid4(),
+        address="Punto de prueba, Pasto",
+        lat=latitude,
+        lng=longitude,
+        status=DeliveryPointStatus.PENDING,
+        order_id=f"ORDER-{uuid4()}",
+        customer_email=customer_email,
+        email_notifications_enabled=email_notifications_enabled,
+        customer_phone=customer_phone,
+        sms_notifications_enabled=sms_notifications_enabled,
+        tracking_token=f"TRACK-{uuid4()}",
+    )
+    async with session_factory() as session:
+        session.add(point)
+        await session.commit()
+    return point
