@@ -116,3 +116,120 @@ class HttpRouteTrafficAdvisor:
         return self._request_body_from(request.as_payload())
 
     def _request_body_from(self, payload: dict[str, object]) -> dict[str, object]:
+        if self._protocol == "openai-chat":
+            body: dict[str, object] = {
+                "model": self._model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            _ASSIGNMENT_SYSTEM_PROMPT
+                            if payload.get("task") == "assignment_traffic"
+                            else _SYSTEM_PROMPT
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(payload, ensure_ascii=False),
+                    },
+                ],
+                "temperature": 0.1,
+                "top_p": 1,
+                "max_tokens": 1_024,
+                "stream": False,
+            }
+            if "api.groq.com" in self._api_url:
+                body["response_format"] = {"type": "json_object"}
+            return body
+        return {
+            "contractVersion": payload["contractVersion"],
+            "task": payload["task"],
+            "model": self._model,
+            "input": payload,
+        }
+
+    async def _post(self, payload: dict[str, object]) -> object:
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._timeout_seconds,
+                transport=self._transport,
+            ) as client:
+                response = await client.post(
+                    self._api_url,
+                    headers=headers,
+                    json=self._request_body_from(payload),
+                )
+        except httpx.TimeoutException as error:
+            raise RouteTrafficAiError("La IA de tráfico excedió el tiempo límite.") from error
+        except httpx.HTTPError as error:
+            raise RouteTrafficAiError("No se pudo conectar con la IA de tráfico.") from error
+
+        if response.status_code == 429:
+            raise RouteTrafficAiError("La IA de tráfico alcanzó su límite de solicitudes.")
+        if not response.is_success:
+            raise RouteTrafficAiError(f"La IA de tráfico respondió HTTP {response.status_code}.")
+        try:
+            result: object = response.json()
+            return self._read_chat_content(result) if self._protocol == "openai-chat" else result
+        except (ValueError, TypeError) as error:
+            raise RouteTrafficAiError("La IA de tráfico devolvió JSON inválido.") from error
+
+    @staticmethod
+    def _read_chat_content(payload: object) -> object:
+        if not isinstance(payload, dict):
+            raise ValueError("Chat Completions devolvió una respuesta inválida.")
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise ValueError("Chat Completions no devolvió choices.")
+        message = choices[0].get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            raise ValueError("Chat Completions no devolvió contenido.")
+        content = message["content"].strip()
+        if content.startswith("```") and content.endswith("```"):
+            content = content.removeprefix("```").removesuffix("```").strip()
+            if content[:4].lower() == "json":
+                content = content[4:].strip()
+        return json.loads(content)
+
+
+def get_route_traffic_advisor() -> HttpRouteTrafficAdvisor | None:
+    settings = get_settings()
+    if not (settings.ai_allow_route_location_sharing or settings.ai_allow_location_data_sharing):
+        return None
+    api_url: str
+    api_key: str | None
+    model: str | None
+    if settings.ai_traffic_provider == "groq":
+        api_url = (settings.customer_chat_api_url or GROQ_CHAT_COMPLETIONS_URL).strip()
+        api_key = (
+            settings.customer_chat_api_key.get_secret_value().strip()
+            if settings.customer_chat_api_key is not None
+            else None
+        )
+        model = (settings.customer_chat_model or DEFAULT_GROQ_TRAFFIC_MODEL).strip()
+    else:
+        api_url = (settings.ai_traffic_api_url or "").strip()
+        api_key = (
+            settings.ai_traffic_api_key.get_secret_value().strip()
+            if settings.ai_traffic_api_key is not None
+            else None
+        )
+        model = (settings.ai_traffic_model or "").strip() or None
+    if not api_url or not api_key or not model:
+        return None
+    try:
+        return HttpRouteTrafficAdvisor(
+            api_url=api_url,
+            api_key=api_key or None,
+            model=model,
+            timeout_ms=settings.ai_traffic_timeout_ms,
+        )
+    except ValueError as error:
+        _LOGGER.warning(
+            "La configuración de IA de tráfico no es válida; se usará el algoritmo determinista",
+            extra={"error_type": type(error).__name__},
+        )
+        return None
