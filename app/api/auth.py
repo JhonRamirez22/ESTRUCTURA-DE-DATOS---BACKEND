@@ -327,3 +327,167 @@ def _validate_origin(request: Request, *, required: bool = False) -> None:
 
 async def require_dispatcher_session(
     claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> SessionClaims:
+    if claims is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Debes iniciar sesión para continuar.",
+            headers={"Cache-Control": "private, no-store, max-age=0"},
+        )
+    if claims["role"] != "dispatcher":
+        raise HTTPException(
+            status_code=403,
+            detail="Se requiere una sesión de despacho.",
+            headers={"Cache-Control": "private, no-store, max-age=0"},
+        )
+    return claims
+
+
+async def require_courier_session(
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> SessionClaims:
+    if claims is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Debes iniciar sesión para continuar.",
+            headers={"Cache-Control": "private, no-store, max-age=0"},
+        )
+    if claims["role"] != "courier" or not claims.get("courierId"):
+        raise HTTPException(
+            status_code=403,
+            detail="Se requiere una sesión de repartidor.",
+            headers={"Cache-Control": "private, no-store, max-age=0"},
+        )
+    return claims
+
+
+@router.put("/courier-account")
+async def save_courier_account(
+    request: Request,
+    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    try:
+        data = CourierAccountRequest.model_validate(await request.json())
+    except (ValidationError, json.JSONDecodeError, UnicodeDecodeError):
+        return _error(
+            "Ingresa un correo válido, repartidor y contraseña de 15 a 128 caracteres.", 400
+        )
+    try:
+        courier_id = UUID(data.courier_id)
+    except ValueError:
+        return _error("El identificador del repartidor no es válido.", 400)
+    if await session.get(Courier, courier_id) is None:
+        return _error("El repartidor no existe.", 404)
+    existing = await session.scalar(select(Account).where(Account.courier_id == courier_id))
+    digest = await run_in_threadpool(hash_password, data.password.get_secret_value())
+    if existing is None:
+        session.add(
+            Account(
+                email=data.email,
+                password_hash=digest,
+                role="courier",
+                courier_id=courier_id,
+            )
+        )
+    else:
+        existing.email, existing.password_hash, existing.enabled = data.email, digest, True
+        await revoke_account_sessions(session, existing.id)
+    _audit(session, request, "courier_account_changed", UUID(_claims["accountId"]))
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        return _error("Ese correo ya pertenece a otra cuenta.", 409)
+    return JSONResponse({"email": data.email}, headers={"Cache-Control": "no-store, private"})
+
+
+async def _verify_courier_login(access_code: str, session: AsyncSession) -> str | None:
+    courier_id, separator, secret_part = access_code.partition(".")
+    if not separator or not _UUID_PATTERN.fullmatch(courier_id) or len(secret_part) < 40:
+        return None
+
+    courier_uuid = UUID(courier_id)
+    credential = await CourierRepository(session).get_credential(courier_uuid)
+    if credential is None:
+        return None
+    if not await run_in_threadpool(
+        verify_courier_access_code, access_code, credential.access_code_hash
+    ):
+        return None
+    return str(courier_uuid)
+
+
+def _configured_secret(settings: Settings) -> str | None:
+    secret = (
+        settings.auth_secret.get_secret_value().strip()
+        if settings.auth_secret is not None
+        else None
+    )
+    if secret is None and settings.is_development:
+        secret = DEVELOPMENT_SESSION_SECRET
+    if secret is None or len(secret.encode("utf-8")) < 32:
+        return None
+    return secret
+
+
+def _dispatcher_code(settings: Settings) -> str | None:
+    access_code = (
+        settings.dispatcher_access_code.get_secret_value().strip()
+        if settings.dispatcher_access_code is not None
+        else None
+    )
+    if access_code is None and settings.is_development:
+        return DEVELOPMENT_DISPATCHER_CODE
+    return access_code
+
+
+def _required_page_role(path: str) -> SessionRole | None:
+    if path == "/dashboard" or path.startswith("/dashboard/"):
+        return "dispatcher"
+    if path == "/pedidos" or path.startswith("/pedidos/"):
+        return "dispatcher"
+    if path == "/repartidor" or path.startswith("/repartidor/"):
+        return "courier"
+    return None
+
+
+def _home_for_role(role: SessionRole) -> str:
+    return "/dashboard" if role == "dispatcher" else "/repartidor"
+
+
+def _safe_redirect_target(role: SessionRole, value: object) -> str:
+    fallback = "/dashboard" if role == "dispatcher" else "/repartidor"
+    if not isinstance(value, str) or not value.startswith("/"):
+        return fallback
+    if value.startswith("//") or "\\" in value:
+        return fallback
+
+    target = urlsplit(value)
+    path = target.path
+    if role == "dispatcher":
+        allowed = path == "/dashboard" or path.startswith("/dashboard/")
+        allowed = allowed or path == "/pedidos" or path.startswith("/pedidos/")
+    else:
+        allowed = path == "/repartidor" or path.startswith("/repartidor/")
+    if not allowed or target.scheme or target.netloc:
+        return fallback
+    return urlunsplit(("", "", path, target.query, target.fragment))
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        content={"error": message},
+        status_code=status_code,
+        headers={"Cache-Control": "no-store, private"},
+    )
+
+
+def _audit(
+    session: AsyncSession, request: Request, action: str,
+    account_id: UUID | None = None, *, outcome: str = "allowed",
+) -> None:
+    session.add(SecurityAuditEvent(
+        account_id=account_id, action=action, outcome=outcome,
+        request_id=getattr(request.state, "request_id", str(uuid4())), created_at=utc_now(),
+    ))
