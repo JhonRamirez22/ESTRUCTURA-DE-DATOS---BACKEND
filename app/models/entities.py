@@ -218,3 +218,112 @@ class RouteRevision(Base):
     route: Mapped[Route] = relationship(back_populates="revisions")
 
 
+class LocationEvent(Base):
+    __tablename__ = "location_events"
+    __table_args__ = (
+        Index("location_events_courier_recorded_at_idx", "courier_id", "recorded_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    courier_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("couriers.id", ondelete="CASCADE", onupdate="CASCADE"),
+        nullable=False,
+    )
+    lat: Mapped[float] = mapped_column(Float, nullable=False)
+    lng: Mapped[float] = mapped_column(Float, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, server_default=func.now()
+    )
+
+    courier: Mapped[Courier] = relationship(back_populates="location_events")
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    __table_args__ = (
+        Index("notifications_recipient_created_at_idx", "recipient_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    kind: Mapped[NotificationKind] = mapped_column(
+        _enum_type(NotificationKind, "notification_kind"),
+        nullable=False,
+    )
+    recipient_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    title: Mapped[str] = mapped_column(String(160), nullable=False)
+    message: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, server_default=func.now()
+    )
+    read: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class CustomerNotificationOutbox(Base):
+    """Avisos al cliente con clave idempotente y reintentos fuera de la transacción."""
+
+    __tablename__ = "customer_notification_outbox"
+    __table_args__ = (
+        UniqueConstraint("event_key", name="customer_notification_outbox_event_key_key"),
+        Index(
+            "customer_notification_outbox_status_available_idx",
+            "status",
+            "available_at",
+        ),
+        Index("customer_notification_outbox_delivery_point_idx", "delivery_point_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    delivery_point_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("delivery_points.id", ondelete="CASCADE", onupdate="CASCADE"),
+        nullable=False,
+    )
+    event_key: Mapped[str] = mapped_column(String(220), nullable=False)
+    event_type: Mapped[CustomerNotificationEvent] = mapped_column(
+        _enum_type(CustomerNotificationEvent, "customer_notification_event"), nullable=False
+    )
+    channel: Mapped[CustomerNotificationChannel] = mapped_column(
+        _enum_type(CustomerNotificationChannel, "customer_notification_channel"),
+        nullable=False,
+        default=CustomerNotificationChannel.EMAIL,
+        server_default=CustomerNotificationChannel.EMAIL.value,
+    )
+    recipient_email: Mapped[str | None] = mapped_column(String(320))
+    recipient_phone: Mapped[str | None] = mapped_column(String(20))
+    subject: Mapped[str] = mapped_column(String(180), nullable=False)
+    text_body: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[CustomerNotificationStatus] = mapped_column(
+        _enum_type(CustomerNotificationStatus, "customer_notification_status"),
+        nullable=False,
+        default=CustomerNotificationStatus.PENDING,
+        server_default=CustomerNotificationStatus.PENDING.value,
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, server_default=func.now()
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, server_default=func.now()
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
+
+
+class CustomerChatRateLimitWindow(Base):
+    """Ventana compartida por réplicas; nunca almacena la guía en claro."""
+
+    __tablename__ = "customer_chat_rate_limit_windows"
+    __table_args__ = (
+        Index(
+            "customer_chat_rate_limit_windows_started_at_idx",
+            "window_started_at",
+        ),
+    )
+
+    guide_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False)
