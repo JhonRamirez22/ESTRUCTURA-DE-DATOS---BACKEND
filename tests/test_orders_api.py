@@ -195,3 +195,200 @@ async def test_order_input_rejects_bad_json_outside_pasto_and_foreign_city(
         "/api/pedidos",
         headers=headers,
         json={"address": "Calle 1", "lat": 40.7128, "lng": -74.006, "orderId": "P-2"},
+    )
+    foreign = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            "address": "Carrera 25, Bogotá",
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "orderId": "P-3",
+        },
+    )
+    assert malformed.status_code == 400
+    assert malformed.json() == {"error": "El body debe ser JSON válido."}
+    assert outside.status_code == 400
+    assert "dentro de la zona de servicio de Pasto" in outside.json()["error"]
+    assert foreign.status_code == 400
+    assert "ciudad fuera de Pasto" in foreign.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_customer_email_requires_consent_and_is_never_returned_in_order_json(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    headers = {"Cookie": _cookie("dispatcher")}
+    missing_contact = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            "address": "Calle 10",
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "orderId": "CONSENT-MISSING",
+            "emailNotificationsEnabled": True,
+        },
+    )
+    invalid_email = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            "address": "Calle 10",
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "orderId": "EMAIL-INVALID",
+            "customerEmail": "no-es-correo",
+            "emailNotificationsEnabled": True,
+        },
+    )
+    unconsented_email = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            "address": "Calle 10",
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "orderId": "EMAIL-NO-CONSENT",
+            "customerEmail": "no-retener@example.com",
+            "emailNotificationsEnabled": False,
+        },
+    )
+    created = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            "address": "Calle 10",
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "orderId": "EMAIL-CONSENT",
+            "customerEmail": "cliente@example.com",
+            "emailNotificationsEnabled": True,
+        },
+    )
+
+    assert missing_contact.status_code == 400
+    assert invalid_email.status_code == 400
+    assert unconsented_email.status_code == 201
+    assert created.status_code == 201
+    assert "no-retener@example.com" not in unconsented_email.text
+    assert "cliente@example.com" not in created.text
+    point_id = UUID(created.json()["deliveryPoint"]["id"])
+    unconsented_id = UUID(unconsented_email.json()["deliveryPoint"]["id"])
+    async with session_factory() as session:
+        saved = await session.get(DeliveryPoint, point_id)
+        assert saved is not None
+        assert saved.customer_email == "cliente@example.com"
+        assert saved.email_notifications_enabled is True
+        unconsented = await session.get(DeliveryPoint, unconsented_id)
+        assert unconsented is not None
+        assert unconsented.customer_email is None
+        assert unconsented.email_notifications_enabled is False
+
+    async with session_factory() as session:
+        saved = await session.get(DeliveryPoint, point_id)
+        assert saved is not None
+        await enqueue_order_assigned_notification(session, saved, uuid4())
+        await session.commit()
+
+    revoked = await client.patch(
+        f"/api/pedidos/{point_id}",
+        headers=headers,
+        json={"emailNotificationsEnabled": False},
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert "cliente@example.com" not in revoked.text
+    async with session_factory() as session:
+        saved = await session.get(DeliveryPoint, point_id)
+        assert saved is not None
+        assert saved.customer_email is None
+        assert saved.email_notifications_enabled is False
+        notification = await session.scalar(
+            select(CustomerNotificationOutbox).where(
+                CustomerNotificationOutbox.delivery_point_id == point_id
+            )
+        )
+        assert notification is not None
+        assert notification.channel is CustomerNotificationChannel.EMAIL
+        assert notification.event_type is CustomerNotificationEvent.ORDER_ASSIGNED
+        assert notification.status is CustomerNotificationStatus.CANCELLED
+        assert notification.recipient_email is None
+        assert notification.subject == ""
+        assert notification.text_body == ""
+
+
+@pytest.mark.asyncio
+async def test_customer_sms_requires_explicit_consent_and_normalizes_colombian_mobile(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    headers = {"Cookie": _cookie("dispatcher")}
+    base_order = {
+        "address": "Calle 10",
+        "lat": 1.2136,
+        "lng": -77.2811,
+    }
+    missing_phone = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={**base_order, "orderId": "SMS-MISSING", "smsNotificationsEnabled": True},
+    )
+    invalid_phone = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            **base_order,
+            "orderId": "SMS-INVALID",
+            "customerPhone": "+12025550100",
+            "smsNotificationsEnabled": True,
+        },
+    )
+    unconsented_phone = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            **base_order,
+            "orderId": "SMS-NO-CONSENT",
+            "customerPhone": "3001234567",
+        },
+    )
+    opted_in = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            **base_order,
+            "orderId": "SMS-CONSENT",
+            "customerPhone": "300 123 4567",
+            "smsNotificationsEnabled": True,
+        },
+    )
+
+    assert missing_phone.status_code == 400
+    assert invalid_phone.status_code == 400
+    assert unconsented_phone.status_code == 201
+    assert opted_in.status_code == 201
+    assert "3001234567" not in opted_in.text
+    point_id = UUID(opted_in.json()["deliveryPoint"]["id"])
+    async with session_factory() as session:
+        saved = await session.get(DeliveryPoint, point_id)
+        assert saved is not None
+        assert saved.customer_phone == "+573001234567"
+        assert saved.sms_notifications_enabled is True
+        unconsented_id = UUID(unconsented_phone.json()["deliveryPoint"]["id"])
+        unconsented = await session.get(DeliveryPoint, unconsented_id)
+        assert unconsented is not None
+        assert unconsented.customer_phone is None
+        assert unconsented.sms_notifications_enabled is False
+
+    async with session_factory() as session:
+        saved = await session.get(DeliveryPoint, point_id)
+        assert saved is not None
+        await enqueue_order_assigned_notification(session, saved, uuid4())
+        await session.commit()
+
+    revoked = await client.patch(
+        f"/api/pedidos/{point_id}",
+        headers=headers,
+        json={"smsNotificationsEnabled": False},
+    )
