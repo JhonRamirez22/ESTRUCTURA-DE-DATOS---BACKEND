@@ -124,3 +124,128 @@ async def providers() -> AsyncIterator[tuple[FakeMatrixProvider, FakeRouteProvid
         app.dependency_overrides.pop(get_traffic_service, None)
 
 
+@pytest_asyncio.fixture
+async def client(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[httpx.AsyncClient]:
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_traffic_service] = lambda: None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(get_traffic_service, None)
+
+
+@pytest.mark.asyncio
+async def test_tracking_validates_missing_and_unknown_guides(
+    client: httpx.AsyncClient,
+    providers: tuple[FakeMatrixProvider, FakeRouteProvider],
+) -> None:
+    missing = await client.get("/api/seguimiento")
+    unknown = await client.get("/api/seguimiento?guia=not-a-real-guide")
+
+    assert missing.status_code == 400
+    assert missing.json()["error"] == "Ingresa el número de guía para consultar el pedido."
+    assert unknown.status_code == 404
+    assert unknown.json()["error"] == "No encontramos un pedido con esa guía."
+    assert "no-store" in missing.headers["cache-control"]
+    assert providers[0].calls == 0
+
+
+@pytest.mark.asyncio
+async def test_unassigned_delivery_point_returns_only_guide_and_destination(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    providers: tuple[FakeMatrixProvider, FakeRouteProvider],
+) -> None:
+    point = await _create_delivery_point(session_factory)
+
+    response = await client.get(f"/api/seguimiento?guia={point.tracking_token}")
+
+    assert response.status_code == 200
+    assert response.json()["tracking"] == {
+        "guide": point.tracking_token,
+        "status": "PENDING",
+        "address": point.address,
+        "coordinates": {"lat": point.lat, "lng": point.lng},
+        "route": None,
+    }
+    assert providers[0].calls == 0
+    assert providers[1].calls == []
+
+
+@pytest.mark.asyncio
+async def test_active_tracking_shares_rounded_location_and_only_target_leg(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    providers: tuple[FakeMatrixProvider, FakeRouteProvider],
+) -> None:
+    courier, route, target, private_point = await _create_active_route(session_factory)
+
+    response = await client.get(f"/api/seguimiento?guia={target.tracking_token}")
+    payload = response.json()
+    tracking = payload["tracking"]
+    route_payload = tracking["route"]
+
+    assert response.status_code == 200
+    assert route_payload["courier"]["currentLat"] == 1.2136
+    assert route_payload["courier"]["currentLng"] == -77.2811
+    assert route_payload["estimatedMinutesFromNow"] == 9
+    assert route_payload["distanceFromCourierMeters"] == 1_450
+    assert route_payload["geometryProvider"] == "OSRM"
+    assert providers[0].calls == 1
+    assert providers[1].calls == [[(-77.2811, 1.2136), (target.lng, target.lat)]]
+    assert route.id.hex not in response.text
+    assert courier.name not in response.text and courier.phone not in response.text
+    assert "cliente-privado@example.com" not in response.text
+    assert "+573009876543" not in response.text
+    assert private_point.address not in response.text
+    assert str(courier.id) not in response.text
+    assert route_payload.get("estimateWarning") is None
+    assert route_payload["liveTraffic"] == {
+        "source": "ROAD_BASELINE",
+        "configured": False,
+        "applied": False,
+        "status": "NOT_CONFIGURED",
+        "scope": "FIRST_LEG_ONLY",
+        "warning": "TomTom no está configurado; el ETA usa tiempos viales base.",
+    }
+    assert "no-store" in response.headers["cache-control"]
+
+
+@pytest.mark.asyncio
+async def test_tracking_applies_partial_tomtom_factor_only_to_the_first_road_leg(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    providers: tuple[FakeMatrixProvider, FakeRouteProvider],
+) -> None:
+    _courier, _route, target, _private_point = await _create_active_route(session_factory)
+    traffic = FakeTrafficProvider()
+    app.dependency_overrides[get_traffic_service] = lambda: traffic
+
+    response = await client.get(f"/api/seguimiento?guia={target.tracking_token}")
+    payload = response.json()["tracking"]["route"]
+
+    assert response.status_code == 200
+    assert payload["estimatedMinutesFromNow"] == 13.5
+    assert payload["liveTraffic"]["source"] == "TOMTOM"
+    assert payload["liveTraffic"]["applied"] is True
+    assert payload["liveTraffic"]["status"] == "LIVE"
+    assert "solo el siguiente tramo" in payload["liveTraffic"]["warning"]
+    assert providers[1].calls == [[(-77.2811, 1.2136), (target.lng, target.lat)]]
+
+
+@pytest.mark.asyncio
+async def test_stale_location_and_delivered_point_never_expose_courier_or_route(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    providers: tuple[FakeMatrixProvider, FakeRouteProvider],
