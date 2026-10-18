@@ -155,3 +155,160 @@ class HttpOrderChatAssistant:
         self,
         *,
         api_url: str,
+        api_key: str,
+        model: str,
+        timeout_ms: int,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        if not api_url.startswith("https://"):
+            raise ValueError("CUSTOMER_CHAT_API_URL debe usar HTTPS.")
+        if not api_key.strip() or not model.strip():
+            raise ValueError("La URL, API key y modelo del chat son obligatorios.")
+        if timeout_ms <= 0:
+            raise ValueError("CUSTOMER_CHAT_TIMEOUT_MS debe ser positivo.")
+        self._api_url = api_url
+        self._api_key = api_key
+        self._model = model
+        self._timeout_seconds = timeout_ms / 1_000
+        self._transport = transport
+
+    async def answer(
+        self,
+        *,
+        delivery_status: str,
+        route_status: str | None,
+        messages: Sequence[CustomerChatTurn],
+        estimated_minutes_from_now: float | None = None,
+        estimate_basis: str = (
+            "tiempos viales estimados; TomTom, si se aplica, "
+            "solo cubre parcialmente el primer tramo"
+        ),
+    ) -> str:
+        scoped_messages = _messages_in_order_scope(messages)
+        if not scoped_messages or scoped_messages[-1] is not messages[-1]:
+            return _OUT_OF_SCOPE_REPLY
+
+        context: dict[str, object] = {
+            "deliveryStatus": delivery_status,
+            "routeStatus": route_status,
+            "statusDefinitions": {
+                "PENDING": "recibido y aún sin asignar a una ruta",
+                "EN_ROUTE": "asignado y en camino",
+                "DELIVERED": "entregado",
+                "FAILED": "entrega con incidencia",
+                "PLANNED": "ruta planeada, aún no iniciada",
+                "IN_PROGRESS": "ruta en curso",
+                "COMPLETED": "ruta finalizada",
+                "CANCELLED": "ruta cancelada",
+            },
+        }
+        # No compartimos el ETA con el proveedor si el cliente no preguntó por la llegada.
+        if customer_asks_for_arrival_estimate(scoped_messages):
+            context["estimatedMinutesFromNow"] = estimated_minutes_from_now
+            context["estimateBasis"] = estimate_basis
+        request_messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": f"{_SYSTEM_PROMPT}\nContexto del pedido (JSON): "
+                f"{json.dumps(context, ensure_ascii=False)}",
+            }
+        ]
+        # Nunca enviamos texto libre: así nombres, guías, direcciones, coordenadas e IDs
+        # no dependen de que una expresión regular reconozca cada formato posible.
+        request_messages.extend(
+            {"role": message.role, "content": _canonical_order_question(message.content)}
+            for message in scoped_messages
+        )
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._timeout_seconds,
+                transport=self._transport,
+            ) as client:
+                response = await client.post(
+                    self._api_url,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self._api_key}",
+                    },
+                    json={
+                        "model": self._model,
+                        "messages": request_messages,
+                        "temperature": 0.2,
+                        "max_tokens": 350,
+                        "stream": False,
+                    },
+                )
+        except httpx.TimeoutException as error:
+            raise CustomerChatTimeoutError from error
+        except httpx.HTTPError as error:
+            raise CustomerChatProviderError from error
+
+        if response.status_code == 429:
+            raise CustomerChatRateLimitError
+        if not response.is_success:
+            raise CustomerChatProviderError
+
+        try:
+            payload: object = response.json()
+            answer = _read_chat_content(payload)
+        except (ValueError, TypeError, KeyError, IndexError) as error:
+            raise CustomerChatProviderError from error
+        if not answer or len(answer) > 1_500:
+            raise CustomerChatProviderError
+        return _normalize_customer_facing_answer(answer)
+
+
+def create_customer_order_chat(settings: Settings) -> OrderChatAssistant | None:
+    """No devuelve un adaptador parcial: el chat solo se activa con su config completa."""
+    api_url = (settings.customer_chat_api_url or "").strip()
+    api_key = (
+        settings.customer_chat_api_key.get_secret_value().strip()
+        if settings.customer_chat_api_key is not None
+        else ""
+    )
+    model = (settings.customer_chat_model or "").strip()
+    if not api_url or not api_key or not model:
+        return None
+    return HttpOrderChatAssistant(
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+        timeout_ms=settings.customer_chat_timeout_ms,
+    )
+
+
+def get_customer_order_chat() -> OrderChatAssistant | None:
+    try:
+        return create_customer_order_chat(get_settings())
+    except ValueError as error:
+        _LOGGER.warning(
+            "La configuración del asistente de pedidos no es válida",
+            extra={"error_type": type(error).__name__},
+        )
+        return None
+
+
+def _messages_in_order_scope(
+    messages: Sequence[CustomerChatTurn],
+) -> list[CustomerChatTurn]:
+    """Conserva preguntas del pedido y seguimientos elípticos contiguos, nunca texto ajeno."""
+    scoped_messages: list[CustomerChatTurn] = []
+    order_context_is_current = False
+    for message in messages:
+        is_direct_order_question = _message_is_order_scoped(message.content)
+        is_order_follow_up = order_context_is_current and _message_is_order_follow_up(
+            message.content
+        )
+        if is_direct_order_question or is_order_follow_up:
+            scoped_messages.append(message)
+            order_context_is_current = True
+        else:
+            # Una pregunta ajena corta la continuidad y no se reenvía al proveedor.
+            order_context_is_current = False
+    return scoped_messages
+
+
+def customer_asks_for_arrival_estimate(messages: Sequence[CustomerChatTurn]) -> bool:
+    """Detect arrival questions only when the latest turn belongs to this order."""
