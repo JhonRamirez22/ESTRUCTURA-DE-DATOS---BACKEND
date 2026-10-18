@@ -832,3 +832,281 @@ def _validate_courier_position(
         )
     if not is_courier_location_fresh(courier.last_location_at, now):
         raise RouteConflictError(
+            "La ubicación GPS del repartidor venció mientras se calculaba la ruta."
+        )
+
+
+def _build_route_revision_snapshot(
+    route: Route,
+    active_points: Sequence[DeliveryPoint],
+) -> dict[str, object]:
+    ordered_stops: list[dict[str, object]] = []
+    for point in active_points:
+        sequence_index = point.sequence_index
+        if sequence_index is None or sequence_index < 0:
+            raise RouteConflictError(
+                "No se puede guardar el historial: falta el orden de una parada."
+            )
+        ordered_stops.append(
+            {"deliveryPointId": str(point.id), "sequenceIndex": sequence_index}
+        )
+    ordered_stops.sort(key=lambda stop: cast(int, stop["sequenceIndex"]))
+    return {
+        "version": 1,
+        "estimatedDurationMinutes": route.estimated_duration_minutes,
+        "estimatedDistanceMeters": route.estimated_distance_meters,
+        "baselineDurationMinutes": route.baseline_duration_minutes,
+        "baselineDistanceMeters": route.baseline_distance_meters,
+        "geometry": route.geometry,
+        "geometryProvider": route.geometry_provider.value if route.geometry_provider else None,
+        "activeStops": ordered_stops,
+    }
+
+
+def _read_route_revision_snapshot(value: object) -> _RouteRevisionSnapshot:
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise RouteConflictError("El historial de la ruta no tiene un formato restaurable.")
+
+    estimated_duration = _snapshot_number(value.get("estimatedDurationMinutes"))
+    estimated_distance = _snapshot_number(value.get("estimatedDistanceMeters"))
+    raw_baseline_duration = value.get("baselineDurationMinutes")
+    raw_baseline_distance = value.get("baselineDistanceMeters")
+    baseline_duration = _snapshot_optional_number(raw_baseline_duration)
+    baseline_distance = _snapshot_optional_number(raw_baseline_distance)
+    raw_stops = value.get("activeStops")
+    if (
+        estimated_duration is None
+        or estimated_distance is None
+        or not isinstance(raw_stops, list)
+        or not raw_stops
+    ):
+        raise RouteConflictError("El historial de la ruta está incompleto y no se puede restaurar.")
+    if (raw_baseline_duration is not None and baseline_duration is None) or (
+        raw_baseline_distance is not None and baseline_distance is None
+    ):
+        raise RouteConflictError("El historial contiene métricas no restaurables.")
+
+    active_stops: list[tuple[UUID, int]] = []
+    for raw_stop in raw_stops:
+        if not isinstance(raw_stop, dict):
+            raise RouteConflictError("El historial de la ruta contiene una parada inválida.")
+        try:
+            point_id = UUID(str(raw_stop.get("deliveryPointId")))
+        except (ValueError, TypeError, AttributeError) as error:
+            raise RouteConflictError(
+                "El historial de la ruta contiene una parada inválida."
+            ) from error
+        sequence_index = raw_stop.get("sequenceIndex")
+        if (
+            isinstance(sequence_index, bool)
+            or not isinstance(sequence_index, int)
+            or sequence_index < 0
+        ):
+            raise RouteConflictError("El historial de la ruta contiene un orden inválido.")
+        active_stops.append((point_id, sequence_index))
+    if (
+        len({point_id for point_id, _index in active_stops}) != len(active_stops)
+        or len({index for _point_id, index in active_stops}) != len(active_stops)
+    ):
+        raise RouteConflictError("El historial de la ruta contiene un orden duplicado.")
+
+    raw_provider = value.get("geometryProvider")
+    try:
+        provider = RouteGeometryProvider(raw_provider) if raw_provider is not None else None
+    except ValueError as error:
+        raise RouteConflictError("El historial contiene un proveedor vial inválido.") from error
+    geometry = value.get("geometry")
+    if geometry is not None and (
+        not isinstance(geometry, dict)
+        or geometry.get("type") != "LineString"
+        or not isinstance(geometry.get("coordinates"), list)
+    ):
+        raise RouteConflictError("El historial no contiene una geometría vial restaurable.")
+
+    return _RouteRevisionSnapshot(
+        estimated_duration_minutes=estimated_duration,
+        estimated_distance_meters=estimated_distance,
+        baseline_duration_minutes=baseline_duration,
+        baseline_distance_meters=baseline_distance,
+        geometry=geometry,
+        geometry_provider=provider,
+        active_stops=tuple(active_stops),
+    )
+
+
+def _snapshot_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _snapshot_optional_number(value: object) -> float | None:
+    return None if value is None else _snapshot_number(value)
+
+
+def _validate_transition(current: RouteStatus, target: RouteStatus) -> None:
+    allowed: dict[RouteStatus, set[RouteStatus]] = {
+        RouteStatus.PLANNED: {RouteStatus.IN_PROGRESS, RouteStatus.CANCELLED},
+        RouteStatus.IN_PROGRESS: {RouteStatus.COMPLETED, RouteStatus.CANCELLED},
+        RouteStatus.COMPLETED: set(),
+        RouteStatus.CANCELLED: set(),
+    }
+    if current != target and target not in allowed[current]:
+        raise RouteConflictError(f"No se puede cambiar una ruta {current} a {target}.")
+
+
+def _route_cost(matrix: Sequence[Sequence[float | None]], route: Sequence[int]) -> float:
+    total = 0.0
+    for index, source in enumerate(route[:-1]):
+        cost = matrix[source][route[index + 1]]
+        total += math.inf if cost is None else cost
+    return total
+
+
+async def _apply_live_traffic_to_route(
+    traffic_provider: TrafficProvider,
+    matrix: Sequence[Sequence[float | None]],
+    route: Sequence[int],
+    ordered_coordinates: Sequence[Coordinate],
+    geometry: GeoJsonLineString,
+    *,
+    baseline_matrix: Sequence[Sequence[float | None]] | None = None,
+) -> tuple[list[list[float | None]], dict[str, object]]:
+    """Consulta pocos puntos sobre las calles y ajusta solo las aristas muestreadas."""
+    tomtom_base_matrix = baseline_matrix if baseline_matrix is not None else matrix
+    legs = [
+        (start, end, tomtom_base_matrix[start][end])
+        for start, end in zip(route, route[1:], strict=False)
+    ]
+    samples = sample_route_leg_points(geometry, ordered_coordinates)
+    base_summary: dict[str, object] = {
+        "source": "tomtom",
+        "configured": True,
+        "applied": False,
+        "routeSegments": len(legs),
+        "requestedSegments": 0,
+        "sampledSegments": 0,
+        "adjustedSegments": 0,
+        "closedSegments": 0,
+        "staleSegments": 0,
+        "lowConfidenceSegments": 0,
+        "errorSegments": 0,
+        "coverageRatio": 0.0,
+    }
+    if not legs or len(samples) != len(legs):
+        base_summary["warning"] = (
+            "No se pudieron alinear las paradas con la geometría vial; "
+            "se conservaron los tiempos de base."
+        )
+        return [list(row) for row in matrix], base_summary
+
+    # La primera etapa siempre se mide; el resto prioriza los tramos más costosos.
+    prioritized_legs = sorted(
+        enumerate(legs),
+        key=lambda item: (
+            item[0] != 0,
+            -(item[1][2] if item[1][2] is not None else -1.0),
+        ),
+    )[:MAX_TOMTOM_ROUTE_SAMPLES]
+    base_summary["requestedSegments"] = len(prioritized_legs)
+    responses = await asyncio.gather(
+        *(
+            traffic_provider.get_flow_segment(samples[leg_index])
+            for leg_index, _leg in prioritized_legs
+        ),
+        return_exceptions=True,
+    )
+
+    adjusted_matrix = [list(row) for row in matrix]
+    sampled_count = 0
+    adjusted_count = 0
+    closed_count = 0
+    stale_count = 0
+    low_confidence_count = 0
+    error_count = 0
+    for (_leg_index, (start, end, base_cost)), response in zip(
+        prioritized_legs,
+        responses,
+        strict=True,
+    ):
+        if isinstance(response, asyncio.CancelledError):
+            raise response
+        if isinstance(response, BaseException):
+            if not isinstance(response, Exception):
+                raise response
+            error_count += 1
+            _LOGGER.warning(
+                "TomTom Traffic falló para un tramo; se mantiene el costo vial base",
+                extra={"error_type": type(response).__name__},
+            )
+            continue
+
+        sampled_count += 1
+        if response.cache_status == "STALE":
+            stale_count += 1
+        if response.road_closure:
+            adjusted_matrix[start][end] = None
+            closed_count += 1
+            continue
+        if response.confidence < MIN_TOMTOM_CONFIDENCE:
+            low_confidence_count += 1
+            continue
+        multiplier = response.travel_time_multiplier
+        if base_cost is None or multiplier is None or not math.isfinite(multiplier):
+            low_confidence_count += 1
+            continue
+        adjusted_matrix[start][end] = base_cost * multiplier
+        adjusted_count += 1
+
+    route_segment_count = len(legs)
+    applied_count = adjusted_count + closed_count
+    warning_parts: list[str] = []
+    if applied_count:
+        warning_parts.append(
+            "Estimación de tráfico TomTom parcial: se ajustaron "
+            f"{adjusted_count} tramos y se marcaron {closed_count} cerrados."
+        )
+    else:
+        warning_parts.append(
+            "TomTom no entregó factores utilizables; se conservaron los tiempos viales de base."
+        )
+    if len(prioritized_legs) < route_segment_count:
+        warning_parts.append(
+            f"Se consultaron como máximo {MAX_TOMTOM_ROUTE_SAMPLES} de "
+            f"{route_segment_count} tramos para controlar latencia y cuota."
+        )
+    if error_count:
+        warning_parts.append(f"{error_count} consultas fallaron y conservaron costo base.")
+    if low_confidence_count:
+        warning_parts.append(
+            f"Se omitieron {low_confidence_count} respuestas sin confianza suficiente."
+        )
+    if stale_count:
+        warning_parts.append(f"{stale_count} tramos usaron datos recientes en caché.")
+
+    base_summary.update(
+        {
+            "applied": applied_count > 0,
+            "sampledSegments": sampled_count,
+            "adjustedSegments": adjusted_count,
+            "closedSegments": closed_count,
+            "staleSegments": stale_count,
+            "lowConfidenceSegments": low_confidence_count,
+            "errorSegments": error_count,
+            "coverageRatio": sampled_count / route_segment_count if route_segment_count else 0,
+            "warning": " ".join(warning_parts),
+        }
+    )
+    return adjusted_matrix, base_summary
+
+
+def _validate_matrix_shape(matrix: Sequence[Sequence[float | None]], expected: int) -> None:
+    if len(matrix) != expected or any(len(row) != expected for row in matrix):
+        raise RoutePlanningError("El proveedor devolvió una matriz de tiempos inválida.", 502)
+
+
+def _as_naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
