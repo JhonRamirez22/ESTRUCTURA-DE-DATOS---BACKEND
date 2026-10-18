@@ -351,3 +351,179 @@ async def update_delivery_point(
         content: dict[str, object] = {
             "deliveryPoint": _point_json(
                 updated,
+                include_route=is_dispatcher,
+                include_tracking=is_dispatcher,
+            )
+        }
+        if normalization is not None:
+            content["addressNormalization"] = normalization.as_dict()
+        return _json(content, headers=_NO_STORE)
+    except IntegrityError as error:
+        await session.rollback()
+        if _is_duplicate_order(error):
+            return _error("Ya existe un pedido con esa guía.", 409)
+        _log_database_error("No se pudo actualizar el pedido", error)
+        return _error("No se pudo procesar el pedido.", 500)
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_database_error("No se pudo actualizar el pedido", error)
+        return _error("No se pudo procesar el pedido.", 500)
+
+
+@router.delete("/{delivery_point_id}", status_code=204)
+async def delete_delivery_point(
+    delivery_point_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> Response:
+    access_error = _dispatcher_access_error(claims)
+    if access_error is not None:
+        return access_error
+    parsed_id = _parse_uuid(delivery_point_id)
+    if parsed_id is None:
+        return _error("El pedido no existe.", 404)
+    try:
+        repository = DeliveryPointRepository(session)
+        point = await repository.get_delivery_point(parsed_id)
+        if point is None:
+            return _error("El pedido no existe.", 404)
+        if point.route_id is not None or point.status is not DeliveryPointStatus.PENDING:
+            return _error(
+                "Solo se pueden eliminar pedidos pendientes que aún no estén asignados a una ruta.",
+                409,
+            )
+        await repository.delete(point)
+        await session.commit()
+        return Response(status_code=204, headers=_NO_STORE)
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_database_error("No se pudo eliminar el pedido", error)
+        return _error("No se pudo procesar el pedido.", 500)
+
+
+def _point_view(
+    point: DeliveryPoint,
+    *,
+    include_route: bool = False,
+) -> DeliveryPointView:
+    route = point.route if include_route else None
+    return DeliveryPointView(
+        id=point.id,
+        address=point.address,
+        lat=point.lat,
+        lng=point.lng,
+        time_window=cast(JsonValue | None, point.time_window),
+        status=point.status,
+        order_id=point.order_id,
+        tracking_token=point.tracking_token,
+        route_id=point.route_id,
+        sequence_index=point.sequence_index,
+        route=RouteSummaryView.model_validate(route) if route is not None else None,
+    )
+
+
+def _point_json(
+    point: DeliveryPoint,
+    *,
+    include_route: bool = False,
+    include_tracking: bool = True,
+) -> dict[str, object]:
+    payload = _point_view(point, include_route=include_route).model_dump(
+        mode="json", by_alias=True
+    )
+    if not include_route:
+        payload.pop("route", None)
+    if not include_tracking:
+        payload.pop("trackingToken", None)
+    return payload
+
+
+def _validate_pasto_location(address: str, latitude: float, longitude: float) -> str | None:
+    if not is_within_pasto_service_area(latitude, longitude):
+        return "La ubicación debe estar dentro de la zona de servicio de Pasto, Nariño."
+    if contains_foreign_city_reference(address):
+        return "La dirección indica una ciudad fuera de Pasto, Nariño."
+    return None
+
+
+async def _read_json_object(request: Request) -> dict[str, object] | JSONResponse:
+    try:
+        body: object = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error("El body debe ser JSON válido.", 400)
+    if not isinstance(body, dict):
+        return _error("El body debe ser un objeto JSON.", 400)
+    return body
+
+
+def _validation_error(error: ValidationError) -> JSONResponse:
+    first = error.errors(include_input=False)[0]
+    field_name = str(first["loc"][-1]) if first.get("loc") else "pedido"
+    messages = {
+        "address": "address debe ser un string no vacío.",
+        "lat": "lat debe ser un número finito dentro del rango permitido.",
+        "lng": "lng debe ser un número finito dentro del rango permitido.",
+        "orderId": "orderId debe ser un string no vacío.",
+        "timeWindow": "timeWindow debe ser un valor JSON válido.",
+        "status": "status debe ser PENDING, EN_ROUTE, DELIVERED o FAILED.",
+    }
+    message = messages.get(field_name, str(first["msg"]))
+    if "No hay campos válidos" in str(first["msg"]):
+        message = "No hay campos válidos para actualizar."
+    return _error(message, 400)
+
+
+def _belongs_to_courier(point: DeliveryPoint, claims: SessionClaims) -> bool:
+    return (
+        point.route is not None
+        and claims.get("courierId") is not None
+        and str(point.route.courier_id) == claims["courierId"]
+    )
+
+
+def _session_courier_id(claims: SessionClaims) -> str | None:
+    if claims["role"] != "courier":
+        return None
+    courier_id = claims.get("courierId")
+    return courier_id if courier_id else None
+
+
+def _is_dispatcher(claims: SessionClaims | None) -> bool:
+    return claims is not None and claims["role"] == "dispatcher"
+
+
+def _dispatcher_access_error(claims: SessionClaims | None) -> JSONResponse | None:
+    if claims is None:
+        return _error("Debes iniciar sesión para continuar.", 401)
+    if not _is_dispatcher(claims):
+        return _error("Se requiere una sesión de despacho.", 403)
+    return None
+
+
+def _parse_uuid(value: str) -> UUID | None:
+    try:
+        return UUID(value)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _is_duplicate_order(error: IntegrityError) -> bool:
+    message = str(error.orig).lower()
+    return "delivery_points_order_id_key" in message or "order_id" in message
+
+
+def _log_database_error(message: str, error: SQLAlchemyError) -> None:
+    _LOGGER.error(message, extra={"error_type": type(error).__name__})
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return _json({"error": message}, status_code=status_code, headers=_NO_STORE)
+
+
+def _json(
+    content: dict[str, object],
+    *,
+    status_code: int = 200,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    return JSONResponse(content=content, status_code=status_code, headers=headers or _NO_STORE)
