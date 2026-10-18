@@ -110,3 +110,115 @@ class OsrmClient:
         _validate_matrix_dimensions(duration_seconds, len(coordinates), "durations")
         _validate_matrix_dimensions(distances_meters, len(coordinates), "distances")
         return {
+            "durations_minutes": [
+                [None if seconds is None else seconds / 60 for seconds in row]
+                for row in duration_seconds
+            ],
+            "distances_meters": distances_meters,
+        }
+
+    async def get_route(self, coordinates: Sequence[Coordinate]) -> OsrmRouteResult:
+        """Consulta Route; entrega geometría [lng,lat], metros y duración en minutos."""
+        validate_coordinates(coordinates)
+        encoded = _serialize_coordinates(coordinates)
+        radiuses = _serialize_radiuses(len(coordinates))
+        payload = await self._request(
+            f"/route/v1/driving/{encoded}"
+            f"?overview=full&geometries=geojson&steps=false&radiuses={radiuses}"
+        )
+        routes = payload.get("routes")
+        if payload.get("code") != "Ok" or not isinstance(routes, list) or not routes:
+            detail = payload.get("message", payload.get("code", "respuesta desconocida"))
+            raise OsrmClientError(f"OSRM route response was not successful: {detail}")
+
+        route = _read_object(routes[0], "OSRM route response contains an invalid route")
+        distance = _read_number(route.get("distance"), "route distance")
+        duration_seconds = _read_number(route.get("duration"), "route duration")
+        geometry = _read_geometry(route.get("geometry"))
+        waypoints = _read_waypoints(payload.get("waypoints"), len(coordinates))
+        _validate_geometry_covers_waypoints(geometry, waypoints)
+
+        return {
+            "geometry": geometry,
+            "geometry_provider": "OSRM",
+            "distance_meters": distance,
+            "duration_minutes": duration_seconds / 60,
+            "snap_distances_meters": [distance_meters for _, distance_meters in waypoints],
+        }
+
+    async def _request(self, path: str) -> dict[str, object]:
+        try:
+            response = await self._client.get(path)
+        except httpx.TimeoutException as error:
+            raise OsrmTimeoutError(self._timeout_seconds) from error
+        except httpx.RequestError as error:
+            raise OsrmClientError(f"OSRM network request failed: {error}") from error
+
+        if not response.is_success:
+            body = response.text
+            if response.status_code == 429:
+                raise OsrmRateLimitError(body)
+            raise OsrmClientError(
+                f"OSRM request failed (HTTP {response.status_code}): {body}",
+                status=response.status_code,
+                response_body=body,
+            )
+
+        try:
+            raw_payload: object = response.json()
+        except ValueError as error:
+            raise OsrmClientError(f"OSRM returned invalid JSON: {error}") from error
+        return _read_object(raw_payload, "OSRM response must be a JSON object")
+
+
+def _serialize_coordinates(coordinates: Sequence[Coordinate]) -> str:
+    return ";".join(f"{longitude},{latitude}" for longitude, latitude in coordinates)
+
+
+def _serialize_radiuses(count: int) -> str:
+    return ";".join(str(OSRM_MAX_SNAP_DISTANCE_METERS) for _ in range(count))
+
+
+def _read_object(value: object, message: str) -> dict[str, object]:
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise OsrmClientError(message)
+    return {key: item for key, item in value.items() if isinstance(key, str)}
+
+
+def _read_number(value: object, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise OsrmClientError(f"OSRM response contains an invalid {name}")
+    return float(value)
+
+
+def _read_matrix(value: object, name: str) -> list[list[float | None]]:
+    if not isinstance(value, list) or any(not isinstance(row, list) for row in value):
+        raise OsrmClientError(f"OSRM response has no valid {name} matrix")
+
+    result: list[list[float | None]] = []
+    for row in value:
+        values: list[float | None] = []
+        for cell in row:
+            if cell is None:
+                values.append(None)
+            elif (
+                isinstance(cell, bool)
+                or not isinstance(cell, (int, float))
+                or not math.isfinite(cell)
+                or cell < 0
+            ):
+                raise OsrmClientError(f"OSRM response contains an invalid {name} value")
+            else:
+                values.append(float(cell))
+        result.append(values)
+    return result
+
+
+def _validate_matrix_dimensions(matrix: Sequence[Sequence[object]], size: int, name: str) -> None:
+    if len(matrix) != size or any(len(row) != size for row in matrix):
+        raise OsrmClientError(f"OSRM response has an incomplete {name} matrix")
