@@ -414,3 +414,86 @@ async def propose_route_endpoint(
             record_proposal(parsed_id, cached[1], cached=True)
             return _json({**cached[1], "cached": True}, headers=_NO_STORE)
         matrix_provider, route_provider = providers
+        plan = await build_optimized_route_plan(
+            session,
+            route.courier_id,
+            current_ids,
+            matrix_provider=cast(MatrixProvider, matrix_provider),
+            route_provider=cast(RouteProvider, route_provider),
+            traffic_ai_advisor=advisor,
+            traffic_provider=traffic,
+            order_advisor=order_advisor,
+            allow_on_route_courier=True,
+            existing_route_id=parsed_id,
+        )
+        body = _proposal_json(plan, current_ids)
+        if len(_PROPOSAL_CACHE) >= _PROPOSAL_CACHE_LIMIT:
+            _PROPOSAL_CACHE.clear()
+        _PROPOSAL_CACHE[cache_key] = (now, body)
+        record_proposal(parsed_id, body, cached=False)
+        return _json({**body, "cached": False}, headers=_NO_STORE)
+    except RoutePlanningError as error:
+        return _error(str(error), error.status_code)
+    except (RoutingClientError, TimeoutError) as error:
+        _LOGGER.warning(
+            "No se pudo obtener la ruta vial para la propuesta",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error(
+            "El proveedor vial no pudo calcular la propuesta. Tu ruta actual sigue igual.",
+            502,
+        )
+    except SQLAlchemyError as error:
+        _log_database_error("No se pudo calcular la propuesta de ruta", error)
+        return _error("No se pudo calcular la propuesta de ruta.", 500)
+
+
+def _historical_fields(historical: dict[str, Any] | None, stop_id: str) -> dict[str, Any]:
+    if historical is None or stop_id not in historical["perStop"]:
+        return {}
+    item = historical["perStop"][stop_id]
+    return {
+        "historicalMinutesFromNow": item["minutes"],
+        "historicalMultiplier": item["multiplier"],
+        "historicalLevel": item["level"],
+    }
+
+
+def _proposal_json(plan: OptimizedRoutePlan, current_ids: list[UUID]) -> dict[str, object]:
+    ordered = [str(point_id) for point_id in plan.ordered_delivery_point_ids]
+    current = [str(point_id) for point_id in current_ids]
+    improvement: float | None = None
+    if plan.baseline_duration_minutes is not None:
+        improvement = round(plan.baseline_duration_minutes - plan.estimated_duration_minutes, 1)
+    worth_applying = ordered != current and (
+        improvement is None or improvement >= MIN_PROPOSAL_GAIN_MINUTES
+    )
+    return {
+        "worthApplying": worth_applying,
+        "minGainMinutes": MIN_PROPOSAL_GAIN_MINUTES,
+        "orderedDeliveryPointIds": ordered,
+        "currentDeliveryPointIds": current,
+        "changed": ordered != current,
+        "estimatedDurationMinutes": round(plan.estimated_duration_minutes, 1),
+        "estimatedDistanceMeters": round(plan.estimated_distance_meters),
+        "baselineDurationMinutes": (
+            round(plan.baseline_duration_minutes, 1)
+            if plan.baseline_duration_minutes is not None else None
+        ),
+        "improvementMinutes": improvement,
+        "geometry": plan.geometry,
+        "matrixSource": plan.matrix_source,
+        "trafficAi": plan.traffic_ai,
+        "liveTraffic": plan.live_traffic,
+        "aiOrder": plan.ai_order,
+        "warning": plan.warning,
+        "computedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }
+
+
+@router.post("/{route_id}/deshacer-recalculo")
+async def undo_route_recalculation_endpoint(
+    route_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> JSONResponse:
