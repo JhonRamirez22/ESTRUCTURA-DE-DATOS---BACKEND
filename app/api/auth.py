@@ -385,3 +385,80 @@ async def _resolve_session(
             # Con Bearer no hay credencial ambiente: el CSRF solo protege a la cookie.
             if not from_bearer and not csrf_matches(
                 token, request.headers.get("X-CSRF-Token"), secret
+            ):
+                raise HTTPException(status_code=403, detail="La verificación CSRF falló.")
+        _enforce_account_limit(
+            settings, identity.account_id or identity.courier_id or candidate, request.method
+        )
+        return _claims_from_identity(identity)
+    return None
+
+
+_ACCOUNT_LIMITERS: dict[tuple[bool, int], SlidingWindowLimiter] = {}
+
+
+def _enforce_account_limit(settings: Settings, subject: object, method: str) -> None:
+    """429 si una cuenta repite peticiones por encima de su cupo por minuto."""
+    write = method not in {"GET", "HEAD", "OPTIONS"}
+    limit = (
+        settings.account_write_limit_per_minute
+        if write
+        else settings.account_read_limit_per_minute
+    )
+    limiter = _ACCOUNT_LIMITERS.setdefault((write, limit), SlidingWindowLimiter(limit, 60))
+    retry_after = limiter.retry_after(str(subject))
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail="Demasiadas solicitudes seguidas. Espera un momento.",
+            headers={"Retry-After": str(retry_after), "Cache-Control": "private, no-store"},
+        )
+
+
+def _claims_from_identity(identity: SessionIdentity) -> SessionClaims:
+    claims: SessionClaims = {
+        "role": cast(SessionRole, identity.role),
+        "expiresAt": int(identity.expires_at.replace(tzinfo=UTC).timestamp()),
+    }
+    if identity.account_id:
+        claims["accountId"] = str(identity.account_id)
+    if identity.courier_id:
+        claims["courierId"] = str(identity.courier_id)
+    return claims
+
+
+def _requested_role(request: Request) -> SessionRole | None:
+    value = request.headers.get(SESSION_ROLE_HEADER)
+    if value is None:
+        return None
+    if value not in SESSION_COOKIE_NAMES:
+        raise HTTPException(status_code=400, detail="El rol de sesión no es válido.")
+    return value
+
+
+async def _role_claims(
+    role: SessionRole,
+    claims: SessionClaims | None,
+    request: Request,
+    session: AsyncSession,
+) -> SessionClaims | None:
+    """Prefiere la sesión del rol pedido; si no existe, devuelve la otra para responder 403."""
+    if claims is not None and claims["role"] == role:
+        return claims
+    own = await _resolve_session(request, session, role=role)
+    return own if own is not None else claims
+
+
+def _validate_origin(request: Request, *, required: bool = False) -> None:
+    origin = request.headers.get("origin")
+    if origin is None and not required:
+        return
+    allowed = get_settings().app_allowed_origins
+    if get_settings().node_env != "production":
+        allowed = (
+            *allowed, str(request.base_url).rstrip("/"),
+            "http://localhost:3000", "http://127.0.0.1:3000",
+        )
+    if origin not in allowed or request.headers.get("sec-fetch-site") == "cross-site":
+        raise HTTPException(status_code=403, detail="El origen de la petición no está permitido.")
+
