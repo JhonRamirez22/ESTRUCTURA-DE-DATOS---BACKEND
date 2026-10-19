@@ -334,3 +334,87 @@ async def build_optimized_route_plan(
         "adjustedSegments": 0,
         "closedSegments": 0,
         "coverageRatio": 0.0,
+        "warning": "TomTom no disponible; se conservan los tiempos viales de base.",
+    }
+    if traffic_provider is not None and has_road_times:
+        optimization_matrix, live_traffic = await _apply_live_traffic_to_route(
+            traffic_provider, baseline_matrix, initial_route, ordered_coordinates,
+            route_result["geometry"], baseline_matrix=baseline_matrix,
+        )
+    observations = cast(list[dict[str, object]], live_traffic.get("observations", []))
+    measured_pairs = {
+        (item["fromStopId"], item["toStopId"]) for item in observations
+    }
+    traffic_ai: dict[str, object] = {
+        "source": "deterministic",
+        "applied": False,
+        "warning": (
+            "IA de tráfico no configurada o permiso de ubicaciones desactivado; "
+            f"se optimizó con tiempos viales de {provider_name}, no con distancia en línea recta."
+        ),
+    }
+
+    if traffic_ai_advisor is None and traffic_provider is not None and has_road_times:
+        traffic_ai = {
+            "source": "tomtom-live",
+            "applied": False,
+            "warning": "Se usa TomTom en los tramos muestreados y OSRM para el resto.",
+        }
+    elif traffic_ai_advisor is not None and not has_road_times:
+        traffic_ai["warning"] = (
+            "La IA no se consultó porque la matriz es un fallback, "
+            "no tiempos de calles verificados."
+        )
+    elif traffic_ai_advisor is not None:
+        try:
+            stop_ids = [f"stop-{index}" for index in range(len(coordinates))]
+            road_distances = matrix_result.get("distances_meters")
+            all_candidates = build_route_traffic_candidates(
+                stop_ids,
+                coordinates,
+                baseline_matrix,
+                distance_matrix=(
+                    road_distances
+                    if road_distances is not None
+                    else [[None for _ in coordinates] for _ in coordinates]
+                ),
+                distance_source=matrix_source,
+            )
+            baseline_stop_ids = [stop_ids[index] for index in baseline_route]
+            candidates = select_route_traffic_candidates(
+                all_candidates,
+                baseline_stop_ids,
+                MAX_ROUTE_TRAFFIC_AI_CANDIDATES,
+            )
+            if not candidates:
+                raise ValueError("No hay pares con conexión vial para asesoría de IA.")
+            advice = await traffic_ai_advisor.get_route_advice(
+                RouteTrafficAiRequest(
+                    tuple(candidates), current_time.replace(tzinfo=UTC),
+                    traffic_observations=tuple(observations),
+                )
+            )
+            supported, ignored_count = filter_route_traffic_adjustments(
+                candidates, advice.adjustments
+            )
+            # Una sugerencia del modelo nunca sustituye una medición ni reabre un cierre.
+            supported = [
+                item for item in supported
+                if (item.from_stop_id, item.to_stop_id) not in measured_pairs
+            ]
+            optimization_matrix = apply_route_traffic_adjustments(
+                optimization_matrix, stop_ids, supported
+            )
+            warnings: list[str] = []
+            if supported:
+                warnings.append(
+                    "La IA aportó estimaciones para tramos sin medición; "
+                    "TomTom conserva prioridad en los tramos observados."
+                )
+            elif ignored_count:
+                warnings.append(
+                    "La IA devolvió tramos ajenos a la ruta; se usaron tiempos base "
+                    "del proveedor vial."
+                )
+            else:
+                warnings.append(
