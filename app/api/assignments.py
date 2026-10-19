@@ -393,3 +393,81 @@ async def apply_assignments(
                 count
                 for result in results
                 for queued_channel, count in result.customer_notifications_queued_by_channel
+                if queued_channel is channel
+            )
+            for channel in CustomerNotificationChannel
+        }
+        configured_by_channel = customer_notification_channels_configured()
+        queued_notifications = sum(queued_by_channel.values())
+        if queued_notifications and any_customer_notification_delivery_configured():
+            background_tasks.add_task(
+                dispatch_pending_customer_notifications_background,
+                session_factory,
+            )
+        channels = {
+            channel.value.lower(): {
+                "queued": queued_by_channel[channel],
+                "configured": configured_by_channel[channel],
+            }
+            for channel in CustomerNotificationChannel
+        }
+        pending_setup = [
+            "SMTP" if name == "email" else "Twilio SMS"
+            for name, details in channels.items()
+            if details["queued"] and not details["configured"]
+        ]
+        warning = (
+            "Configura "
+            + " y ".join(pending_setup)
+            + " para entregar los avisos."
+            if pending_setup
+            else None
+        )
+        return _json(
+            {
+                "routes": [_operation_json(result) for result in results],
+                "customerNotifications": {
+                    "queued": queued_notifications,
+                    "channels": channels,
+                    "warning": warning,
+                },
+            },
+            status_code=201,
+        )
+    except RoutePlanningError as error:
+        return _error(str(error), error.status_code)
+    except IntegrityError as error:
+        await session.rollback()
+        _log_database_error("Conflicto al aplicar las asignaciones", error)
+        return _error("Un pedido o courier cambió mientras se aplicaban las asignaciones.", 409)
+    except RoutingClientError as error:
+        _LOGGER.warning(
+            "El proveedor vial no pudo preparar todas las rutas asignadas",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error(
+            "El proveedor vial no pudo calcular todas las rutas. "
+            "No se guardaron asignaciones parciales.",
+            502,
+        )
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_database_error("No se pudieron aplicar las asignaciones", error)
+        return _error("No se pudieron aplicar las asignaciones.", 500)
+
+
+def _operation_json(result: RouteOperationResult) -> dict[str, object]:
+    route = result.route
+    ordered_points = sorted(
+        route.delivery_points,
+        key=lambda point: point.sequence_index if point.sequence_index is not None else 0,
+    )
+    return {
+        "matrixSource": result.matrix_source,
+        "orderedDeliveryPointIds": [
+            str(point_id) for point_id in result.ordered_delivery_point_ids
+        ],
+        "trafficAi": result.traffic_ai,
+        "liveTraffic": result.live_traffic,
+        "optimization": get_route_optimization(route.id),
+        "route": {
