@@ -412,3 +412,85 @@ async def delete_delivery_point(
     parsed_id = _parse_uuid(delivery_point_id)
     if parsed_id is None:
         return _error("El pedido no existe.", 404)
+    try:
+        repository = DeliveryPointRepository(session)
+        existing = await repository.get_delivery_point(parsed_id)
+        deleted = await repository.delete_if_pending_unassigned(parsed_id)
+        if deleted and existing is not None:
+            DeliveryEventRecorder(session).deleted(existing, EventActor.from_claims(claims))
+        if not deleted:
+            point = await repository.get_delivery_point(parsed_id)
+            if point is None:
+                return _error("El pedido no existe.", 404)
+            return _error(
+                "Solo se pueden eliminar pedidos pendientes que aún no estén asignados a una ruta.",
+                409,
+            )
+        await session.commit()
+        return Response(status_code=204, headers=_NO_STORE)
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_database_error("No se pudo eliminar el pedido", error)
+        return _error("No se pudo procesar el pedido.", 500)
+
+
+def _point_view(
+    point: DeliveryPoint,
+    *,
+    include_route: bool = False,
+) -> DeliveryPointView:
+    route = point.route if include_route else None
+    return DeliveryPointView(
+        id=point.id,
+        address=point.address,
+        lat=point.lat,
+        lng=point.lng,
+        time_window=cast(JsonValue | None, point.time_window),
+        priority=point.priority,
+        status=point.status,
+        order_id=point.order_id,
+        tracking_token=point.tracking_token,
+        route_id=point.route_id,
+        sequence_index=point.sequence_index,
+        scheduled_for=point.scheduled_for,
+        schedule_state=_schedule_state(point),
+        created_at=point.created_at,
+        delivered_at=point.delivered_at,
+        route=RouteSummaryView.model_validate(route) if route is not None else None,
+    )
+
+
+def _schedule_state(point: DeliveryPoint) -> str | None:
+    """Only open shipments show a schedule badge; a delivered one is simply done."""
+    if point.status not in {DeliveryPointStatus.PENDING, DeliveryPointStatus.REQUESTED}:
+        return None
+    state = DeliverySchedule(lead_minutes=get_settings().scheduled_lead_minutes).state(
+        point.scheduled_for
+    )
+    return state.value if state is not None else None
+
+
+def _point_json(
+    point: DeliveryPoint,
+    *,
+    include_route: bool = False,
+    include_tracking: bool = True,
+) -> dict[str, object]:
+    payload = _point_view(point, include_route=include_route).model_dump(
+        mode="json", by_alias=True
+    )
+    if not include_route:
+        payload.pop("route", None)
+    if not include_tracking:
+        payload.pop("trackingToken", None)
+    return payload
+
+
+def _validate_pasto_location(address: str, latitude: float, longitude: float) -> str | None:
+    if not is_within_pasto_service_area(latitude, longitude):
+        return "La ubicación debe estar dentro de la zona de servicio de Pasto, Nariño."
+    if contains_foreign_city_reference(address):
+        return "La dirección indica una ciudad fuera de Pasto, Nariño."
+    return None
+
+
