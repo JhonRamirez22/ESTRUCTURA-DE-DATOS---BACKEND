@@ -264,3 +264,69 @@ class TrafficService:
                 f"TomTom Traffic respondió HTTP {response.status_code}.", response.status_code
             )
         try:
+            payload: object = response.json()
+            return parse_tomtom_flow_response(payload, timestamp=self._utc_now())
+        except (ValueError, TypeError) as error:
+            raise TrafficProviderError("TomTom Traffic devolvió una respuesta inválida.") from error
+
+    def _use_stale_or_raise(
+        self,
+        cached_node: DoublyLinkedNode[_TrafficCacheEntry] | None,
+        error: TrafficServiceError,
+    ) -> TrafficData:
+        if cached_node is not None and cached_node.value.stale_until > self._monotonic():
+            self._cache.move_to_front(cached_node)
+            _LOGGER.warning("TomTom Traffic sirve el último dato válido del caché")
+            return replace(cached_node.value.data, cache_status="STALE")
+        raise error
+
+    def _store(self, key: str, data: TrafficData) -> None:
+        existing = self._cache_nodes.get(key)
+        if existing is not None:
+            self._cache.remove(existing)
+        stored_at = self._monotonic()
+        entry = _TrafficCacheEntry(
+            key=key,
+            fresh_until=stored_at + TRAFFIC_CACHE_TTL_SECONDS,
+            stale_until=stored_at + TRAFFIC_STALE_MAX_AGE_SECONDS,
+            data=data,
+        )
+        self._cache_nodes[key] = self._cache.appendleft(entry)
+        while len(self._cache) > TRAFFIC_CACHE_MAX_ENTRIES:
+            evicted = self._cache.pop_back()
+            if evicted is not None:
+                self._cache_nodes.pop(evicted.key, None)
+
+    def _remove_cache_node(
+        self,
+        key: str,
+        node: DoublyLinkedNode[_TrafficCacheEntry],
+    ) -> None:
+        self._cache.remove(node)
+        self._cache_nodes.pop(key, None)
+
+
+def build_traffic_cache_key(coordinate: Coordinate) -> str:
+    """Redondea a 5 decimales (aprox. un metro en Pasto) para absorber jitter GPS."""
+    longitude, latitude = coordinate
+    return f"tomtom-flow-v1:{round(latitude, 5)},{round(longitude, 5)}"
+
+
+@lru_cache(maxsize=1)
+def get_traffic_service() -> TrafficService | None:
+    settings = get_settings()
+    api_key = (
+        settings.tomtom_api_key.get_secret_value().strip()
+        if settings.tomtom_api_key is not None
+        else ""
+    )
+    if not api_key:
+        return None
+    return TrafficService(api_key=api_key, timeout_ms=settings.tomtom_traffic_timeout_ms)
+
+
+async def close_traffic_service() -> None:
+    service = get_traffic_service()
+    if service is not None:
+        await service.aclose()
+    get_traffic_service.cache_clear()
