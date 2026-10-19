@@ -429,3 +429,89 @@ def is_courier_near_delivery_point(
         math.sin(latitude_delta / 2) ** 2
         + math.cos(start_latitude) * math.cos(end_latitude) * math.sin(longitude_delta / 2) ** 2
     )
+    distance_meters = 2 * EARTH_RADIUS_METERS * math.asin(min(1.0, math.sqrt(haversine)))
+    return distance_meters <= NEARBY_DELIVERY_RADIUS_METERS
+
+
+async def _enqueue_notification(
+    session: AsyncSession,
+    point: DeliveryPoint,
+    route_id: UUID,
+    event_type: CustomerNotificationEvent,
+    channel: CustomerNotificationChannel,
+    recipient: str,
+    subject: str,
+    text_body: str,
+    now: datetime | None,
+) -> bool:
+    # Mantener la clave de email histórica preserva idempotencia al migrar desde 0002.
+    event_key = f"{event_type.value.lower()}:{route_id}:{point.id}"
+    if channel is CustomerNotificationChannel.SMS:
+        event_key = f"{event_key}:sms"
+    values = {
+        "id": uuid4(),
+        "delivery_point_id": point.id,
+        "event_key": event_key,
+        "event_type": event_type,
+        "channel": channel,
+        "recipient_email": recipient if channel is CustomerNotificationChannel.EMAIL else None,
+        "recipient_phone": recipient if channel is CustomerNotificationChannel.SMS else None,
+        "subject": subject,
+        "text_body": text_body,
+        "status": CustomerNotificationStatus.PENDING,
+        "attempt_count": 0,
+        "available_at": _as_naive_utc(now or datetime.now(UTC)),
+    }
+    dialect_name = session.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        result = await session.execute(
+            postgres_insert(CustomerNotificationOutbox)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=[CustomerNotificationOutbox.event_key])
+            .returning(CustomerNotificationOutbox.id)
+        )
+    elif dialect_name == "sqlite":
+        result = await session.execute(
+            sqlite_insert(CustomerNotificationOutbox)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=[CustomerNotificationOutbox.event_key])
+            .returning(CustomerNotificationOutbox.id)
+        )
+    else:
+        existing = await session.scalar(
+            select(CustomerNotificationOutbox.id).where(
+                CustomerNotificationOutbox.event_key == event_key
+            )
+        )
+        if existing is not None:
+            return False
+        session.add(CustomerNotificationOutbox(**values))
+        await session.flush()
+        return True
+
+    return result.scalar_one_or_none() is not None
+
+
+async def _claim_pending_notifications(
+    session_factory: async_sessionmaker[AsyncSession],
+    now: datetime,
+    settings: Settings,
+    enabled_channels: tuple[CustomerNotificationChannel, ...],
+) -> list[tuple[UUID, CustomerNotificationChannel, str | None, str | None, str, str]]:
+    lease_seconds = max(
+        OUTBOX_LEASE_SECONDS,
+        math.ceil(
+            max(
+                settings.notification_smtp_timeout_ms,
+                settings.notification_sms_timeout_ms,
+            )
+            / 1_000
+        )
+        * 2,
+    )
+    ready = or_(
+        and_(
+            CustomerNotificationOutbox.status == CustomerNotificationStatus.PENDING,
+            CustomerNotificationOutbox.available_at <= now,
+        ),
+        and_(
