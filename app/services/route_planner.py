@@ -418,3 +418,87 @@ async def build_optimized_route_plan(
                 )
             else:
                 warnings.append(
+                    "La IA respondió sin ajustes; se usaron tiempos base del proveedor vial."
+                )
+            if len(candidates) < len(all_candidates):
+                warnings.append(
+                    f"La IA evaluó {len(candidates)} pares priorizados; "
+                    "los demás conservaron tiempos base."
+                )
+            traffic_ai = {
+                "source": "external-ai",
+                "applied": bool(supported),
+                "evaluated": True,
+                "model": advice.model,
+                "warning": " ".join(warnings),
+            }
+        except Exception as error:
+            # El payload puede incluir coordenadas; solo se registra el tipo del error.
+            _LOGGER.warning(
+                "Falló el asesor de tráfico; se usan tiempos viales base",
+                extra={"error_type": type(error).__name__},
+            )
+            traffic_ai = {
+                "source": "deterministic",
+                "applied": False,
+                "warning": (
+                    "La IA de tráfico no respondió de forma utilizable; se optimizó con "
+                    "tiempos viales base."
+                ),
+            }
+
+    # No descartar una solución previa mejor por reiniciar la heurística con nuevos pesos.
+    seed = min(
+        (baseline_route, initial_route, nearest_neighbor(optimization_matrix, 0)),
+        key=lambda route: _route_cost(optimization_matrix, route),
+    )
+    two_opt_route = two_opt(optimization_matrix, seed)
+    # Or-opt traslada tramos de 1 a 3 paradas que 2-opt no corrige con una inversión.
+    optimized_route = or_opt(optimization_matrix, two_opt_route)
+    # Comparar ordenaciones con los mismos costos, no tráfico actual contra flujo libre.
+    baseline_duration = _route_cost(optimization_matrix, baseline_route)
+    optimized_duration = _route_cost(optimization_matrix, optimized_route)
+    if not math.isfinite(optimized_duration):
+        raise RouteConflictError("No existe un camino conectado que cubra todos los pedidos.")
+
+    or_opt_duration = optimized_duration
+    # Óptimo exacto (Held-Karp) en rutas cortas y búsqueda local iterada en largas; es CPU puro,
+    # así que no bloquea el bucle de eventos.
+    refined = await asyncio.to_thread(refine_route, optimization_matrix, optimized_route)
+    optimized_route = refined.route
+    optimized_duration = refined.cost
+    ai_order = await _verified_ai_order(
+        order_advisor, optimization_matrix, optimized_route, has_road_times
+    )
+    if ai_order["accepted"]:
+        optimized_route = cast(list[int], ai_order.pop("route"))
+        optimized_duration = _route_cost(optimization_matrix, optimized_route)
+    ai_order.pop("route", None)
+
+    window_summary = (
+        _apply_time_windows(
+            optimization_matrix, optimized_route, delivery_point_ids, points_by_id, current_time
+        )
+        if get_settings().time_windows_enabled
+        else None
+    )
+    if window_summary is not None:
+        optimized_route = cast(list[int], window_summary.pop("route"))
+        optimized_duration = _route_cost(optimization_matrix, optimized_route)
+
+    final_coordinates = [coordinates[index] for index in optimized_route]
+    if final_coordinates != ordered_coordinates:
+        route_result = await route_provider.get_route(final_coordinates)
+        geometry_provider = route_result["geometry_provider"]
+        if geometry_provider not in {"OSRM", "ORS"}:
+            raise RoutePlanningError("El proveedor no verificó una geometría vial.", 502)
+    final_measured = sum(
+        (f"stop-{start}", f"stop-{end}") in measured_pairs
+        for start, end in zip(optimized_route, optimized_route[1:], strict=False)
+    )
+    live_traffic["usedMeasuredSegments"] = final_measured
+    live_traffic["coverageRatio"] = final_measured / max(1, len(optimized_route) - 1)
+
+    ordered_ids = tuple(delivery_point_ids[index - 1] for index in optimized_route[1:])
+    baseline_geometry: GeoJsonLineString | None = None
+    if baseline_route != optimized_route:
