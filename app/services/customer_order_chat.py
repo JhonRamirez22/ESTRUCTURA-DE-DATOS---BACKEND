@@ -313,3 +313,81 @@ def _messages_in_order_scope(
 def customer_asks_for_arrival_estimate(messages: Sequence[CustomerChatTurn]) -> bool:
     """Detect arrival questions only when the latest turn belongs to this order."""
     scoped_messages = _messages_in_order_scope(messages)
+    if not messages or not scoped_messages or scoped_messages[-1] is not messages[-1]:
+        return False
+    normalized = _normalize_customer_text(messages[-1].content)
+    compact_text = re.sub(r"^[\W_]+|[\W_]+$", "", normalized).strip()
+    return any(pattern.search(normalized) for pattern in _ETA_QUESTION_PHRASES) or any(
+        pattern.fullmatch(compact_text) for pattern in _ETA_FOLLOW_UP_PHRASES
+    )
+
+
+def build_order_fallback_answer(
+    *,
+    delivery_status: str,
+    route_status: str | None,
+    messages: Sequence[CustomerChatTurn],
+    estimated_minutes_from_now: float | None = None,
+) -> str:
+    """Responde con hechos del pedido cuando el proveedor de IA no está disponible."""
+    scoped_messages = _messages_in_order_scope(messages)
+    if not scoped_messages or scoped_messages[-1] is not messages[-1]:
+        return _OUT_OF_SCOPE_REPLY
+
+    fallback_prefix = "No pude consultar la IA ahora. "
+    if customer_asks_for_arrival_estimate(scoped_messages):
+        if (
+            estimated_minutes_from_now is None
+            or not math.isfinite(estimated_minutes_from_now)
+            or estimated_minutes_from_now <= 0
+        ):
+            return (
+                f"{fallback_prefix}No hay un tiempo de llegada confiable para este pedido "
+                "en este momento."
+            )
+        rounded_minutes = max(1, round(estimated_minutes_from_now))
+        return (
+            f"{fallback_prefix}el tiempo estimado es de aproximadamente {rounded_minutes} "
+            "minutos. Es una referencia y puede cambiar durante el recorrido."
+        )
+
+    normalized = _normalize_customer_text(scoped_messages[-1].content)
+    if _ASSIGNMENT_INTENT.search(normalized):
+        if delivery_status == "PENDING":
+            detail = "tu pedido aún está pendiente de asignación a una ruta."
+        elif route_status in {None, "CANCELLED"}:
+            detail = "no hay una ruta activa asociada a tu pedido."
+        else:
+            detail = "tu pedido está asignado a una ruta."
+        return f"{fallback_prefix}{detail}"
+
+    if _ROUTE_PROGRESS_INTENT.search(normalized):
+        if delivery_status == "DELIVERED":
+            detail = "el pedido figura como entregado."
+        elif delivery_status == "FAILED":
+            detail = "el pedido registra una incidencia de entrega."
+        elif route_status == "PLANNED":
+            detail = "tu pedido está en una ruta planificada que aún no inicia."
+        elif route_status == "IN_PROGRESS":
+            detail = (
+                "la ruta de tu pedido está en curso. El mapa muestra la última ubicación "
+                "disponible si el repartidor ha reportado GPS recientemente."
+            )
+        elif route_status == "CANCELLED":
+            detail = "la ruta asociada fue cancelada y no hay una ruta activa."
+        else:
+            detail = "aún no hay información de una ruta activa para este pedido."
+        return f"{fallback_prefix}{detail}"
+
+    status_answers = {
+        "PENDING": "tu pedido fue recibido y aún está pendiente de asignación.",
+        "EN_ROUTE": "tu pedido está en camino.",
+        "DELIVERED": "tu pedido figura como entregado.",
+        "FAILED": "tu pedido registra una incidencia de entrega.",
+    }
+    detail = status_answers.get(
+        delivery_status,
+        "no hay información suficiente para confirmar el estado del pedido.",
+    )
+    return f"{fallback_prefix}{detail}"
+
