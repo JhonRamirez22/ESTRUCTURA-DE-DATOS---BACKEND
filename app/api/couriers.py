@@ -423,3 +423,88 @@ async def _post_location(
         accepted=result["accepted"],
     )
     return _json(
+        payload.model_dump(mode="json", by_alias=True),
+        status_code=201,
+        headers=_NO_STORE_PRIVATE,
+    )
+
+
+async def _write_location(
+    session_factory: async_sessionmaker[AsyncSession],
+    courier_id: UUID,
+    latitude: float,
+    longitude: float,
+    recorded_at: datetime,
+) -> _LocationWriteResult:
+    async with session_factory() as session:
+        async with session.begin():
+            repository = CourierRepository(session)
+            if not await repository.courier_exists(courier_id):
+                raise CourierNotFoundError
+            event, accepted = await repository.record_location(
+                courier_id=courier_id,
+                latitude=latitude,
+                longitude=longitude,
+                recorded_at=recorded_at,
+            )
+            nearby_notification_queued = False
+            if accepted:
+                next_point = await repository.get_next_delivery_point_for_route(courier_id)
+                if next_point is not None and next_point.route_id is not None:
+                    if is_courier_near_delivery_point(
+                        latitude,
+                        longitude,
+                        next_point.lat,
+                        next_point.lng,
+                    ):
+                        nearby_notification_queued = bool(
+                            await enqueue_courier_near_notification(
+                                session,
+                                next_point,
+                                next_point.route_id,
+                                now=recorded_at,
+                            )
+                        )
+            return {
+                "event": event,
+                "accepted": accepted,
+                "nearby_notification_queued": nearby_notification_queued,
+            }
+
+
+@router.delete("/{courier_id}/ubicacion")
+async def stop_courier_location(
+    courier_id: str,
+    claims: Annotated[SessionClaims, Depends(require_courier_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    parsed_id = _parse_uuid(courier_id)
+    if str(parsed_id) != claims.get("courierId"):
+        return _error("No puedes detener el seguimiento de otro repartidor.", 403)
+    return await _stop_location(parsed_id, session)
+
+
+async def _stop_location(courier_id: UUID, session: AsyncSession) -> JSONResponse:
+    try:
+        async with session.begin():
+            repository = CourierRepository(session)
+            active_route_id = await repository.get_active_route_id(courier_id)
+            courier = await repository.get_courier(courier_id)
+            if courier is None:
+                return _error("El repartidor no existe.", 404)
+            courier.status = (
+                CourierStatus.ON_ROUTE if active_route_id is not None else CourierStatus.OFFLINE
+            )
+        payload = {
+            "courier": {
+                "status": courier.status.value,
+                "lastLocationAt": _iso_utc(courier.last_location_at),
+            }
+        }
+        return _json(payload, headers=_NO_STORE_PRIVATE)
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_db_error("No se pudo detener el seguimiento", error)
+        return _error("No se pudo detener el seguimiento.", 500)
+
+
