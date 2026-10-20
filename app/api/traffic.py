@@ -8,7 +8,7 @@ import math
 from datetime import UTC
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query
 from starlette.responses import JSONResponse
 
 from app.api.auth import get_optional_session
@@ -31,7 +31,6 @@ _RATE_LIMITER = CustomerChatRateLimiter(max_requests=60, window_seconds=60)
 
 @router.get("")
 async def get_traffic(
-    request: Request,
     claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
     service: Annotated[TrafficService | None, Depends(get_traffic_service)],
     lat: Annotated[float, Query(ge=-90, le=90)],
@@ -46,8 +45,9 @@ async def get_traffic(
     if service is None:
         return _error("TomTom Traffic no está configurado todavía.", 503)
 
-    session_token = request.cookies.get("rutas-pasto-session", "")
-    session_fingerprint = hashlib.sha256(session_token.encode("utf-8")).hexdigest()
+    # Cada cuenta tiene su propio contador; la cookie ya no es única, así que se usa la cuenta.
+    subject = claims.get("accountId") or claims.get("courierId") or claims["role"]
+    session_fingerprint = hashlib.sha256(subject.encode("utf-8")).hexdigest()
     retry_after = _RATE_LIMITER.retry_after(session_fingerprint)
     if retry_after is not None:
         return JSONResponse(

@@ -21,16 +21,20 @@ from app.core.routing.contracts import GeoJsonLineString, RouteResult
 from app.db.session import get_session
 from app.models import DeliveryPointStatus, RouteStatus
 from app.repositories.delivery_point_repository import DeliveryPointRepository
+from app.services.customer_chat_rate_limiter import CustomerChatRateLimiter
 from app.services.customer_eta_traffic import (
     FirstLegTrafficEstimate,
     estimate_first_leg_with_traffic,
 )
 from app.services.route_planner import get_routing_providers
 from app.services.traffic import TrafficService, get_traffic_service
+from app.settings import get_settings
 
 router = APIRouter(prefix="/seguimiento", tags=["seguimiento"])
 _LOGGER = logging.getLogger(__name__)
 _NO_STORE = {"Cache-Control": "no-store, private"}
+# Acota el consumo de ETA/tráfico (TomTom) por guía: 30 consultas por minuto.
+_TRACKING_LIMITER = CustomerChatRateLimiter(max_requests=30, window_seconds=60)
 _TERMINAL_POINT_STATUSES = (DeliveryPointStatus.DELIVERED, DeliveryPointStatus.FAILED)
 _ACTIVE_ROUTE_STATUSES = (RouteStatus.PLANNED, RouteStatus.IN_PROGRESS)
 
@@ -48,6 +52,14 @@ async def get_tracking(
     normalized_guide = guide.strip() if guide is not None else ""
     if not normalized_guide:
         return _error("Ingresa el número de guía para consultar el pedido.", 400)
+
+    limited = await _tracking_retry_after(session, normalized_guide)
+    if limited is not None:
+        return JSONResponse(
+            content={"error": "Demasiadas consultas seguidas. Espera un momento."},
+            status_code=429,
+            headers={**_NO_STORE, "Retry-After": str(limited)},
+        )
 
     matrix_provider, route_provider = providers
     try:
@@ -306,3 +318,21 @@ def _error(message: str, status_code: int) -> JSONResponse:
 
 def _json(content: dict[str, object]) -> JSONResponse:
     return JSONResponse(content=jsonable_encoder(content), headers=_NO_STORE)
+
+
+async def _tracking_retry_after(session: AsyncSession, guide: str) -> int | None:
+    """Límite compartido en PostgreSQL; sin AUTH_SECRET se usa el contador local."""
+    settings = get_settings()
+    secret = settings.auth_secret.get_secret_value() if settings.auth_secret is not None else ""
+    key = f"tracking:{guide}"
+    if not secret:
+        return _TRACKING_LIMITER.retry_after(key)
+    try:
+        return await _TRACKING_LIMITER.retry_after_shared(session, key, hmac_secret=secret)
+    except (SQLAlchemyError, ValueError, RuntimeError) as error:
+        await session.rollback()
+        _LOGGER.warning(
+            "No se pudo aplicar el límite compartido del seguimiento",
+            extra={"error_type": type(error).__name__},
+        )
+        return None
