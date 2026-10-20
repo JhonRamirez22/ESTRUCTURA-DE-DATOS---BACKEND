@@ -14,6 +14,7 @@ from app.core.auth import SessionClaims
 from app.services.optimization_feed import (
     mark_summary_requested,
     recent_events,
+    recent_incidents,
     stats,
     summary_cooldown_remaining,
 )
@@ -38,6 +39,7 @@ async def recent_optimizations(
     current = stats()
     return {
         "events": recent_events(limit),
+        "incidents": recent_incidents(10),
         "stats": {
             "proposals": current.proposals,
             "cacheHits": current.cache_hits,

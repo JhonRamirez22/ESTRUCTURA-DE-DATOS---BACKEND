@@ -6,6 +6,7 @@ nombres ni coordenadas.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -14,6 +15,7 @@ from typing import Protocol
 
 import httpx
 
+from app.services.optimization_feed import record_incident
 from app.settings import get_settings
 
 _LOGGER = logging.getLogger(__name__)
@@ -77,20 +79,40 @@ class HttpRouteOrderAdvisor:
             "max_tokens": 600,
             "stream": False,
         }
-        try:
-            async with httpx.AsyncClient(
-                timeout=self._timeout_seconds, transport=self._transport
-            ) as client:
-                response = await client.post(
-                    self._api_url,
-                    headers={"Authorization": f"Bearer {self._api_key}"},
-                    json=body,
-                )
-        except httpx.HTTPError as error:
-            raise RouteOrderAdvisorError("No se pudo consultar a la IA de orden.") from error
-        if not response.is_success:
-            raise RouteOrderAdvisorError(f"La IA de orden respondió HTTP {response.status_code}.")
+        response = await self._post_with_one_retry(body)
         return _parse_order(response, size)
+
+
+    async def _post_with_one_retry(self, body: dict[str, object]) -> httpx.Response:
+        last_error: RouteOrderAdvisorError | None = None
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self._timeout_seconds, transport=self._transport
+                ) as client:
+                    response = await client.post(
+                        self._api_url,
+                        headers={"Authorization": f"Bearer {self._api_key}"},
+                        json=body,
+                    )
+            except httpx.HTTPError as error:
+                record_incident("groq", "orden:red")
+                last_error = RouteOrderAdvisorError("No se pudo consultar a la IA de orden.")
+                last_error.__cause__ = error
+            else:
+                if response.is_success:
+                    return response
+                retryable = response.status_code == 429 or response.status_code >= 500
+                record_incident("groq", f"orden:http-{response.status_code}")
+                last_error = RouteOrderAdvisorError(
+                    f"La IA de orden respondió HTTP {response.status_code}."
+                )
+                if not retryable:
+                    break
+            if attempt == 0:
+                await asyncio.sleep(0.4)
+        assert last_error is not None
+        raise last_error
 
 
 def _parse_order(response: httpx.Response, size: int) -> list[int]:

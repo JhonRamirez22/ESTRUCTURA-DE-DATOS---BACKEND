@@ -55,3 +55,39 @@ async def test_advisor_reports_provider_errors_without_leaking_details() -> None
     with pytest.raises(RouteOrderAdvisorError) as error:
         await _advisor(transport).suggest_order(MATRIX, [0, 1, 2])
     assert "secret detail" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_advisor_retries_once_on_a_transient_error_and_records_the_incident() -> None:
+    from app.services import optimization_feed
+
+    optimization_feed.reset()
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(503)
+        return _reply('{"order":["stop-0","stop-1","stop-2"]}')
+
+    order = await _advisor(httpx.MockTransport(handler)).suggest_order(MATRIX, [0, 1, 2])
+    assert order == [0, 1, 2] and calls["count"] == 2
+    assert optimization_feed.recent_incidents(5)[0]["kind"] == "orden:http-503"
+    optimization_feed.reset()
+
+
+@pytest.mark.asyncio
+async def test_advisor_does_not_retry_a_client_error() -> None:
+    from app.services import optimization_feed
+
+    optimization_feed.reset()
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(400)
+
+    with pytest.raises(RouteOrderAdvisorError):
+        await _advisor(httpx.MockTransport(handler)).suggest_order(MATRIX, [0, 1, 2])
+    assert calls["count"] == 1
+    optimization_feed.reset()
