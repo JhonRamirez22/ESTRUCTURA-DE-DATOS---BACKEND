@@ -34,6 +34,7 @@ from app.models import (
     RouteStatus,
 )
 from app.repositories.route_repository import RouteRepository
+from app.services.optimization_feed import record_applied, record_proposal
 from app.services.route_planner import (
     MAX_ROUTE_STOPS,
     MatrixProvider,
@@ -317,6 +318,7 @@ async def recalculate_route_endpoint(
         result = await recalculate_route(session, parsed_id, plan, previous_ids)
         body = _operation_json(result, dispatcher=dispatcher)
         body["recalculated"] = True
+        record_applied(parsed_id, body)
         route_payload = body.get("route")
         if dispatcher and isinstance(route_payload, dict):
             route_payload["canUndo"] = True
@@ -395,6 +397,7 @@ async def propose_route_endpoint(
         )
         cached = _PROPOSAL_CACHE.get(cache_key)
         if cached is not None and now - cached[0] < _PROPOSAL_TTL_SECONDS:
+            record_proposal(parsed_id, cached[1], cached=True)
             return _json({**cached[1], "cached": True}, headers=_NO_STORE)
         matrix_provider, route_provider = providers
         plan = await build_optimized_route_plan(
@@ -412,6 +415,7 @@ async def propose_route_endpoint(
         if len(_PROPOSAL_CACHE) >= _PROPOSAL_CACHE_LIMIT:
             _PROPOSAL_CACHE.clear()
         _PROPOSAL_CACHE[cache_key] = (now, body)
+        record_proposal(parsed_id, body, cached=False)
         return _json({**body, "cached": False}, headers=_NO_STORE)
     except RoutePlanningError as error:
         return _error(str(error), error.status_code)

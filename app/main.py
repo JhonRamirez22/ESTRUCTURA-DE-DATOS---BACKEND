@@ -20,6 +20,7 @@ from app.api.customer_chat import router as customer_chat_router
 from app.api.geocoding import router as geocoding_router
 from app.api.health import router as health_router
 from app.api.notifications import router as notifications_router
+from app.api.optimizations import router as optimizations_router
 from app.api.orders import router as orders_router
 from app.api.routes import router as routes_router
 from app.api.tracking import router as tracking_router
@@ -88,6 +89,7 @@ for router in (
     health_router, auth_router, addresses_router, notifications_router, customer_chat_router,
     geocoding_router, analytics_router, couriers_router, orders_router,
     assignments_router, routes_router, tracking_router, traffic_router, traffic_tiles_router,
+    optimizations_router,
 ):
     app.include_router(router, prefix="/api/v1")
     # El alias conserva exactamente las mismas dependencias y permisos.

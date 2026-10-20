@@ -1106,3 +1106,32 @@ async def test_route_proposal_is_scoped_and_never_persists_the_order(
         f"/api/v1/rutas/{route['id']}", headers={"Cookie": _cookie("dispatcher")},
     )
     assert unchanged.json()["route"]["optimizedAt"] == route["optimizedAt"]
+
+
+@pytest.mark.asyncio
+async def test_optimization_feed_is_dispatcher_only(client: httpx.AsyncClient) -> None:
+    assert (await client.get("/api/v1/optimizaciones/recientes")).status_code == 401
+    courier = await client.get(
+        "/api/v1/optimizaciones/recientes", headers={"Cookie": _cookie("courier", uuid4())},
+    )
+    assert courier.status_code == 403
+    allowed = await client.get(
+        "/api/v1/optimizaciones/recientes", headers={"Cookie": _cookie("dispatcher")},
+    )
+    assert allowed.status_code == 200
+    assert set(allowed.json()) >= {"events", "stats", "summaryCooldownSeconds"}
+
+
+@pytest.mark.asyncio
+async def test_optimization_summary_requires_groq_and_never_changes_routes(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import optimization_feed
+
+    monkeypatch.setenv("CUSTOMER_CHAT_API_KEY", "")
+    get_settings.cache_clear()
+    optimization_feed._LAST_SUMMARY_AT.clear()
+    response = await client.post(
+        "/api/v1/optimizaciones/resumen", headers={"Cookie": _cookie("dispatcher")},
+    )
+    assert response.status_code == 503

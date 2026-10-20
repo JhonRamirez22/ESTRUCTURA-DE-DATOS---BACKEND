@@ -21,6 +21,8 @@ _EXPECTED_OPERATIONS = frozenset(
         ("GET", "/api/geocoding/search"),
         ("GET", "/api/notificaciones"),
         ("GET", "/api/notificaciones/clientes/estado"),
+        ("GET", "/api/optimizaciones/recientes"),
+        ("POST", "/api/optimizaciones/resumen"),
         ("GET", "/api/pedidos"),
         ("POST", "/api/pedidos"),
         ("DELETE", "/api/pedidos/{}"),
