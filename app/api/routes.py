@@ -497,3 +497,86 @@ async def undo_route_recalculation_endpoint(
     session: Annotated[AsyncSession, Depends(get_session)],
     claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
 ) -> JSONResponse:
+    if claims is None:
+        return _error("Debes iniciar sesión para continuar.", 401)
+    if claims["role"] != "dispatcher":
+        return _error("Se requiere una sesión de despacho.", 403)
+    parsed_id = _parse_uuid(route_id)
+    if parsed_id is None:
+        return _error("La ruta no existe.", 404)
+    try:
+        result = await undo_route_recalculation(session, parsed_id)
+        return _json(
+            {
+                "route": _route_json(result.route, dispatcher=True, can_undo=result.can_undo),
+                "undone": True,
+                "canUndo": result.can_undo,
+                "releasedDeliveryPointIds": [
+                    str(point_id) for point_id in result.released_delivery_point_ids
+                ],
+            },
+            headers=_NO_STORE,
+        )
+    except RoutePlanningError as error:
+        return _error(str(error), error.status_code)
+    except SQLAlchemyError as error:
+        await session.rollback()
+        _log_database_error("No se pudo restaurar el recálculo de la ruta", error)
+        return _error("No se pudo restaurar el recálculo de la ruta.", 500)
+
+
+@router.get("/{route_id}/navegacion")
+async def get_route_navigation(
+    route_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    providers: Annotated[
+        tuple[CachedMatrixProvider, CachedRouteProvider],
+        Depends(get_routing_providers),
+    ],
+) -> JSONResponse:
+    authorized = _authorize_route_id(route_id, claims)
+    if isinstance(authorized, JSONResponse):
+        return authorized
+    route_uuid, _dispatcher = authorized
+    try:
+        route = await RouteRepository(session).load_route(route_uuid)
+        if route is None:
+            return _error("La ruta no existe.", 404)
+        if (
+            claims is not None
+            and claims["role"] == "courier"
+            and route.courier_id != _claim_courier_id(claims)
+        ):
+            return _error("La ruta no existe.", 404)
+        if route.status not in {RouteStatus.PLANNED, RouteStatus.IN_PROGRESS}:
+            return _error("La ruta no está disponible para navegación.", 409)
+
+        courier = route.courier
+        if courier.current_lat is None or courier.current_lng is None:
+            return _error("El repartidor todavía no tiene una ubicación actual.", 409)
+        if not is_courier_location_fresh(courier.last_location_at):
+            return _error(
+                "La ubicación GPS está desactualizada. Comparte una posición reciente "
+                "para actualizar el trazado.",
+                409,
+            )
+        if not is_within_pasto_service_area(courier.current_lat, courier.current_lng):
+            return _error("La última ubicación está fuera de Pasto.", 409)
+
+        remaining = sorted(
+            (
+                point
+                for point in route.delivery_points
+                if point.status.value in {"PENDING", "EN_ROUTE"}
+            ),
+            key=lambda point: point.sequence_index if point.sequence_index is not None else 0,
+        )
+        if not remaining:
+            return _json({"navigation": None})
+        coordinates: list[Coordinate] = [(courier.current_lng, courier.current_lat)]
+        coordinates.extend((point.lng, point.lat) for point in remaining)
+        _matrix_provider, route_provider = providers
+        result = await cast(RouteProvider, route_provider).get_route(coordinates)
+        if result["geometry_provider"] not in {"OSRM", "ORS"}:
+            return _error(
