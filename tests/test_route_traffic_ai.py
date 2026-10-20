@@ -78,7 +78,7 @@ async def test_http_advisor_supports_openai_chat_and_sanitizes_provider_errors()
     async def success_handler(incoming: httpx.Request) -> httpx.Response:
         body = json.loads(incoming.content)
         seen_payload.update(body)
-        content = json.dumps({"adjustments": [], "model": "test-model"})
+        content = json.dumps({"adjustments": [], "model": "invented-by-response"})
         return httpx.Response(
             200,
             json={"choices": [{"message": {"content": content}}]},

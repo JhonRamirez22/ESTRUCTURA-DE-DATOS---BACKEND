@@ -290,11 +290,46 @@ async def test_route_creation_applies_tomtom_factor_and_returns_coverage(
     assert response.status_code == 201, response.text
     payload = response.json()
     assert payload["route"]["estimatedDurationMinutes"] == 12.0
+    # Una sola parada no ahorra ni pierde tiempo por reordenación: ambas usan el mismo tráfico.
+    assert payload["route"]["baselineDurationMinutes"] == 12.0
     assert payload["trafficAi"]["source"] == "tomtom-live"
     assert payload["liveTraffic"]["source"] == "tomtom"
     assert payload["liveTraffic"]["adjustedSegments"] == 1
     assert payload["liveTraffic"]["coverageRatio"] == 1.0
     assert len(traffic.coordinates) == 1
+
+
+@pytest.mark.asyncio
+async def test_closed_baseline_can_be_replaced_without_infinite_savings(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from dataclasses import replace
+
+    class ClosedTrafficProvider(FakeTomTomTrafficProvider):
+        async def get_flow_segment(self, coordinate: Coordinate) -> TrafficData:
+            return replace(
+                await super().get_flow_segment(coordinate),
+                road_closure=True, traffic_level=TrafficLevel.CERRADO,
+            )
+
+    await _create_courier(session_factory)
+    first_id = await _create_point(session_factory)
+    second_id = await _create_point(session_factory, address="Calle 18 # 20-30")
+    app.dependency_overrides[get_traffic_service] = ClosedTrafficProvider
+    async with session_factory() as session:
+        second = await session.get(DeliveryPoint, second_id)
+        assert second is not None
+        second.lat, second.lng = 1.215, -77.279
+        await session.commit()
+    response = await client.post(
+        "/api/v1/rutas", headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(first_id), str(second_id)]},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["orderedDeliveryPointIds"] == [str(first_id), str(second_id)]
+    assert response.json()["route"]["baselineDurationMinutes"] is None
+    assert response.json()["route"]["estimatedDurationMinutes"] == 9
 
 
 @pytest.mark.asyncio
@@ -323,9 +358,70 @@ async def test_ors_road_matrix_can_use_traffic_advice_without_fabricated_distanc
     assert payload["trafficAi"]["source"] == "external-ai"
     assert payload["trafficAi"]["applied"] is True
     assert advisor.requests == 1
-    assert payload["route"]["baselineDurationMinutes"] == 6.0
+    assert payload["route"]["baselineDurationMinutes"] == pytest.approx(8.4)
     assert payload["route"]["baselineDistanceMeters"] is None
     assert payload["route"]["geometryProvider"] == "ORS"
+
+
+@pytest.mark.asyncio
+async def test_groq_receives_tomtom_evidence_without_overwriting_observed_travel_time(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from app.core.ai.route_traffic import RouteTrafficAiRequest
+
+    requests: list[RouteTrafficAiRequest] = []
+
+    class Advisor:
+        async def get_route_advice(self, request: RouteTrafficAiRequest) -> RouteTrafficAdvice:
+            requests.append(request)
+            return RouteTrafficAdvice(
+                adjustments=(RouteTrafficAdjustment("stop-0", "stop-1", 0.5),),
+                model="groq-test",
+            )
+
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    app.dependency_overrides[get_route_traffic_advisor] = Advisor
+    app.dependency_overrides[get_traffic_service] = FakeTomTomTrafficProvider
+    result = await client.post(
+        "/api/v1/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(point_id)]},
+    )
+    assert result.status_code == 201, result.text
+    assert requests[0].as_payload()["trafficObservations"][0]["trafficMultiplier"] == 2.0
+    assert result.json()["route"]["estimatedDurationMinutes"] == 12
+    assert result.json()["trafficAi"]["source"] == "external-ai"
+
+
+@pytest.mark.asyncio
+async def test_courier_can_optimize_only_own_route_without_adding_orders_or_leaking_secrets(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    created = await client.post(
+        "/api/v1/rutas", headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(point_id)]},
+    )
+    endpoint = f"/api/v1/rutas/{created.json()['route']['id']}/recalcular"
+    foreign = await client.post(endpoint, headers={"Cookie": _cookie("courier", uuid4())}, json={})
+    assert foreign.status_code == 404
+    added = await client.post(
+        endpoint, headers={"Cookie": _cookie("courier", _COURIER_ID)},
+        json={"deliveryPointIds": [str(uuid4())]},
+    )
+    assert added.status_code == 403
+    own = await client.post(
+        endpoint, headers={"Cookie": _cookie("courier", _COURIER_ID)}, json={},
+    )
+    assert own.status_code == 200, own.text
+    assert own.json()["route"]["geometryProvider"] == "OSRM"
+    assert own.json()["route"]["optimizedAt"]
+    assert "TRACK-" not in own.text and "3001112233" not in own.text
+    assert "trackingToken" not in own.json()["route"]["deliveryPoints"][0]
 
 
 @pytest.mark.asyncio

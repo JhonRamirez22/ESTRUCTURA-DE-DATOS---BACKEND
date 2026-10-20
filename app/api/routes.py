@@ -274,8 +274,9 @@ async def recalculate_route_endpoint(
 ) -> JSONResponse:
     if claims is None:
         return _error("Debes iniciar sesión para continuar.", 401)
-    if claims["role"] != "dispatcher":
-        return _error("Se requiere una sesión de despacho.", 403)
+    dispatcher = claims["role"] == "dispatcher"
+    if not dispatcher and _claim_courier_id(claims) is None:
+        return _error("La sesión de repartidor no es válida.", 403)
     parsed_id = _parse_uuid(route_id)
     if parsed_id is None:
         return _error("La ruta no existe.", 404)
@@ -284,8 +285,10 @@ async def recalculate_route_endpoint(
         return parsed_body
     try:
         route = await RouteRepository(session).load_route(parsed_id)
-        if route is None:
+        if route is None or (not dispatcher and route.courier_id != _claim_courier_id(claims)):
             return _error("La ruta no existe.", 404)
+        if not dispatcher and parsed_body.delivery_point_ids:
+            return _error("El repartidor solo puede optimizar sus paradas ya asignadas.", 403)
         if route.status not in {RouteStatus.PLANNED, RouteStatus.IN_PROGRESS}:
             return _error("Solo se pueden recalcular rutas planificadas o en progreso.", 409)
         previous_ids = [
@@ -310,10 +313,10 @@ async def recalculate_route_endpoint(
             existing_route_id=parsed_id,
         )
         result = await recalculate_route(session, parsed_id, plan, previous_ids)
-        body = _operation_json(result)
+        body = _operation_json(result, dispatcher=dispatcher)
         body["recalculated"] = True
         route_payload = body.get("route")
-        if isinstance(route_payload, dict):
+        if dispatcher and isinstance(route_payload, dict):
             route_payload["canUndo"] = True
         return _json(body, headers=_NO_STORE)
     except RoutePlanningError as error:
@@ -777,7 +780,9 @@ def _read_route_geometry(value: object) -> GeoJsonLineString | None:
     return {"type": "LineString", "coordinates": parsed}
 
 
-def _operation_json(result: RouteOperationResult) -> dict[str, object]:
+def _operation_json(
+    result: RouteOperationResult, *, dispatcher: bool = True
+) -> dict[str, object]:
     route = result.route
     point_ids = result.ordered_delivery_point_ids
     return {
@@ -785,7 +790,7 @@ def _operation_json(result: RouteOperationResult) -> dict[str, object]:
         "orderedDeliveryPointIds": [str(point_id) for point_id in point_ids],
         "trafficAi": result.traffic_ai,
         "liveTraffic": result.live_traffic,
-        "route": _route_json(route, dispatcher=True),
+        "route": _route_json(route, dispatcher=dispatcher),
         **({"warning": result.warning} if result.warning is not None else {}),
     }
 

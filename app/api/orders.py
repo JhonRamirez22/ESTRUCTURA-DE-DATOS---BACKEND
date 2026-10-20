@@ -384,15 +384,15 @@ async def delete_delivery_point(
         return _error("El pedido no existe.", 404)
     try:
         repository = DeliveryPointRepository(session)
-        point = await repository.get_delivery_point(parsed_id)
-        if point is None:
-            return _error("El pedido no existe.", 404)
-        if point.route_id is not None or point.status is not DeliveryPointStatus.PENDING:
+        deleted = await repository.delete_if_pending_unassigned(parsed_id)
+        if not deleted:
+            point = await repository.get_delivery_point(parsed_id)
+            if point is None:
+                return _error("El pedido no existe.", 404)
             return _error(
                 "Solo se pueden eliminar pedidos pendientes que aún no estén asignados a una ruta.",
                 409,
             )
-        await repository.delete(point)
         await session.commit()
         return Response(status_code=204, headers=_NO_STORE)
     except SQLAlchemyError as error:

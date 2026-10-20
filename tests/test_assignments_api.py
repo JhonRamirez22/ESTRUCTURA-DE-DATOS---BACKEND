@@ -19,12 +19,14 @@ from app.core.ai.assignment_traffic import (
     AssignmentTrafficAdvice,
     AssignmentTrafficRequest,
 )
+from app.core.ai.route_traffic import RouteTrafficAdvice
 from app.core.auth import (
     SESSION_COOKIE_NAME,
     SESSION_MAX_AGE_SECONDS,
     create_session_token,
 )
 from app.core.routing.contracts import Coordinate, RouteResult
+from app.core.traffic.tomtom import TrafficData, TrafficLevel
 from app.db.base import Base
 from app.db.session import get_session, get_session_factory
 from app.main import app
@@ -80,6 +82,7 @@ class FakeRouteProvider:
 class FakeTrafficAdvisor:
     def __init__(self, *, fail_route_advice: bool = False) -> None:
         self.assignment_request: AssignmentTrafficRequest | None = None
+        self.route_requests = 0
         self.fail_route_advice = fail_route_advice
 
     async def get_assignment_advice(
@@ -100,12 +103,10 @@ class FakeTrafficAdvisor:
         )
 
     async def get_route_advice(self, _request: object) -> Any:
+        self.route_requests += 1
         if self.fail_route_advice:
             raise RuntimeError("AI unavailable")
-        return {
-            "adjustments": (),
-            "model": "test-model",
-        }
+        return RouteTrafficAdvice(adjustments=(), model="test-model")
 
 
 @pytest_asyncio.fixture
@@ -249,40 +250,67 @@ async def test_proposal_is_dispatcher_only_and_reports_orders_when_no_courier_is
 
 
 @pytest.mark.asyncio
-async def test_proposal_sends_opaque_aliases_to_ai_and_uses_valid_adjustment(
+async def test_proposal_does_not_call_ai_or_persist_routes_before_dispatch(
     client: httpx.AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     courier = await _create_courier(session_factory, latitude=1.2136, longitude=-77.2811)
     point = await _create_point(session_factory, latitude=1.214, longitude=-77.28)
     advisor = FakeTrafficAdvisor()
+    traffic_calls: list[Coordinate] = []
+
+    class Traffic:
+        async def get_flow_segment(self, coordinate: Coordinate) -> TrafficData:
+            traffic_calls.append(coordinate)
+            return TrafficData(
+                current_speed_kmh=20, free_flow_speed_kmh=40,
+                current_travel_time_seconds=120, free_flow_travel_time_seconds=60,
+                confidence=0.9, road_closure=False, traffic_ratio=0.5,
+                traffic_level=TrafficLevel.ALTO, travel_time_multiplier=2.0,
+                timestamp=datetime.now(UTC),
+            )
+
     app.dependency_overrides[get_route_traffic_advisor] = lambda: advisor
+    app.dependency_overrides[get_traffic_service] = Traffic
     try:
         response = await client.post(
             "/api/asignaciones",
             headers={"Cookie": _dispatcher_cookie()},
             json={"courierIds": [str(courier.id)], "deliveryPointIds": [str(point.id)]},
         )
+        assert advisor.route_requests == 0
+        assert traffic_calls == []
+        async with session_factory() as session:
+            assert await session.scalar(select(func.count()).select_from(Route)) == 0
+        dispatched = await client.post(
+            "/api/asignaciones/aplicar",
+            headers={"Cookie": _dispatcher_cookie()},
+            json={"assignments": response.json()["assignments"]},
+        )
+        assert dispatched.status_code == 201, dispatched.text
+        assert advisor.route_requests == 1
+        assert traffic_calls
+        assert dispatched.json()["routes"][0]["liveTraffic"]["applied"] is True
+        route_id = dispatched.json()["routes"][0]["route"]["id"]
+        calls_after_dispatch = len(traffic_calls)
+        for _ in range(2):
+            listed = await client.get("/api/rutas", headers={"Cookie": _dispatcher_cookie()})
+            navigation = await client.get(
+                f"/api/rutas/{route_id}/navegacion", headers={"Cookie": _dispatcher_cookie()}
+            )
+            assert listed.status_code == navigation.status_code == 200
+        assert advisor.route_requests == 1
+        assert len(traffic_calls) == calls_after_dispatch
     finally:
         app.dependency_overrides.pop(get_route_traffic_advisor, None)
+        app.dependency_overrides.pop(get_traffic_service, None)
 
     assert response.status_code == 200
-    assert advisor.assignment_request is not None
-    candidate = advisor.assignment_request.candidates[0]
-    assert candidate.courier_id == "courier-1"
-    assert candidate.order_id == "order-1"
-    assert str(courier.id) not in str(advisor.assignment_request.as_payload())
-    assert str(point.id) not in str(advisor.assignment_request.as_payload())
-    assert response.json()["ai"] == {
-        "source": "external-ai",
-        "applied": True,
-        "model": "test-model",
-        "routingSource": "osrm",
-        "warning": (
-            "Groq aportó factores estimados sobre costos viales de OSRM; "
-            "no representan tráfico en vivo."
-        ),
-    }
+    assert advisor.assignment_request is None
+    assert response.json()["ai"]["source"] == "deterministic"
+    assert response.json()["ai"]["applied"] is False
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Route)) == 1
 
 
 @pytest.mark.asyncio

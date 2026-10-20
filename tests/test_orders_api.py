@@ -539,9 +539,11 @@ async def test_dispatcher_can_edit_and_delete_only_unassigned_pending_orders(
         json={"lat": 1.215, "lng": -77.279},
     )
     deleted = await client.delete(f"/api/pedidos/{point_id}", headers=dispatcher)
+    deleted_again = await client.delete(f"/api/pedidos/{point_id}", headers=dispatcher)
     assert blocked_delete.status_code == 409
     assert blocked_location_edit.status_code == 409
     assert deleted.status_code == 204
+    assert deleted_again.status_code == 404
     async with session_factory() as session:
         assert await session.get(DeliveryPoint, point_id) is None
         assigned_point = await session.get(DeliveryPoint, assigned_point_id)

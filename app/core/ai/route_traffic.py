@@ -61,6 +61,7 @@ class RouteTrafficAiRequest:
     candidates: tuple[RouteTrafficCandidate, ...]
     generated_at: datetime
     courier_id: str = "courier"
+    traffic_observations: tuple[dict[str, object], ...] = ()
 
     def as_payload(self) -> dict[str, object]:
         timestamp = self.generated_at.astimezone(UTC).isoformat(timespec="milliseconds")
@@ -71,6 +72,7 @@ class RouteTrafficAiRequest:
             "generatedAt": timestamp.replace("+00:00", "Z"),
             "courierId": self.courier_id,
             "candidates": [candidate.as_payload() for candidate in self.candidates],
+            "trafficObservations": list(self.traffic_observations),
         }
 
 

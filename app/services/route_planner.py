@@ -269,6 +269,36 @@ async def build_optimized_route_plan(
     _validate_matrix_shape(baseline_matrix, len(coordinates))
     baseline_route = nearest_neighbor(baseline_matrix, 0)
     optimization_matrix = baseline_matrix
+    initial_route = two_opt(baseline_matrix, baseline_route)
+    if not math.isfinite(_route_cost(baseline_matrix, initial_route)):
+        raise RouteConflictError("No existe un camino conectado que cubra todos los pedidos.")
+    ordered_coordinates = [coordinates[index] for index in initial_route]
+    route_result = await route_provider.get_route(ordered_coordinates)
+    geometry_provider = route_result["geometry_provider"]
+    if geometry_provider not in {"OSRM", "ORS"}:
+        raise RoutePlanningError(
+            "El proveedor no verificó una geometría vial; no se guardará una línea recta.", 502
+        )
+    live_traffic: dict[str, object] = {
+        "source": "osrm-baseline",
+        "configured": traffic_provider is not None,
+        "applied": False,
+        "routeSegments": len(initial_route) - 1,
+        "sampledSegments": 0,
+        "adjustedSegments": 0,
+        "closedSegments": 0,
+        "coverageRatio": 0.0,
+        "warning": "TomTom no disponible; se conservan los tiempos viales de base.",
+    }
+    if traffic_provider is not None and has_road_times:
+        optimization_matrix, live_traffic = await _apply_live_traffic_to_route(
+            traffic_provider, baseline_matrix, initial_route, ordered_coordinates,
+            route_result["geometry"], baseline_matrix=baseline_matrix,
+        )
+    observations = cast(list[dict[str, object]], live_traffic.get("observations", []))
+    measured_pairs = {
+        (item["fromStopId"], item["toStopId"]) for item in observations
+    }
     traffic_ai: dict[str, object] = {
         "source": "deterministic",
         "applied": False,
@@ -313,19 +343,27 @@ async def build_optimized_route_plan(
             if not candidates:
                 raise ValueError("No hay pares con conexión vial para asesoría de IA.")
             advice = await traffic_ai_advisor.get_route_advice(
-                RouteTrafficAiRequest(tuple(candidates), current_time.replace(tzinfo=UTC))
+                RouteTrafficAiRequest(
+                    tuple(candidates), current_time.replace(tzinfo=UTC),
+                    traffic_observations=tuple(observations),
+                )
             )
             supported, ignored_count = filter_route_traffic_adjustments(
                 candidates, advice.adjustments
             )
+            # Una sugerencia del modelo nunca sustituye una medición ni reabre un cierre.
+            supported = [
+                item for item in supported
+                if (item.from_stop_id, item.to_stop_id) not in measured_pairs
+            ]
             optimization_matrix = apply_route_traffic_adjustments(
-                baseline_matrix, stop_ids, supported
+                optimization_matrix, stop_ids, supported
             )
             warnings: list[str] = []
             if supported:
                 warnings.append(
-                    "El factor de IA es una estimación; el proveedor vial no proporciona "
-                    "tráfico en vivo."
+                    "La IA aportó estimaciones para tramos sin medición; "
+                    "TomTom conserva prioridad en los tramos observados."
                 )
             elif ignored_count:
                 warnings.append(
@@ -344,6 +382,7 @@ async def build_optimized_route_plan(
             traffic_ai = {
                 "source": "external-ai",
                 "applied": bool(supported),
+                "evaluated": True,
                 "model": advice.model,
                 "warning": " ".join(warnings),
             }
@@ -362,76 +401,30 @@ async def build_optimized_route_plan(
                 ),
             }
 
-    optimized_route = two_opt(optimization_matrix, nearest_neighbor(optimization_matrix, 0))
-    baseline_duration = _route_cost(baseline_matrix, baseline_route)
+    # No descartar una solución previa mejor por reiniciar la heurística con nuevos pesos.
+    seed = min(
+        (baseline_route, initial_route, nearest_neighbor(optimization_matrix, 0)),
+        key=lambda route: _route_cost(optimization_matrix, route),
+    )
+    optimized_route = two_opt(optimization_matrix, seed)
+    # Comparar ordenaciones con los mismos costos, no tráfico actual contra flujo libre.
+    baseline_duration = _route_cost(optimization_matrix, baseline_route)
     optimized_duration = _route_cost(optimization_matrix, optimized_route)
-    if not math.isfinite(baseline_duration) or not math.isfinite(optimized_duration):
+    if not math.isfinite(optimized_duration):
         raise RouteConflictError("No existe un camino conectado que cubra todos los pedidos.")
 
-    if traffic_provider is None:
-        initial_traffic_warning = (
-            "TomTom Traffic no está configurado; la ruta usa los tiempos viales de base."
-        )
-    elif not has_road_times:
-        initial_traffic_warning = (
-            "TomTom no se consultó porque la matriz no contiene tiempos viales verificados."
-        )
-    else:
-        initial_traffic_warning = (
-            "No se pudo muestrear tráfico vial; se conservan los tiempos de base."
-        )
-    live_traffic: dict[str, object] = {
-        "source": "osrm-baseline",
-        "configured": traffic_provider is not None,
-        "applied": False,
-        "routeSegments": max(0, len(optimized_route) - 1),
-        "sampledSegments": 0,
-        "adjustedSegments": 0,
-        "closedSegments": 0,
-        "coverageRatio": 0.0,
-        "warning": initial_traffic_warning,
-    }
-    ordered_coordinates = [coordinates[index] for index in optimized_route]
-    route_result = await route_provider.get_route(ordered_coordinates)
-    geometry_provider = route_result["geometry_provider"]
-    if geometry_provider not in {"OSRM", "ORS"}:
-        raise RoutePlanningError(
-            "El proveedor no verificó una geometría vial; no se guardará una línea recta.", 502
-        )
-    if traffic_provider is not None and has_road_times:
-        optimization_matrix, live_traffic = await _apply_live_traffic_to_route(
-            traffic_provider,
-            optimization_matrix,
-            optimized_route,
-            ordered_coordinates,
-            route_result["geometry"],
-            baseline_matrix=baseline_matrix,
-        )
-        if live_traffic["applied"]:
-            optimized_route = two_opt(
-                optimization_matrix,
-                nearest_neighbor(optimization_matrix, 0),
-            )
-            optimized_duration = _route_cost(optimization_matrix, optimized_route)
-            if not math.isfinite(optimized_duration):
-                raise RouteConflictError(
-                    "TomTom reportó cierres que impiden conectar todas las paradas con "
-                    "los tramos disponibles. Revisa la ruta antes de asignarla."
-                )
-            final_coordinates = [coordinates[index] for index in optimized_route]
-            if final_coordinates != ordered_coordinates:
-                route_result = await route_provider.get_route(final_coordinates)
-                geometry_provider = route_result["geometry_provider"]
-                if geometry_provider not in {"OSRM", "ORS"}:
-                    raise RoutePlanningError(
-                        "El proveedor no verificó una geometría vial; "
-                        "no se guardará una línea recta.",
-                        502,
-                    )
-        else:
-            traffic_ai["warning"] = (
-                f"{traffic_ai['warning']} {live_traffic['warning']}"
-            ).strip()
+    final_coordinates = [coordinates[index] for index in optimized_route]
+    if final_coordinates != ordered_coordinates:
+        route_result = await route_provider.get_route(final_coordinates)
+        geometry_provider = route_result["geometry_provider"]
+        if geometry_provider not in {"OSRM", "ORS"}:
+            raise RoutePlanningError("El proveedor no verificó una geometría vial.", 502)
+    final_measured = sum(
+        (f"stop-{start}", f"stop-{end}") in measured_pairs
+        for start, end in zip(optimized_route, optimized_route[1:], strict=False)
+    )
+    live_traffic["usedMeasuredSegments"] = final_measured
+    live_traffic["coverageRatio"] = final_measured / max(1, len(optimized_route) - 1)
 
     ordered_ids = tuple(delivery_point_ids[index - 1] for index in optimized_route[1:])
     distances = matrix_result.get("distances_meters")
@@ -451,12 +444,12 @@ async def build_optimized_route_plan(
         ),
         estimated_duration_minutes=(
             optimized_duration
-            if live_traffic["applied"]
+            if live_traffic["applied"] or traffic_ai["applied"]
             else route_result["duration_minutes"]
         ),
         estimated_distance_meters=route_result["distance_meters"],
         baseline_duration_minutes=(
-            baseline_duration if has_road_times else None
+            baseline_duration if has_road_times and math.isfinite(baseline_duration) else None
         ),
         baseline_distance_meters=baseline_distance if math.isfinite(baseline_distance) else None,
         geometry=route_result["geometry"],
@@ -1025,6 +1018,7 @@ async def _apply_live_traffic_to_route(
     stale_count = 0
     low_confidence_count = 0
     error_count = 0
+    observations: list[dict[str, object]] = []
     for (_leg_index, (start, end, base_cost)), response in zip(
         prioritized_legs,
         responses,
@@ -1045,7 +1039,14 @@ async def _apply_live_traffic_to_route(
         sampled_count += 1
         if response.cache_status == "STALE":
             stale_count += 1
+        observation: dict[str, object] = {
+            "fromStopId": f"stop-{start}", "toStopId": f"stop-{end}",
+            "trafficMultiplier": response.travel_time_multiplier,
+            "confidence": response.confidence, "roadClosure": response.road_closure,
+            "observedAt": response.timestamp.isoformat(), "cacheStatus": response.cache_status,
+        }
         if response.road_closure:
+            observations.append(observation)
             adjusted_matrix[start][end] = None
             closed_count += 1
             continue
@@ -1057,6 +1058,7 @@ async def _apply_live_traffic_to_route(
             low_confidence_count += 1
             continue
         adjusted_matrix[start][end] = base_cost * multiplier
+        observations.append(observation)
         adjusted_count += 1
 
     route_segment_count = len(legs)
@@ -1096,6 +1098,7 @@ async def _apply_live_traffic_to_route(
             "errorSegments": error_count,
             "coverageRatio": sampled_count / route_segment_count if route_segment_count else 0,
             "warning": " ".join(warning_parts),
+            "observations": observations,
         }
     )
     return adjusted_matrix, base_summary

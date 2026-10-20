@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -99,5 +99,14 @@ class DeliveryPointRepository:
         )
         return result.scalar_one_or_none() == point_id
 
-    async def delete(self, point: DeliveryPoint) -> None:
-        await self._session.delete(point)
+    async def delete_if_pending_unassigned(self, point_id: UUID) -> bool:
+        result = await self._session.execute(
+            delete(DeliveryPoint)
+            .where(
+                DeliveryPoint.id == point_id,
+                DeliveryPoint.status == DeliveryPointStatus.PENDING,
+                DeliveryPoint.route_id.is_(None),
+            )
+            .returning(DeliveryPoint.id)
+        )
+        return result.scalar_one_or_none() == point_id

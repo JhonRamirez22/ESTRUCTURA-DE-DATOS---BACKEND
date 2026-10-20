@@ -31,6 +31,10 @@ _SYSTEM_PROMPT = " ".join(
         '{"adjustments":[{"fromStopId":"...","toStopId":"...",'
         '"trafficMultiplier":1.0}],"model":"..."}.',
         "El factor debe estar entre 0.5 y 3. No inventes IDs y omite pares sin evidencia.",
+        "trafficObservations contiene mediciones TomTom con fecha, confianza y cierres.",
+        "No alteres tramos medidos ni reabras cierres. Puedes estimar otros pares solo con",
+        "evidencia de las observaciones; si no basta, omite el ajuste.",
+        "No inventes tráfico en vivo.",
     )
 )
 _ASSIGNMENT_SYSTEM_PROMPT = " ".join(
@@ -140,6 +144,9 @@ class HttpRouteTrafficAdvisor:
             }
             if "api.groq.com" in self._api_url:
                 body["response_format"] = {"type": "json_object"}
+                body["max_tokens"] = 4_096
+                if self._model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
+                    body["reasoning_effort"] = "low"
             return body
         return {
             "contractVersion": payload["contractVersion"],
@@ -173,7 +180,13 @@ class HttpRouteTrafficAdvisor:
             raise RouteTrafficAiError(f"La IA de tráfico respondió HTTP {response.status_code}.")
         try:
             result: object = response.json()
-            return self._read_chat_content(result) if self._protocol == "openai-chat" else result
+            if self._protocol == "openai-chat":
+                content = self._read_chat_content(result)
+                if isinstance(content, dict):
+                    # El modelo utilizado proviene de la configuración, no del texto inventado.
+                    content["model"] = self._model
+                return content
+            return result
         except (ValueError, TypeError) as error:
             raise RouteTrafficAiError("La IA de tráfico devolvió JSON inválido.") from error
 
@@ -204,11 +217,8 @@ def get_route_traffic_advisor() -> HttpRouteTrafficAdvisor | None:
     model: str | None
     if settings.ai_traffic_provider == "groq":
         api_url = (settings.customer_chat_api_url or GROQ_CHAT_COMPLETIONS_URL).strip()
-        api_key = (
-            settings.customer_chat_api_key.get_secret_value().strip()
-            if settings.customer_chat_api_key is not None
-            else None
-        )
+        key = settings.customer_chat_api_key or settings.ai_traffic_api_key
+        api_key = key.get_secret_value().strip() if key is not None else None
         model = (settings.customer_chat_model or DEFAULT_GROQ_TRAFFIC_MODEL).strip()
     else:
         api_url = (settings.ai_traffic_api_url or "").strip()
