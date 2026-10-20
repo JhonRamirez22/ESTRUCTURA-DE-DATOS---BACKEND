@@ -261,6 +261,8 @@ async def _enqueue_customer_event(
     sms_body: str,
     now: datetime | None,
 ) -> tuple[CustomerNotificationChannel, ...]:
+    if not get_settings().customer_notifications_enabled:
+        return ()
     queued: list[CustomerNotificationChannel] = []
     email = (point.customer_email or "").strip()
     if point.email_notifications_enabled and email:

@@ -24,3 +24,12 @@ def business_authentication(request: pytest.FixtureRequest) -> Iterator[None]:
         yield
     finally:
         app.dependency_overrides.pop(get_optional_session, None)
+
+
+@pytest.fixture(autouse=True)
+def customer_notifications_for_feature_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    # El producto las trae apagadas; las pruebas de la función las encienden explícitamente.
+    from app.settings import get_settings
+
+    monkeypatch.setenv("CUSTOMER_NOTIFICATIONS_ENABLED", "true")
+    get_settings.cache_clear()

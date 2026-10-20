@@ -68,6 +68,8 @@ class Settings(BaseSettings):
     notification_from_email: str | None = None
     notification_smtp_timeout_ms: int = Field(default=5_000, gt=0, le=60_000)
     # El poller infinito solo se habilita en un proceso persistente, nunca por defecto.
+    # Avisos al cliente por correo y SMS: apagados en el producto actual.
+    customer_notifications_enabled: bool = False
     customer_notification_worker_enabled: bool = False
     customer_notification_poll_seconds: int = Field(default=30, ge=5, le=3_600)
     notification_sms_twilio_account_sid: str | None = None
