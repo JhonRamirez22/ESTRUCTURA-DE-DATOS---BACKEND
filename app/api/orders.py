@@ -494,3 +494,85 @@ def _validate_pasto_location(address: str, latitude: float, longitude: float) ->
     return None
 
 
+async def _read_json_object(request: Request) -> dict[str, object] | JSONResponse:
+    try:
+        body: object = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error("El body debe ser JSON válido.", 400)
+    if not isinstance(body, dict):
+        return _error("El body debe ser un objeto JSON.", 400)
+    return body
+
+
+def _validation_error(error: ValidationError) -> JSONResponse:
+    first = error.errors(include_input=False)[0]
+    field_name = str(first["loc"][-1]) if first.get("loc") else "pedido"
+    messages = {
+        "address": "address debe ser un string no vacío.",
+        "lat": "lat debe ser un número finito dentro del rango permitido.",
+        "lng": "lng debe ser un número finito dentro del rango permitido.",
+        "orderId": "orderId debe ser un string no vacío.",
+        "timeWindow": "timeWindow debe ser un valor JSON válido.",
+        "scheduledFor": "scheduledFor debe ser una fecha y hora futura (máximo 60 días).",
+        "status": "status debe ser REQUESTED, PENDING, EN_ROUTE, DELIVERED o FAILED.",
+    }
+    message = messages.get(field_name, str(first["msg"]))
+    if "No hay campos válidos" in str(first["msg"]):
+        message = "No hay campos válidos para actualizar."
+    return _error(message, 400)
+
+
+def _belongs_to_courier(point: DeliveryPoint, claims: SessionClaims) -> bool:
+    return (
+        point.route is not None
+        and claims.get("courierId") is not None
+        and str(point.route.courier_id) == claims["courierId"]
+    )
+
+
+def _session_courier_id(claims: SessionClaims) -> str | None:
+    if claims["role"] != "courier":
+        return None
+    courier_id = claims.get("courierId")
+    return courier_id if courier_id else None
+
+
+def _is_dispatcher(claims: SessionClaims | None) -> bool:
+    return claims is not None and claims["role"] == "dispatcher"
+
+
+def _dispatcher_access_error(claims: SessionClaims | None) -> JSONResponse | None:
+    if claims is None:
+        return _error("Debes iniciar sesión para continuar.", 401)
+    if not _is_dispatcher(claims):
+        return _error("Se requiere una sesión de despacho.", 403)
+    return None
+
+
+def _parse_uuid(value: str) -> UUID | None:
+    try:
+        return UUID(value)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _is_duplicate_order(error: IntegrityError) -> bool:
+    message = str(error.orig).lower()
+    return "delivery_points_order_id_key" in message or "order_id" in message
+
+
+def _log_database_error(message: str, error: SQLAlchemyError) -> None:
+    _LOGGER.error(message, extra={"error_type": type(error).__name__})
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return _json({"error": message}, status_code=status_code, headers=_NO_STORE)
+
+
+def _json(
+    content: dict[str, object],
+    *,
+    status_code: int = 200,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    return JSONResponse(content=content, status_code=status_code, headers=headers or _NO_STORE)
