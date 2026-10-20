@@ -462,3 +462,80 @@ def _validate_origin(request: Request, *, required: bool = False) -> None:
     if origin not in allowed or request.headers.get("sec-fetch-site") == "cross-site":
         raise HTTPException(status_code=403, detail="El origen de la petición no está permitido.")
 
+
+async def require_dispatcher_session(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> SessionClaims:
+    claims = await _role_claims("dispatcher", claims, request, session)
+    if claims is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Debes iniciar sesión para continuar.",
+            headers={"Cache-Control": "private, no-store, max-age=0"},
+        )
+    if claims["role"] != "dispatcher":
+        raise HTTPException(
+            status_code=403,
+            detail="Se requiere una sesión de despacho.",
+            headers={"Cache-Control": "private, no-store, max-age=0"},
+        )
+    return claims
+
+
+async def require_courier_session(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> SessionClaims:
+    claims = await _role_claims("courier", claims, request, session)
+    if claims is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Debes iniciar sesión para continuar.",
+            headers={"Cache-Control": "private, no-store, max-age=0"},
+        )
+    if claims["role"] != "courier" or not claims.get("courierId"):
+        raise HTTPException(
+            status_code=403,
+            detail="Se requiere una sesión de repartidor.",
+            headers={"Cache-Control": "private, no-store, max-age=0"},
+        )
+    return claims
+
+
+@router.post("/password")
+async def change_password(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> JSONResponse:
+    """La cuenta con sesión cambia su propia contraseña; todas sus sesiones se cierran."""
+    account_raw = claims.get("accountId") if claims else None
+    if claims is None or not account_raw:
+        return _error("Debes iniciar sesión con tu cuenta para cambiar la contraseña.", 401)
+    try:
+        data = PasswordChangeRequest.model_validate(await request.json())
+    except (ValidationError, json.JSONDecodeError, UnicodeDecodeError):
+        return _error("La contraseña nueva debe tener de 15 a 128 caracteres.", 400)
+    secret = _configured_secret(get_settings())
+    if secret is None:
+        return _error("El acceso no está configurado.", 503)
+    account = await session.get(Account, UUID(account_raw))
+    if account is None or not account.enabled:
+        return _error("Debes iniciar sesión con tu cuenta para cambiar la contraseña.", 401)
+    retry_after = await _PASSWORD_LIMITER.retry_after_shared(
+        session, f"password:{account.id}", hmac_secret=secret
+    )
+    if retry_after is not None:
+        return JSONResponse(
+            {"error": "Demasiados intentos. Espera unos minutos."},
+            status_code=429,
+            headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+        )
+    current = data.current_password.get_secret_value()
+    new = data.new_password.get_secret_value()
+    if not await run_in_threadpool(verify_password, current, account.password_hash):
+        _audit(session, request, "password_change", account.id, outcome="denied")
+        await session.commit()
