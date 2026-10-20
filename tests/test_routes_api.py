@@ -1074,3 +1074,35 @@ async def test_route_write_requires_dispatcher_and_rejects_malformed_body(
         json={"courierId": "not-a-uuid", "deliveryPointIds": []},
     )
     assert malformed.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_route_proposal_is_scoped_and_never_persists_the_order(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    created = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(point_id)]},
+    )
+    route = created.json()["route"]
+    endpoint = f"/api/v1/rutas/{route['id']}/propuesta"
+
+    foreign = await client.post(endpoint, headers={"Cookie": _cookie("courier", uuid4())})
+    assert foreign.status_code == 404
+
+    proposal = await client.post(endpoint, headers={"Cookie": _cookie("courier", _COURIER_ID)})
+    assert proposal.status_code == 200, proposal.text
+    body = proposal.json()
+    assert body["orderedDeliveryPointIds"] == [str(point_id)]
+    assert body["changed"] is False
+    assert body["cached"] is False
+    assert "TRACK-" not in proposal.text
+
+    unchanged = await client.get(
+        f"/api/v1/rutas/{route['id']}", headers={"Cookie": _cookie("dispatcher")},
+    )
+    assert unchanged.json()["route"]["optimizedAt"] == route["optimizedAt"]

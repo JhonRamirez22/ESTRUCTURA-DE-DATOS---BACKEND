@@ -44,6 +44,7 @@ _EXPECTED_OPERATIONS = frozenset(
         ("GET", "/api/rutas/{}/eta"),
         ("GET", "/api/rutas/{}/navegacion"),
         ("POST", "/api/rutas/{}/recalcular"),
+        ("POST", "/api/rutas/{}/propuesta"),
         ("POST", "/api/rutas/{}/deshacer-recalculo"),
         ("GET", "/api/rutas/{}/trafico"),
         ("GET", "/api/rutas/{}/trafico-vivo"),

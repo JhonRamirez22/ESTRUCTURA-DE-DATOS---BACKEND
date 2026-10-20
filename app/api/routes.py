@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import UTC, datetime
 from typing import Annotated, cast
 from uuid import UUID
@@ -36,6 +37,7 @@ from app.repositories.route_repository import RouteRepository
 from app.services.route_planner import (
     MAX_ROUTE_STOPS,
     MatrixProvider,
+    OptimizedRoutePlan,
     RouteOperationResult,
     RoutePlanningError,
     RouteProvider,
@@ -339,6 +341,118 @@ async def recalculate_route_endpoint(
         await session.rollback()
         _log_database_error("No se pudo recalcular la ruta", error)
         return _error("No se pudo recalcular la ruta.", 500)
+
+
+# Propuestas en memoria por proceso: el repartidor consulta cada 5 s, pero TomTom y Groq
+# se invocan como máximo una vez por minuto y combinación de paradas y zona de GPS.
+_PROPOSAL_TTL_SECONDS = 60.0
+_PROPOSAL_CACHE_LIMIT = 256
+_ProposalKey = tuple[UUID, tuple[UUID, ...], float, float]
+_PROPOSAL_CACHE: dict[_ProposalKey, tuple[float, dict[str, object]]] = {}
+
+
+@router.post("/{route_id}/propuesta")
+async def propose_route_endpoint(
+    route_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    providers: Annotated[
+        tuple[CachedMatrixProvider, CachedRouteProvider],
+        Depends(get_routing_providers),
+    ],
+    advisor: Annotated[RouteTrafficAdvisor | None, Depends(get_route_traffic_advisor)],
+    traffic: Annotated[TrafficService | None, Depends(get_traffic_service)],
+) -> JSONResponse:
+    """Calcula el orden óptimo con tráfico e IA sin guardar nada; aplicarlo usa /recalcular."""
+    if claims is None:
+        return _error("Debes iniciar sesión para continuar.", 401)
+    dispatcher = claims["role"] == "dispatcher"
+    if not dispatcher and _claim_courier_id(claims) is None:
+        return _error("La sesión de repartidor no es válida.", 403)
+    parsed_id = _parse_uuid(route_id)
+    if parsed_id is None:
+        return _error("La ruta no existe.", 404)
+    try:
+        route = await RouteRepository(session).load_route(parsed_id)
+        if route is None or (not dispatcher and route.courier_id != _claim_courier_id(claims)):
+            return _error("La ruta no existe.", 404)
+        if route.status not in {RouteStatus.PLANNED, RouteStatus.IN_PROGRESS}:
+            return _error("Solo se pueden proponer rutas planificadas o en progreso.", 409)
+        current_ids = [
+            point.id
+            for point in sorted(route.delivery_points, key=lambda item: item.sequence_index or 0)
+            if point.status.value in {"PENDING", "EN_ROUTE"}
+        ]
+        if not current_ids:
+            return _error("La ruta no tiene puntos pendientes para optimizar.", 409)
+        courier = route.courier
+        if courier.current_lat is None or courier.current_lng is None:
+            return _error("Falta la ubicación del repartidor para proponer una ruta.", 409)
+        now = time.monotonic()
+        cache_key = (
+            parsed_id, tuple(current_ids),
+            round(courier.current_lat, 3), round(courier.current_lng, 3),
+        )
+        cached = _PROPOSAL_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < _PROPOSAL_TTL_SECONDS:
+            return _json({**cached[1], "cached": True}, headers=_NO_STORE)
+        matrix_provider, route_provider = providers
+        plan = await build_optimized_route_plan(
+            session,
+            route.courier_id,
+            current_ids,
+            matrix_provider=cast(MatrixProvider, matrix_provider),
+            route_provider=cast(RouteProvider, route_provider),
+            traffic_ai_advisor=advisor,
+            traffic_provider=traffic,
+            allow_on_route_courier=True,
+            existing_route_id=parsed_id,
+        )
+        body = _proposal_json(plan, current_ids)
+        if len(_PROPOSAL_CACHE) >= _PROPOSAL_CACHE_LIMIT:
+            _PROPOSAL_CACHE.clear()
+        _PROPOSAL_CACHE[cache_key] = (now, body)
+        return _json({**body, "cached": False}, headers=_NO_STORE)
+    except RoutePlanningError as error:
+        return _error(str(error), error.status_code)
+    except (RoutingClientError, TimeoutError) as error:
+        _LOGGER.warning(
+            "No se pudo obtener la ruta vial para la propuesta",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error(
+            "El proveedor vial no pudo calcular la propuesta. Tu ruta actual sigue igual.",
+            502,
+        )
+    except SQLAlchemyError as error:
+        _log_database_error("No se pudo calcular la propuesta de ruta", error)
+        return _error("No se pudo calcular la propuesta de ruta.", 500)
+
+
+def _proposal_json(plan: OptimizedRoutePlan, current_ids: list[UUID]) -> dict[str, object]:
+    ordered = [str(point_id) for point_id in plan.ordered_delivery_point_ids]
+    current = [str(point_id) for point_id in current_ids]
+    improvement: float | None = None
+    if plan.baseline_duration_minutes is not None:
+        improvement = round(plan.baseline_duration_minutes - plan.estimated_duration_minutes, 1)
+    return {
+        "orderedDeliveryPointIds": ordered,
+        "currentDeliveryPointIds": current,
+        "changed": ordered != current,
+        "estimatedDurationMinutes": round(plan.estimated_duration_minutes, 1),
+        "estimatedDistanceMeters": round(plan.estimated_distance_meters),
+        "baselineDurationMinutes": (
+            round(plan.baseline_duration_minutes, 1)
+            if plan.baseline_duration_minutes is not None else None
+        ),
+        "improvementMinutes": improvement,
+        "geometry": plan.geometry,
+        "matrixSource": plan.matrix_source,
+        "trafficAi": plan.traffic_ai,
+        "liveTraffic": plan.live_traffic,
+        "warning": plan.warning,
+        "computedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }
 
 
 @router.post("/{route_id}/deshacer-recalculo")
