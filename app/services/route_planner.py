@@ -502,3 +502,87 @@ async def build_optimized_route_plan(
     ordered_ids = tuple(delivery_point_ids[index - 1] for index in optimized_route[1:])
     baseline_geometry: GeoJsonLineString | None = None
     if baseline_route != optimized_route:
+        try:
+            # Solo para mostrar la diferencia en el mapa; no participa en la decisión.
+            baseline_geometry = (
+                await route_provider.get_route([coordinates[index] for index in baseline_route])
+            )["geometry"]
+        except Exception as error:
+            _LOGGER.info(
+                "No se obtuvo el trazado del orden base para comparar",
+                extra={"error_type": type(error).__name__},
+            )
+    optimization = _optimization_summary(
+        delivery_point_ids=delivery_point_ids,
+        matrix=optimization_matrix,
+        baseline_route=baseline_route,
+        two_opt_route=two_opt_route,
+        or_opt_duration=or_opt_duration,
+        refined=refined,
+        final_route=optimized_route,
+        baseline_geometry=baseline_geometry,
+        live_traffic=live_traffic,
+        traffic_ai=traffic_ai,
+        ai_order=ai_order,
+        computed_at=current_time,
+    )
+    if window_summary is not None:
+        optimization["timeWindows"] = window_summary
+    distances = matrix_result.get("distances_meters")
+    baseline_distance = (
+        _route_cost(distances, baseline_route)
+        if distances is not None and has_road_times
+        else math.inf
+    )
+
+    return OptimizedRoutePlan(
+        courier_id=courier_id,
+        planned_courier_location=(courier.current_lng, courier.current_lat),
+        ordered_delivery_point_ids=ordered_ids,
+        planned_delivery_point_coordinates=tuple(
+            (point_id, (points_by_id[point_id].lng, points_by_id[point_id].lat))
+            for point_id in delivery_point_ids
+        ),
+        estimated_duration_minutes=(
+            optimized_duration
+            if live_traffic["applied"] or traffic_ai["applied"]
+            else route_result["duration_minutes"]
+        ),
+        estimated_distance_meters=route_result["distance_meters"],
+        baseline_duration_minutes=(
+            baseline_duration if has_road_times and math.isfinite(baseline_duration) else None
+        ),
+        baseline_distance_meters=baseline_distance if math.isfinite(baseline_distance) else None,
+        geometry=route_result["geometry"],
+        geometry_provider=RouteGeometryProvider(geometry_provider),
+        matrix_source=str(matrix_source),
+        warning=matrix_result.get("warning"),
+        traffic_ai=traffic_ai,
+        live_traffic=live_traffic,
+        ai_order=ai_order,
+        optimization=optimization,
+    )
+
+
+_BOGOTA_OFFSET = timedelta(hours=-5)
+
+
+def _apply_time_windows(
+    matrix: Sequence[Sequence[float | None]],
+    route: list[int],
+    delivery_point_ids: Sequence[UUID],
+    points_by_id: Mapping[UUID, DeliveryPoint],
+    current_time: datetime,
+) -> dict[str, object] | None:
+    """Reordena para cumplir ventanas y prioridades; ``None`` si ningún pedido las usa."""
+    local = current_time + _BOGOTA_OFFSET
+    now_minute = local.hour * 60 + local.minute + local.second / 60
+    windows: dict[int, Window] = {}
+    priority: dict[int, float] = {}
+    for index, point_id in enumerate(delivery_point_ids, start=1):
+        point = points_by_id[point_id]
+        window = window_from_json(point.time_window, now_minute)
+        if window is not None:
+            windows[index] = window
+        if point.priority > 1:
+            priority[index] = float(point.priority)
