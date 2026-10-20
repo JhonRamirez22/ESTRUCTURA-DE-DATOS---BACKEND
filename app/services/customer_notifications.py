@@ -601,3 +601,89 @@ async def _has_current_delivery_consent(
             if notification.status is not CustomerNotificationStatus.PROCESSING:
                 return False
 
+            if notification.channel is CustomerNotificationChannel.EMAIL:
+                authorized = (
+                    point.email_notifications_enabled
+                    and point.customer_email is not None
+                    and point.customer_email.strip() == notification.recipient_email
+                )
+            else:
+                authorized = (
+                    point.sms_notifications_enabled
+                    and point.customer_phone is not None
+                    and point.customer_phone.strip() == notification.recipient_phone
+                )
+
+            if not authorized:
+                notification.status = CustomerNotificationStatus.CANCELLED
+                notification.lease_expires_at = None
+                notification.recipient_email = None
+                notification.recipient_phone = None
+                notification.subject = ""
+                notification.text_body = ""
+            return authorized
+
+
+async def _record_delivery_success(
+    session_factory: async_sessionmaker[AsyncSession],
+    notification_id: UUID,
+    now: datetime,
+) -> bool:
+    async with session_factory() as session:
+        async with session.begin():
+            row = await session.scalar(
+                select(CustomerNotificationOutbox)
+                .where(CustomerNotificationOutbox.id == notification_id)
+                .with_for_update()
+            )
+            if row is None or row.status is not CustomerNotificationStatus.PROCESSING:
+                return False
+            row.status = CustomerNotificationStatus.SENT
+            row.sent_at = now
+            row.lease_expires_at = None
+            # Se conserva idempotencia, pero se borran destinatario y contenido ya enviados.
+            row.recipient_email = None
+            row.recipient_phone = None
+            row.subject = ""
+            row.text_body = ""
+            row.last_error_code = None
+    return True
+
+
+async def _record_delivery_failure(
+    session_factory: async_sessionmaker[AsyncSession],
+    notification_id: UUID,
+    now: datetime,
+    error_code: str,
+) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            row = await session.scalar(
+                select(CustomerNotificationOutbox)
+                .where(CustomerNotificationOutbox.id == notification_id)
+                .with_for_update()
+            )
+            if row is None or row.status is not CustomerNotificationStatus.PROCESSING:
+                return
+            row.last_error_code = error_code[:100]
+            row.lease_expires_at = None
+            if row.attempt_count >= MAX_NOTIFICATION_ATTEMPTS:
+                row.status = CustomerNotificationStatus.FAILED
+                # Un aviso agotado ya no se enviará automáticamente; no retener PII.
+                row.recipient_email = None
+                row.recipient_phone = None
+                row.subject = ""
+                row.text_body = ""
+                return
+
+            retry_seconds = min(
+                RETRY_BASE_SECONDS * (2 ** min(row.attempt_count - 1, 10)),
+                RETRY_MAX_SECONDS,
+            )
+            row.status = CustomerNotificationStatus.PENDING
+            row.available_at = now + timedelta(seconds=retry_seconds)
+
+
+def _as_naive_utc(value: datetime) -> datetime:
+    normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return normalized.replace(tzinfo=None)
