@@ -663,3 +663,86 @@ async def get_route_eta(
             courier.current_lat is None
             or courier.current_lng is None
             or not is_courier_location_fresh(courier.last_location_at)
+            or not is_within_pasto_service_area(courier.current_lat, courier.current_lng)
+        ):
+            return _error(
+                "El courier no tiene una posición reciente dentro de Pasto para calcular el ETA.",
+                409,
+            )
+
+        coordinates: list[Coordinate] = [(courier.current_lng, courier.current_lat)]
+        coordinates.extend((point.lng, point.lat) for point in points)
+        matrix_provider, _route_provider = providers
+        matrix_result = await cast(MatrixProvider, matrix_provider).get_duration_matrix(coordinates)
+        etas = estimate_stop_etas_from_matrix(
+            [str(point.id) for point in points],
+            matrix_result["durations_minutes"],
+            matrix_result.get("distances_meters"),
+        )
+        historical: dict[str, Any] | None = None
+        if get_settings().traffic_history_enabled:
+            try:
+                historical = await historical_eta(
+                    RouteRepository(session),
+                    [
+                        StopForEta(
+                            str(point.id), point.lat, point.lng, eta.estimated_minutes_from_now
+                        )
+                        for point, eta in zip(points, etas, strict=False)
+                    ],
+                    datetime.now(UTC).replace(tzinfo=None),
+                )
+            except SQLAlchemyError as error:
+                _log_database_error("No se pudo leer el historial de tráfico", error)
+        warnings = [
+            matrix_result.get("warning"),
+            "Los tiempos son estimaciones de la red vial; no incluyen tráfico en vivo.",
+        ]
+        if any(eta.estimated_minutes_from_now is None for eta in etas):
+            warnings.append("No se encontró conexión vial para una o más paradas de la secuencia.")
+        return _json(
+            {
+                "approximate": True,
+                "estimatedAt": estimated_at,
+                "etas": [
+                    {
+                        "stopId": eta.stop_id,
+                        "distanceFromCourierMeters": eta.distance_from_courier_meters,
+                        "estimatedMinutesFromNow": eta.estimated_minutes_from_now,
+                        **_historical_fields(historical, eta.stop_id),
+                    }
+                    for eta in etas
+                ],
+                "historical": historical["summary"] if historical else None,
+                "matrixSource": matrix_result["source"],
+                "routeId": str(route.id),
+                "warning": " ".join(item for item in warnings if item),
+            }
+        )
+    except RoutingClientError as error:
+        _LOGGER.warning(
+            "No se pudo calcular la matriz del ETA",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error(
+            "El ETA vial no está disponible temporalmente; no se estimó en línea recta.", 503
+        )
+    except ValueError as error:
+        _LOGGER.warning(
+            "La matriz del ETA no cumple el contrato",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error("El ETA vial no está disponible temporalmente.", 503)
+    except SQLAlchemyError as error:
+        _log_database_error("No se pudo calcular el ETA de la ruta", error)
+        return _error("No se pudo calcular el ETA de la ruta.", 500)
+
+
+@router.get("/{route_id}/trafico")
+async def get_route_traffic_profile(
+    route_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> JSONResponse:
+    authorized = _authorize_route_id(route_id, claims)
+    if isinstance(authorized, JSONResponse):
