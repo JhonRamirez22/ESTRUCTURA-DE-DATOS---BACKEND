@@ -49,6 +49,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     notification_worker: asyncio.Task[None] | None = None
     _app.state.customer_notification_worker_task = None
     settings = get_settings()
+    problems = settings.startup_problems()
+    if problems:
+        raise RuntimeError("Configuración inválida: " + " ".join(problems))
     if (
         settings.customer_notification_worker_enabled
         and os.environ.get("VERCEL") != "1"

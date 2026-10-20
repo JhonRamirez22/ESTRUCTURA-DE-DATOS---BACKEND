@@ -176,6 +176,28 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:
         return self.node_env == "development"
 
+    def startup_problems(self) -> list[str]:
+        """Errores de configuración que deben impedir el arranque, no solo avisar en el log."""
+        problems: list[str] = []
+        if self.node_env == "production":
+            secret = self.auth_secret.get_secret_value().strip() if self.auth_secret else ""
+            if len(secret.encode("utf-8")) < 32:
+                problems.append("AUTH_SECRET debe tener al menos 32 bytes en producción.")
+        elif self.is_development and not self._database_is_local():
+            problems.append("NODE_ENV=development solo se permite con una base de datos local.")
+        return problems
+
+    def _database_is_local(self) -> bool:
+        raw_url = self.database_url.get_secret_value().strip() if self.database_url else ""
+        if raw_url:
+            url = make_url(raw_url)
+            if url.drivername.startswith("sqlite"):
+                return True
+            host = url.host
+        else:
+            host = self.database_host
+        return host in {None, "", "localhost", "127.0.0.1", "::1"}
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

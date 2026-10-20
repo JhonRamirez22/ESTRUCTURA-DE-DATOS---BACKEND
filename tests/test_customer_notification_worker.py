@@ -105,7 +105,10 @@ async def test_fastapi_lifespan_starts_worker_only_when_enabled_on_a_persistent_
     monkeypatch.setattr(
         application,
         "get_settings",
-        lambda: Settings(customer_notification_worker_enabled=worker_enabled),
+        lambda: Settings(
+            customer_notification_worker_enabled=worker_enabled,
+            auth_secret="unit-test-session-secret-with-at-least-32-bytes",
+        ),
     )
     if is_vercel:
         monkeypatch.setenv("VERCEL", "1")
