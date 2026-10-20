@@ -398,15 +398,19 @@ async def test_page_access_is_decided_by_backend_without_exposing_role(
 ) -> None:
     anonymous_access = await client.get("/api/auth/access", params={"path": "/dashboard"})
     anonymous_login = await client.get("/api/auth/access", params={"path": "/acceso"})
+    anonymous_staff = await client.get("/api/auth/access", params={"path": "/personal"})
     assert anonymous_access.json() == {"allowed": False, "redirectTo": "/acceso"}
+    assert anonymous_staff.json() == {"allowed": False, "redirectTo": "/acceso"}
     assert anonymous_login.json() == {"allowed": True, "redirectTo": None}
 
     await client.post("/api/auth/login", json={"accessCode": DISPATCHER_CODE})
     dispatcher_access = await client.get("/api/auth/access", params={"path": "/dashboard"})
     courier_access = await client.get("/api/auth/access", params={"path": "/repartidor"})
     access_page = await client.get("/api/auth/access", params={"path": "/acceso"})
+    staff_page = await client.get("/api/auth/access", params={"path": "/personal"})
 
     assert dispatcher_access.json() == {"allowed": True, "redirectTo": None}
+    assert staff_page.json() == {"allowed": True, "redirectTo": None}
     assert courier_access.json() == {"allowed": False, "redirectTo": "/dashboard"}
     assert access_page.json() == {"allowed": False, "redirectTo": "/dashboard"}
     assert "role" not in courier_access.json()

@@ -572,6 +572,8 @@ def _required_page_role(path: str) -> SessionRole | None:
         return "dispatcher"
     if path == "/pedidos" or path.startswith("/pedidos/"):
         return "dispatcher"
+    if path == "/personal" or path.startswith("/personal/"):
+        return "dispatcher"
     if path == "/repartidor" or path.startswith("/repartidor/"):
         return "courier"
     return None
