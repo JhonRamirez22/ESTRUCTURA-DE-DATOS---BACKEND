@@ -539,3 +539,80 @@ async def change_password(
     if not await run_in_threadpool(verify_password, current, account.password_hash):
         _audit(session, request, "password_change", account.id, outcome="denied")
         await session.commit()
+        return _error("La contraseña actual no es correcta.", 403)
+    if new == current:
+        return _error("La contraseña nueva debe ser distinta de la actual.", 400)
+    account.password_hash = await run_in_threadpool(hash_password, new)
+    await revoke_account_sessions(session, account.id)
+    _audit(session, request, "password_change", account.id)
+    await session.commit()
+    secure = get_settings().node_env == "production"
+    response = JSONResponse(
+        {"ok": True, "reloginRequired": True}, headers={"Cache-Control": "no-store, private"}
+    )
+    for role in ("dispatcher", "courier"):
+        response.headers.append(
+            "Set-Cookie", cleared_session_cookie(session_cookie_name(role), secure)
+        )
+    return response
+
+
+@router.put("/courier-account")
+async def save_courier_account(
+    request: Request,
+    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> JSONResponse:
+    try:
+        data = CourierAccountRequest.model_validate(await request.json())
+    except (ValidationError, json.JSONDecodeError, UnicodeDecodeError):
+        return _error(
+            "Ingresa un correo válido, repartidor y contraseña de 15 a 128 caracteres.", 400
+        )
+    try:
+        courier_id = UUID(data.courier_id)
+    except ValueError:
+        return _error("El identificador del repartidor no es válido.", 400)
+    if await session.get(Courier, courier_id) is None:
+        return _error("El repartidor no existe.", 404)
+    existing = await session.scalar(select(Account).where(Account.courier_id == courier_id))
+    digest = await run_in_threadpool(hash_password, data.password.get_secret_value())
+    if existing is None:
+        session.add(
+            Account(
+                email=data.email,
+                password_hash=digest,
+                role="courier",
+                courier_id=courier_id,
+            )
+        )
+    else:
+        existing.email, existing.password_hash, existing.enabled = data.email, digest, True
+        await revoke_account_sessions(session, existing.id)
+    _audit(session, request, "courier_account_changed", UUID(_claims["accountId"]))
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        return _error("Ese correo ya pertenece a otra cuenta.", 409)
+    return JSONResponse({"email": data.email}, headers={"Cache-Control": "no-store, private"})
+
+
+async def _verify_courier_login(access_code: str, session: AsyncSession) -> str | None:
+    courier_id, separator, secret_part = access_code.partition(".")
+    if not separator or not _UUID_PATTERN.fullmatch(courier_id) or len(secret_part) < 40:
+        return None
+
+    courier_uuid = UUID(courier_id)
+    credential = await CourierRepository(session).get_credential(courier_uuid)
+    if credential is None:
+        return None
+    if not await run_in_threadpool(
+        verify_courier_access_code, access_code, credential.access_code_hash
+    ):
+        return None
+    return str(courier_uuid)
+
+
+def _configured_secret(settings: Settings) -> str | None:
+    secret = (
