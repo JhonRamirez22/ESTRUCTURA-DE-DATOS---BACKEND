@@ -21,6 +21,7 @@ PUBLIC_OPERATIONS = {
     ("GET", "/api/v1/auth/access"),
     ("GET", "/api/v1/health"),
     ("GET", "/api/v1/seguimiento"),
+    ("POST", "/api/v1/solicitudes"),
     ("POST", "/api/v1/cliente/chat"),
     ("GET", "/api/v1/cliente/chat/estado"),
 }

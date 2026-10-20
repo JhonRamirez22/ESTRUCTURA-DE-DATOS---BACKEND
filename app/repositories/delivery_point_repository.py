@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from uuid import UUID
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -98,6 +98,42 @@ class DeliveryPointRepository:
             update(DeliveryPoint)
             .where(*conditions)
             .values(**updates)
+            .returning(DeliveryPoint.id)
+        )
+        return result.scalar_one_or_none() == point_id
+
+    async def count_requested(self) -> int:
+        """Solicitudes de clientes en espera; acota cuántas puede acumular la bandeja."""
+        total = await self._session.scalar(
+            select(func.count())
+            .select_from(DeliveryPoint)
+            .where(DeliveryPoint.status == DeliveryPointStatus.REQUESTED)
+        )
+        return int(total or 0)
+
+    async def accept_request(self, point_id: UUID) -> bool:
+        """Pasa una solicitud a pedido pendiente; falla si otro despachador ya la resolvió."""
+        result = await self._session.execute(
+            update(DeliveryPoint)
+            .where(
+                DeliveryPoint.id == point_id,
+                DeliveryPoint.status == DeliveryPointStatus.REQUESTED,
+                DeliveryPoint.route_id.is_(None),
+            )
+            .values(status=DeliveryPointStatus.PENDING)
+            .returning(DeliveryPoint.id)
+        )
+        return result.scalar_one_or_none() == point_id
+
+    async def reject_request(self, point_id: UUID) -> bool:
+        """Descarta una solicitud no aceptada: nunca entró a la operación."""
+        result = await self._session.execute(
+            delete(DeliveryPoint)
+            .where(
+                DeliveryPoint.id == point_id,
+                DeliveryPoint.status == DeliveryPointStatus.REQUESTED,
+                DeliveryPoint.route_id.is_(None),
+            )
             .returning(DeliveryPoint.id)
         )
         return result.scalar_one_or_none() == point_id

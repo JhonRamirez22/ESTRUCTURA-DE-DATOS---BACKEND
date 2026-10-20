@@ -61,7 +61,7 @@ async def list_delivery_points(
         try:
             status = DeliveryPointStatus(raw_status)
         except ValueError:
-            return _error("status debe ser PENDING, EN_ROUTE, DELIVERED o FAILED.", 400)
+            return _error("status debe ser REQUESTED, PENDING, EN_ROUTE, DELIVERED o FAILED.", 400)
 
     try:
         points = await DeliveryPointRepository(session).list_delivery_points(status)
@@ -208,6 +208,12 @@ async def update_delivery_point(
             return _error("El pedido no existe.", 404)
         if courier_id is not None and not _belongs_to_courier(point, claims):
             return _error("El pedido no existe.", 404)
+
+        # Una solicitud de cliente solo se resuelve en /solicitudes (aceptar o rechazar).
+        if point.status is DeliveryPointStatus.REQUESTED:
+            return _error("Acepta o rechaza la solicitud antes de modificarla.", 409)
+        if "status" in fields and data.status is DeliveryPointStatus.REQUESTED:
+            return _error("Un pedido no puede volver a ser solicitud.", 400)
 
         if (
             is_dispatcher
@@ -465,7 +471,7 @@ def _validation_error(error: ValidationError) -> JSONResponse:
         "lng": "lng debe ser un número finito dentro del rango permitido.",
         "orderId": "orderId debe ser un string no vacío.",
         "timeWindow": "timeWindow debe ser un valor JSON válido.",
-        "status": "status debe ser PENDING, EN_ROUTE, DELIVERED o FAILED.",
+        "status": "status debe ser REQUESTED, PENDING, EN_ROUTE, DELIVERED o FAILED.",
     }
     message = messages.get(field_name, str(first["msg"]))
     if "No hay campos válidos" in str(first["msg"]):

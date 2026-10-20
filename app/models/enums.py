@@ -10,6 +10,8 @@ class CourierStatus(StrEnum):
 
 
 class DeliveryPointStatus(StrEnum):
+    # Solicitud de un cliente: no entra a la operación hasta que despacho la acepta.
+    REQUESTED = "REQUESTED"
     PENDING = "PENDING"
     EN_ROUTE = "EN_ROUTE"
     DELIVERED = "DELIVERED"

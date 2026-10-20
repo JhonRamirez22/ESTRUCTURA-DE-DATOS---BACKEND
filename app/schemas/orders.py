@@ -106,6 +106,25 @@ class OrderCreateRequest(BaseModel):
         return self
 
 
+class OrderRequestCreate(BaseModel):
+    """Solicitud pública de un cliente: solo dirección y punto; ningún dato personal."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    address: str = Field(min_length=5, max_length=MAX_ADDRESS_LENGTH)
+    lat: _Latitude
+    lng: _Longitude
+
+    @field_validator("address")
+    @classmethod
+    def _address_text(cls, value: str) -> str:
+        text = plain_text(value, max_length=MAX_ADDRESS_LENGTH, field="address")
+        # Entrada anónima: una dirección nunca necesita marcado.
+        if "<" in text or ">" in text:
+            raise ValueError("address contiene caracteres no permitidos.")
+        return text
+
+
 class OrderUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
 

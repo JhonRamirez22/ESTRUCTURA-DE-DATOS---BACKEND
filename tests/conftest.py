@@ -13,7 +13,7 @@ from tests.auth_helpers import business_identity
 _BUSINESS_TESTS = {
     "test_analytics_api", "test_assignments_api", "test_couriers_api",
     "test_notifications_api", "test_orders_api", "test_routes_api",
-    "test_postgres_integration",
+    "test_postgres_integration", "test_order_requests_api",
 }
 
 
