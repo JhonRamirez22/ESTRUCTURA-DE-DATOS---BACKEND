@@ -471,3 +471,81 @@ def _operation_json(result: RouteOperationResult) -> dict[str, object]:
         "liveTraffic": result.live_traffic,
         "optimization": get_route_optimization(route.id),
         "route": {
+            "id": str(route.id),
+            "courierId": str(route.courier_id),
+            "status": route.status.value,
+            "estimatedDurationMinutes": route.estimated_duration_minutes,
+            "estimatedDistanceMeters": route.estimated_distance_meters,
+            "baselineDurationMinutes": route.baseline_duration_minutes,
+            "baselineDistanceMeters": route.baseline_distance_meters,
+            "geometry": route.geometry,
+            "geometryProvider": route.geometry_provider.value if route.geometry_provider else None,
+            "deliveryPoints": [
+                {
+                    "id": str(point.id),
+                    "address": point.address,
+                    "lat": point.lat,
+                    "lng": point.lng,
+                    "status": point.status.value,
+                    "sequenceIndex": point.sequence_index,
+                    "orderId": point.order_id,
+                    "trackingToken": point.tracking_token,
+                }
+                for point in ordered_points
+            ],
+        },
+        **({"warning": result.warning} if result.warning else {}),
+    }
+
+
+async def _read_object(request: Request) -> dict[str, object] | JSONResponse:
+    try:
+        body: object = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error("El body debe ser JSON válido.", 400)
+    if body is None:
+        return _error("El body debe ser un objeto JSON.", 400)
+    if not isinstance(body, dict):
+        return _error("El body debe ser un objeto JSON.", 400)
+    return body
+
+
+def _validation_error(error: ValidationError) -> JSONResponse:
+    first = error.errors()[0]
+    field = str(first.get("loc", ["body"])[-1])
+    if field in {"courier_id", "delivery_point_ids"}:
+        message = (
+            "Los identificadores deben ser UUID válidos; "
+            "deliveryPointIds no puede estar vacío."
+        )
+    else:
+        message = str(first.get("ctx", {}).get("error", "El body de la solicitud no es válido."))
+    return _error(message, 400)
+
+
+def _log_database_error(message: str, error: Exception) -> None:
+    _LOGGER.warning(message, extra={"error_type": type(error).__name__})
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        content={"error": message},
+        status_code=status_code,
+        headers=_NO_STORE,
+    )
+
+
+def _json(content: dict[str, object], *, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(content=content, status_code=status_code, headers=_NO_STORE)
+
+
+_NO_SEGMENT = re.compile(r"coordinate (\d+)")
+
+
+def _unroutable_index(error: RoutingClientError) -> int | None:
+    """Índice del punto sin calle cercana cuando OSRM responde «NoSegment»; si no, None."""
+    body = getattr(error, "response_body", None) or ""
+    if getattr(error, "status", None) != 400 or "NoSegment" not in body:
+        return None
+    match = _NO_SEGMENT.search(body)
+    return int(match.group(1)) if match else None
