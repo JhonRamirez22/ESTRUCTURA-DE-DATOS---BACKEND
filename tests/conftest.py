@@ -1,3 +1,7 @@
+import os
+
+os.environ.setdefault("LEGACY_API_ALIAS_ENABLED", "true")  # antes de importar la app
+
 from collections.abc import Iterator
 
 import pytest

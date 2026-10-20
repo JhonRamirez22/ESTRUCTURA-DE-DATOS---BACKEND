@@ -26,6 +26,7 @@ from app.core.auth import (
     SessionRole,
     cleared_session_cookie,
     matches_access_code,
+    read_bearer_token,
     read_session_token,
     session_cookie,
     session_cookie_name,
@@ -55,6 +56,7 @@ from app.services.access_sessions import (
     utc_now,
 )
 from app.services.customer_chat_rate_limiter import CustomerChatRateLimiter
+from app.services.request_limiter import SlidingWindowLimiter
 from app.settings import Settings, get_settings
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -165,6 +167,7 @@ async def _login_response(
     payload = LoginResponse(
         authenticated=True,
         redirect_to=_safe_redirect_target(role, return_to),
+        access_token=token,
     )
     secure = settings.node_env == "production"
     response = JSONResponse(
@@ -294,6 +297,9 @@ async def logout(
     for role in roles:
         claims = await _resolve_session(request, session, role=role)
         await revoke_access_session(session, read_session_token(cookie_header, role))
+        bearer = read_bearer_token(request.headers.get("authorization"))
+        if bearer:
+            await revoke_access_session(session, bearer)
         if claims and claims.get("accountId"):
             _audit(session, request, "logout", UUID(claims["accountId"]))
     await session.commit()
@@ -341,20 +347,53 @@ async def _resolve_session(
     else:
         roles = ("dispatcher", "courier")
     cookie_header = request.headers.get("cookie")
+    bearer = read_bearer_token(request.headers.get("authorization"))
     for candidate in roles:
-        token = read_session_token(cookie_header, candidate)
+        # El token Bearer tiene prioridad; la cookie HttpOnly queda como respaldo.
+        token: str | None = bearer
+        identity = await resolve_access_session(session, token) if token else None
+        from_bearer = identity is not None and identity.role in roles
+        if not from_bearer:
+            token = read_session_token(cookie_header, candidate)
+            identity = await resolve_access_session(session, token) if token else None
         if token is None:
             continue
-        identity = await resolve_access_session(session, token)
         await session.commit()
         if identity is None:
             continue
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             _validate_origin(request, required=True)
-            if not csrf_matches(token, request.headers.get("X-CSRF-Token"), secret):
+            # Con Bearer no hay credencial ambiente: el CSRF solo protege a la cookie.
+            if not from_bearer and not csrf_matches(
+                token, request.headers.get("X-CSRF-Token"), secret
+            ):
                 raise HTTPException(status_code=403, detail="La verificación CSRF falló.")
+        _enforce_account_limit(
+            settings, identity.account_id or identity.courier_id or candidate, request.method
+        )
         return _claims_from_identity(identity)
     return None
+
+
+_ACCOUNT_LIMITERS: dict[tuple[bool, int], SlidingWindowLimiter] = {}
+
+
+def _enforce_account_limit(settings: Settings, subject: object, method: str) -> None:
+    """429 si una cuenta repite peticiones por encima de su cupo por minuto."""
+    write = method not in {"GET", "HEAD", "OPTIONS"}
+    limit = (
+        settings.account_write_limit_per_minute
+        if write
+        else settings.account_read_limit_per_minute
+    )
+    limiter = _ACCOUNT_LIMITERS.setdefault((write, limit), SlidingWindowLimiter(limit, 60))
+    retry_after = limiter.retry_after(str(subject))
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail="Demasiadas solicitudes seguidas. Espera un momento.",
+            headers={"Retry-After": str(retry_after), "Cache-Control": "private, no-store"},
+        )
 
 
 def _claims_from_identity(identity: SessionIdentity) -> SessionClaims:

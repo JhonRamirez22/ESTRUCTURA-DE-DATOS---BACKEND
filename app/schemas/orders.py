@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
+from app.core.validation import normalize_email, plain_text
 from app.models.enums import DeliveryPointStatus, RouteGeometryProvider, RouteStatus
 
 _Latitude = Annotated[float, Field(strict=True, ge=-90, le=90, allow_inf_nan=False)]
 _Longitude = Annotated[float, Field(strict=True, ge=-180, le=180, allow_inf_nan=False)]
-_EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+MAX_ADDRESS_LENGTH = 200
+MAX_ORDER_ID_LENGTH = 60
+MAX_TIME_WINDOW_JSON = 500
 _COLOMBIAN_MOBILE_PATTERN = re.compile(r"^(?:\+?57)?3\d{9}$")
 
 
@@ -26,13 +38,26 @@ def _normalize_colombian_mobile(phone: str) -> str:
     return f"+57{national_number}"
 
 
+
+def _check_text(value: str | None, field: str, max_length: int) -> str | None:
+    return None if value is None else plain_text(value, max_length=max_length, field=field)
+
+
+def _check_time_window(value: JsonValue | None) -> JsonValue | None:
+    if value is not None and len(json.dumps(value)) > MAX_TIME_WINDOW_JSON:
+        raise ValueError("timeWindow es demasiado grande.")
+    return value
+
+
 class OrderCreateRequest(BaseModel):
     model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
 
-    address: str = Field(min_length=1)
+    address: str = Field(min_length=1, max_length=MAX_ADDRESS_LENGTH)
     lat: _Latitude
     lng: _Longitude
-    order_id: str = Field(min_length=1, validation_alias="orderId")
+    order_id: str = Field(
+        min_length=1, max_length=MAX_ORDER_ID_LENGTH, validation_alias="orderId"
+    )
     time_window: JsonValue | None = Field(default=None, validation_alias="timeWindow")
     customer_email: str | None = Field(
         default=None, max_length=320, validation_alias="customerEmail"
@@ -47,10 +72,25 @@ class OrderCreateRequest(BaseModel):
         default=False, validation_alias="smsNotificationsEnabled"
     )
 
+    @field_validator("address")
+    @classmethod
+    def _address_text(cls, value: str | None) -> str | None:
+        return _check_text(value, "address", MAX_ADDRESS_LENGTH)
+
+    @field_validator("order_id")
+    @classmethod
+    def _order_id_text(cls, value: str | None) -> str | None:
+        return _check_text(value, "orderId", MAX_ORDER_ID_LENGTH)
+
+    @field_validator("time_window")
+    @classmethod
+    def _time_window_size(cls, value: JsonValue | None) -> JsonValue | None:
+        return _check_time_window(value)
+
     @model_validator(mode="after")
     def validate_email_consent(self) -> OrderCreateRequest:
-        if self.customer_email is not None and not _EMAIL_PATTERN.fullmatch(self.customer_email):
-            raise ValueError("customerEmail debe ser una dirección de correo válida.")
+        if self.customer_email is not None:
+            self.customer_email = normalize_email(self.customer_email)
         if self.email_notifications_enabled and self.customer_email is None:
             raise ValueError("Se requiere customerEmail para activar avisos por correo.")
         if not self.email_notifications_enabled:
@@ -69,10 +109,12 @@ class OrderCreateRequest(BaseModel):
 class OrderUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
 
-    address: str | None = Field(default=None, min_length=1)
+    address: str | None = Field(default=None, min_length=1, max_length=MAX_ADDRESS_LENGTH)
     lat: _Latitude | None = None
     lng: _Longitude | None = None
-    order_id: str | None = Field(default=None, min_length=1, validation_alias="orderId")
+    order_id: str | None = Field(
+        default=None, min_length=1, max_length=MAX_ORDER_ID_LENGTH, validation_alias="orderId"
+    )
     status: DeliveryPointStatus | None = None
     time_window: JsonValue | None = Field(default=None, validation_alias="timeWindow")
     customer_email: str | None = Field(
@@ -88,13 +130,28 @@ class OrderUpdateRequest(BaseModel):
         default=None, validation_alias="smsNotificationsEnabled"
     )
 
+    @field_validator("address")
+    @classmethod
+    def _address_text(cls, value: str | None) -> str | None:
+        return _check_text(value, "address", MAX_ADDRESS_LENGTH)
+
+    @field_validator("order_id")
+    @classmethod
+    def _order_id_text(cls, value: str | None) -> str | None:
+        return _check_text(value, "orderId", MAX_ORDER_ID_LENGTH)
+
+    @field_validator("time_window")
+    @classmethod
+    def _time_window_size(cls, value: JsonValue | None) -> JsonValue | None:
+        return _check_time_window(value)
+
     @model_validator(mode="after")
     def validate_update(self) -> OrderUpdateRequest:
         if not self.model_fields_set:
             raise ValueError("No hay campos válidos para actualizar.")
         nullable_fields = {"time_window", "customer_email", "customer_phone"}
-        if self.customer_email is not None and not _EMAIL_PATTERN.fullmatch(self.customer_email):
-            raise ValueError("customerEmail debe ser una dirección de correo válida.")
+        if self.customer_email is not None:
+            self.customer_email = normalize_email(self.customer_email)
         if (
             "customer_email" in self.model_fields_set
             and self.customer_email is None

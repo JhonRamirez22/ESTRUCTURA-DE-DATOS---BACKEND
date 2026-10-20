@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     notification_from_email: str | None = None
     notification_smtp_timeout_ms: int = Field(default=5_000, gt=0, le=60_000)
     # El poller infinito solo se habilita en un proceso persistente, nunca por defecto.
+    # El alias /api heredado queda apagado: la API se publica solo bajo /api/v1.
+    legacy_api_alias_enabled: bool = False
+    # Peticiones por minuto y cuenta; frena inundaciones desde un cliente manipulado.
+    account_read_limit_per_minute: int = Field(default=300, ge=10, le=10_000)
+    account_write_limit_per_minute: int = Field(default=90, ge=5, le=10_000)
     # Avisos al cliente por correo y SMS: apagados en el producto actual.
     customer_notifications_enabled: bool = False
     customer_notification_worker_enabled: bool = False

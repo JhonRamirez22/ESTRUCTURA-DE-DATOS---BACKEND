@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models import DeliveryPoint, DeliveryPointStatus, Route, RouteStatus
+from app.repositories.limits import MAX_LIST_ROWS
 
 
 class DeliveryPointRepository:
@@ -24,7 +25,9 @@ class DeliveryPointRepository:
         statement = select(DeliveryPoint)
         if status is not None:
             statement = statement.where(DeliveryPoint.status == status)
-        points = await self._session.scalars(statement.order_by(DeliveryPoint.id.asc()))
+        points = await self._session.scalars(
+            statement.order_by(DeliveryPoint.id.asc()).limit(MAX_LIST_ROWS)
+        )
         return list(points.all())
 
     async def list_pending_unassigned(

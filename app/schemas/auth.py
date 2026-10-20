@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import re
-
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+
+from app.core.validation import normalize_email
 
 
 class AccountCredentials(BaseModel):
@@ -14,10 +14,7 @@ class AccountCredentials(BaseModel):
     @field_validator("email")
     @classmethod
     def normalize_email(cls, value: str) -> str:
-        normalized = value.strip().casefold()
-        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", normalized):
-            raise ValueError("Ingresa un correo válido.")
-        return normalized
+        return normalize_email(value)
 
     @field_validator("password")
     @classmethod
@@ -56,6 +53,7 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     authenticated: bool
     redirect_to: str = Field(serialization_alias="redirectTo")
+    access_token: str | None = Field(default=None, serialization_alias="accessToken")
 
 
 class SessionResponse(BaseModel):

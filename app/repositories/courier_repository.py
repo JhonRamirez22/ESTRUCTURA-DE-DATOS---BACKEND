@@ -19,6 +19,7 @@ from app.models import (
     Route,
     RouteStatus,
 )
+from app.repositories.limits import MAX_LIST_ROWS
 
 
 class CourierRepository:
@@ -35,7 +36,7 @@ class CourierRepository:
         if status is not None:
             statement = statement.where(Courier.status == status)
         couriers = await self._session.scalars(
-            statement.order_by(Courier.name.asc(), Courier.id.asc())
+            statement.order_by(Courier.name.asc(), Courier.id.asc()).limit(MAX_LIST_ROWS)
         )
         return list(couriers.all())
 

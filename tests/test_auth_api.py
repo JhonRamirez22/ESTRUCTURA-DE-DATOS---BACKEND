@@ -228,7 +228,9 @@ async def test_dispatcher_login_sets_private_cookie_and_does_not_disclose_claims
     )
 
     assert response.status_code == 200
-    assert response.json() == {"authenticated": True, "redirectTo": "/dashboard"}
+    body = response.json()
+    expected = {"authenticated": True, "redirectTo": "/dashboard"}
+    assert body == {**expected, "accessToken": body["accessToken"]}
     assert "rutas-pasto-dispatch-session=" in response.headers["set-cookie"]
     assert "HttpOnly" in response.headers["set-cookie"]
     assert "SameSite=Strict" in response.headers["set-cookie"]
@@ -268,7 +270,9 @@ async def test_email_login_uses_account_role_and_private_session(
         },
     )
     assert response.status_code == 200
-    assert response.json() == {"authenticated": True, "redirectTo": "/dashboard"}
+    body = response.json()
+    expected = {"authenticated": True, "redirectTo": "/dashboard"}
+    assert body == {**expected, "accessToken": body["accessToken"]}
     assert "HttpOnly" in response.headers["set-cookie"]
     assert "password" not in response.text
     for _ in range(12):
@@ -440,7 +444,9 @@ async def test_courier_login_verifies_database_hash_and_limits_redirect_scope(
     )
 
     assert response.status_code == 200
-    assert response.json() == {"authenticated": True, "redirectTo": "/repartidor"}
+    body = response.json()
+    expected = {"authenticated": True, "redirectTo": "/repartidor"}
+    assert body == {**expected, "accessToken": body["accessToken"]}
     assert "courierId" not in response.json()
     assert "role" not in response.json()
     assert (await client.get("/api/auth/session")).json() == {"authenticated": True}
@@ -471,7 +477,9 @@ async def test_external_return_to_is_rejected(
         json={"accessCode": DISPATCHER_CODE, "returnTo": "//evil.example"},
     )
 
-    assert response.json() == {"authenticated": True, "redirectTo": "/dashboard"}
+    body = response.json()
+    expected = {"authenticated": True, "redirectTo": "/dashboard"}
+    assert body == {**expected, "accessToken": body["accessToken"]}
 
 
 @pytest.mark.asyncio

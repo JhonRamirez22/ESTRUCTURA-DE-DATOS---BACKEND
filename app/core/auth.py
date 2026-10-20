@@ -148,6 +148,17 @@ def read_session_token(cookie_header: str | None, role: SessionRole) -> str | No
     return _read_cookie(cookie_header, session_cookie_name(role))
 
 
+def read_bearer_token(authorization: str | None) -> str | None:
+    """Token de `Authorization: Bearer <token>`; None si falta o está mal formado."""
+    if not authorization:
+        return None
+    scheme, _, value = authorization.partition(" ")
+    value = value.strip()
+    if scheme.lower() != "bearer" or not value or len(value) > 512 or " " in value:
+        return None
+    return value
+
+
 def read_legacy_session_token(cookie_header: str | None) -> str | None:
     return _read_cookie(cookie_header, LEGACY_SESSION_COOKIE_NAME)
 

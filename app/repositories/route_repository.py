@@ -20,6 +20,7 @@ from app.models import (
     RouteRevision,
     RouteStatus,
 )
+from app.repositories.limits import MAX_ROUTE_ROWS
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +67,9 @@ class RouteRepository:
             statement = statement.where(Route.courier_id == courier_id)
         if status is not None:
             statement = statement.where(Route.status == status)
-        routes = await self._session.scalars(statement.order_by(Route.created_at.desc()))
+        routes = await self._session.scalars(
+            statement.order_by(Route.created_at.desc()).limit(MAX_ROUTE_ROWS)
+        )
         return list(routes.all())
 
     async def get_route_courier_id(self, route_id: UUID) -> UUID | None:

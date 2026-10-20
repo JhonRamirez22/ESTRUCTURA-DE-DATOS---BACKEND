@@ -95,5 +95,6 @@ for router in (
     optimizations_router,
 ):
     app.include_router(router, prefix="/api/v1")
-    # El alias conserva exactamente las mismas dependencias y permisos.
-    app.include_router(router, prefix="/api", include_in_schema=False)
+    if get_settings().legacy_api_alias_enabled:
+        # Solo para pruebas o migraciones: mismas dependencias y permisos que /api/v1.
+        app.include_router(router, prefix="/api", include_in_schema=False)
