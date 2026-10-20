@@ -135,3 +135,56 @@ async def test_public_requests_are_rate_limited_and_capped(
     monkeypatch.setattr(order_requests, "MAX_WAITING_REQUESTS", 2)
     capped = await _create(client, **{"X-Forwarded-For": "198.51.100.9"})
     assert capped.status_code == 503
+
+
+class _FakeGeocoder:
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    async def search(self, address: str) -> list[object]:
+        from app.services.address_geocoder import AddressSuggestion
+
+        self.queries.append(address)
+        return [AddressSuggestion(address="Calle 18 # 22-14, Pasto", lat=1.2136, lng=-77.2811,
+                                  precision="address")]
+
+
+@pytest.mark.asyncio
+async def test_public_address_lookup_requires_origin_and_caches_results(
+    client: httpx.AsyncClient,  # noqa: F811
+) -> None:
+    from app.main import app
+    from app.services.address_advisor import get_address_ai_advisor
+    from app.services.address_geocoder import get_address_geocoder
+
+    order_requests._LOOKUP_CACHE.clear()
+    geocoder = _FakeGeocoder()
+    app.dependency_overrides[get_address_geocoder] = lambda: geocoder
+    app.dependency_overrides[get_address_ai_advisor] = lambda: None
+    try:
+        no_origin = await client.post(
+            "/api/v1/solicitudes/direccion", json={"address": "calle 18 22 14"}
+        )
+        assert no_origin.status_code == 403
+        first = await client.post(
+            "/api/v1/solicitudes/direccion", headers=_ORIGIN, json={"address": "calle 18 # 22-14"}
+        )
+        assert first.status_code == 200
+        assert first.json()["candidates"][0]["lat"] == 1.2136
+        assert first.json()["cached"] is False
+        again = await client.post(
+            "/api/v1/solicitudes/direccion", headers=_ORIGIN, json={"address": "Calle 18 # 22-14"}
+        )
+        assert again.json()["cached"] is True
+        assert len(geocoder.queries) == 1
+        foreign = await client.post(
+            "/api/v1/solicitudes/direccion", headers=_ORIGIN, json={"address": "calle 5 bogota"}
+        )
+        assert foreign.json()["candidates"] == []
+        markup = await client.post(
+            "/api/v1/solicitudes/direccion", headers=_ORIGIN, json={"address": "<b>calle 5</b>"}
+        )
+        assert markup.status_code == 400
+    finally:
+        app.dependency_overrides.pop(get_address_geocoder, None)
+        app.dependency_overrides.pop(get_address_ai_advisor, None)

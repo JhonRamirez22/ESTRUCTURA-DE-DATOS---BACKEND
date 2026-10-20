@@ -23,6 +23,7 @@ from app.core.ai.route_traffic import (
 from app.core.location.courier_location import is_courier_location_fresh
 from app.core.location.pasto_area import is_within_pasto_service_area
 from app.core.optimization.nearest_neighbor import nearest_neighbor
+from app.core.optimization.or_opt import or_opt
 from app.core.optimization.order_verifier import verify_candidate_order
 from app.core.optimization.two_opt import two_opt
 from app.core.routing.cached_matrix_provider import (
@@ -40,6 +41,7 @@ from app.core.routing.contracts import (
 )
 from app.core.routing.ors_client import OrsClient
 from app.core.routing.osrm_client import OsrmClient
+from app.core.structures.lru_cache import LruCache
 from app.core.structures.stack import Stack
 from app.core.traffic.route_sampling import sample_route_leg_points
 from app.core.traffic.tomtom import TrafficData
@@ -120,6 +122,17 @@ class OptimizedRoutePlan:
     traffic_ai: dict[str, object]
     live_traffic: dict[str, object] = field(default_factory=dict)
     ai_order: dict[str, object] = field(default_factory=dict)
+    # Cómo se llegó al orden final: escalera de mejoras, tráfico medido e IA verificada.
+    optimization: dict[str, object] = field(default_factory=dict)
+
+
+# Último resumen de optimización por ruta, en memoria del proceso (LRU con lista doble).
+# Al reiniciar se pierde: la ruta conserva sus métricas base y optimizada en la base de datos.
+ROUTE_OPTIMIZATIONS: LruCache[UUID, dict[str, object]] = LruCache(128)
+
+
+def get_route_optimization(route_id: UUID) -> dict[str, object] | None:
+    return ROUTE_OPTIMIZATIONS.get(route_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -410,13 +423,16 @@ async def build_optimized_route_plan(
         (baseline_route, initial_route, nearest_neighbor(optimization_matrix, 0)),
         key=lambda route: _route_cost(optimization_matrix, route),
     )
-    optimized_route = two_opt(optimization_matrix, seed)
+    two_opt_route = two_opt(optimization_matrix, seed)
+    # Or-opt traslada tramos de 1 a 3 paradas que 2-opt no corrige con una inversión.
+    optimized_route = or_opt(optimization_matrix, two_opt_route)
     # Comparar ordenaciones con los mismos costos, no tráfico actual contra flujo libre.
     baseline_duration = _route_cost(optimization_matrix, baseline_route)
     optimized_duration = _route_cost(optimization_matrix, optimized_route)
     if not math.isfinite(optimized_duration):
         raise RouteConflictError("No existe un camino conectado que cubra todos los pedidos.")
 
+    or_opt_duration = optimized_duration
     ai_order = await _verified_ai_order(
         order_advisor, optimization_matrix, optimized_route, has_road_times
     )
@@ -439,6 +455,31 @@ async def build_optimized_route_plan(
     live_traffic["coverageRatio"] = final_measured / max(1, len(optimized_route) - 1)
 
     ordered_ids = tuple(delivery_point_ids[index - 1] for index in optimized_route[1:])
+    baseline_geometry: GeoJsonLineString | None = None
+    if baseline_route != optimized_route:
+        try:
+            # Solo para mostrar la diferencia en el mapa; no participa en la decisión.
+            baseline_geometry = (
+                await route_provider.get_route([coordinates[index] for index in baseline_route])
+            )["geometry"]
+        except Exception as error:
+            _LOGGER.info(
+                "No se obtuvo el trazado del orden base para comparar",
+                extra={"error_type": type(error).__name__},
+            )
+    optimization = _optimization_summary(
+        delivery_point_ids=delivery_point_ids,
+        matrix=optimization_matrix,
+        baseline_route=baseline_route,
+        two_opt_route=two_opt_route,
+        or_opt_duration=or_opt_duration,
+        final_route=optimized_route,
+        baseline_geometry=baseline_geometry,
+        live_traffic=live_traffic,
+        traffic_ai=traffic_ai,
+        ai_order=ai_order,
+        computed_at=current_time,
+    )
     distances = matrix_result.get("distances_meters")
     baseline_distance = (
         _route_cost(distances, baseline_route)
@@ -471,7 +512,96 @@ async def build_optimized_route_plan(
         traffic_ai=traffic_ai,
         live_traffic=live_traffic,
         ai_order=ai_order,
+        optimization=optimization,
     )
+
+
+def _optimization_summary(
+    *,
+    delivery_point_ids: Sequence[UUID],
+    matrix: Sequence[Sequence[float | None]],
+    baseline_route: Sequence[int],
+    two_opt_route: Sequence[int],
+    or_opt_duration: float,
+    final_route: Sequence[int],
+    baseline_geometry: GeoJsonLineString | None,
+    live_traffic: Mapping[str, object],
+    traffic_ai: Mapping[str, object],
+    ai_order: Mapping[str, object],
+    computed_at: datetime,
+) -> dict[str, object]:
+    """Explica la ruta con costos de la misma matriz ajustada por tráfico."""
+
+    def minutes(value: float) -> float | None:
+        return round(value, 1) if math.isfinite(value) else None
+
+    def ids(route: Sequence[int]) -> list[str]:
+        return [str(delivery_point_ids[index - 1]) for index in route[1:]]
+
+    baseline = _route_cost(matrix, baseline_route)
+    final = _route_cost(matrix, final_route)
+    observations = cast(list[dict[str, object]], live_traffic.get("observations", []))
+    return {
+        "ladder": [
+            {"step": "nearestNeighbor", "minutes": minutes(baseline)},
+            {"step": "twoOpt", "minutes": minutes(_route_cost(matrix, two_opt_route))},
+            {"step": "orOpt", "minutes": minutes(or_opt_duration)},
+            {
+                "step": "aiOrder",
+                "minutes": minutes(final),
+                "accepted": bool(ai_order.get("accepted")),
+                "proposed": bool(ai_order.get("proposed")),
+            },
+        ],
+        "baselineMinutes": minutes(baseline),
+        "optimizedMinutes": minutes(final),
+        "savedMinutes": minutes(baseline - final) if math.isfinite(baseline - final) else None,
+        "baselineOrder": ids(baseline_route),
+        "optimizedOrder": ids(final_route),
+        "baselineGeometry": baseline_geometry,
+        "trafficPoints": [
+            {
+                "point": item.get("point"),
+                "level": item.get("level"),
+                "multiplier": item.get("trafficMultiplier"),
+                "closed": bool(item.get("roadClosure")),
+                "observedAt": item.get("observedAt"),
+            }
+            for item in observations
+            if item.get("point") is not None
+        ],
+        "tomtom": {
+            "configured": bool(live_traffic.get("configured")),
+            "applied": bool(live_traffic.get("applied")),
+            "sampled": live_traffic.get("sampledSegments", 0),
+            "adjusted": live_traffic.get("adjustedSegments", 0),
+            "closed": live_traffic.get("closedSegments", 0),
+            "segments": live_traffic.get("routeSegments", 0),
+        },
+        "groq": {
+            "trafficSource": traffic_ai.get("source"),
+            "trafficApplied": bool(traffic_ai.get("applied")),
+            "model": traffic_ai.get("model"),
+            "orderProposed": bool(ai_order.get("proposed")),
+            "orderAccepted": bool(ai_order.get("accepted")),
+            "orderSavingMinutes": ai_order.get("savingMinutes"),
+            "orderReason": ai_order.get("reason"),
+        },
+        "computedAt": computed_at.replace(tzinfo=UTC).isoformat(),
+    }
+
+
+def _traffic_level(multiplier: float | None, closed: bool) -> str:
+    """Misma escala que el mapa: de fluido a cerrado según cuánto se alarga el tramo."""
+    if closed:
+        return "CERRADO"
+    if multiplier is None or not math.isfinite(multiplier) or multiplier < 1.15:
+        return "FLUIDO"
+    if multiplier < 1.5:
+        return "MODERADO"
+    if multiplier < 2.0:
+        return "ALTO"
+    return "MUY_ALTO"
 
 
 async def create_optimized_route(
@@ -558,6 +688,7 @@ async def create_optimized_routes_batch(
             saved_route = await repository.load_route(route.id)
             if saved_route is None:
                 raise RuntimeError("La ruta recién creada no pudo volver a consultarse.")
+            ROUTE_OPTIMIZATIONS.put(saved_route.id, plan.optimization)
             results.append(
                 RouteOperationResult(
                     saved_route,
@@ -660,6 +791,7 @@ async def recalculate_route(
         updated = await repository.load_route(route_id)
         if updated is None:
             raise RuntimeError("La ruta recalculada no pudo volver a consultarse.")
+        ROUTE_OPTIMIZATIONS.put(updated.id, plan.optimization)
         result = RouteOperationResult(
             updated,
             plan.ordered_delivery_point_ids,
@@ -1072,7 +1204,7 @@ async def _apply_live_traffic_to_route(
     low_confidence_count = 0
     error_count = 0
     observations: list[dict[str, object]] = []
-    for (_leg_index, (start, end, base_cost)), response in zip(
+    for (leg_index, (start, end, base_cost)), response in zip(
         prioritized_legs,
         responses,
         strict=True,
@@ -1097,6 +1229,9 @@ async def _apply_live_traffic_to_route(
             "trafficMultiplier": response.travel_time_multiplier,
             "confidence": response.confidence, "roadClosure": response.road_closure,
             "observedAt": response.timestamp.isoformat(), "cacheStatus": response.cache_status,
+            # Punto medido sobre la calle ([lng, lat]) y nivel para dibujarlo en el mapa.
+            "point": list(samples[leg_index]),
+            "level": _traffic_level(response.travel_time_multiplier, response.road_closure),
         }
         if response.road_closure:
             observations.append(observation)

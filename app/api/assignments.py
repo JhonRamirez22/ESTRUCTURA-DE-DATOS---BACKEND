@@ -45,6 +45,7 @@ from app.services.route_planner import (
     RouteProvider,
     build_optimized_route_plan,
     create_optimized_routes_batch,
+    get_route_optimization,
     get_routing_providers,
 )
 from app.services.route_traffic_advisor import (
@@ -382,6 +383,7 @@ def _operation_json(result: RouteOperationResult) -> dict[str, object]:
         ],
         "trafficAi": result.traffic_ai,
         "liveTraffic": result.live_traffic,
+        "optimization": get_route_optimization(route.id),
         "route": {
             "id": str(route.id),
             "courierId": str(route.courier_id),

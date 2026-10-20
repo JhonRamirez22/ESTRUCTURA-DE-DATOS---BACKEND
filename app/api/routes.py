@@ -45,6 +45,7 @@ from app.services.route_planner import (
     RouteProvider,
     build_optimized_route_plan,
     create_optimized_route,
+    get_route_optimization,
     get_routing_providers,
     recalculate_route,
     undo_route_recalculation,
@@ -858,6 +859,8 @@ def _route_json(
         "updatedAt": _date_json(route.updated_at),
         "courier": courier_json,
         "deliveryPoints": [_point_json(point, dispatcher=dispatcher) for point in ordered_points],
+        # Cómo se optimizó (escalera, tráfico TomTom, IA); null si el proceso se reinició.
+        "optimization": get_route_optimization(route.id),
     }
     if dispatcher:
         route_data["courierId"] = str(route.courier_id)
@@ -916,6 +919,7 @@ def _operation_json(
         "orderedDeliveryPointIds": [str(point_id) for point_id in point_ids],
         "trafficAi": result.traffic_ai,
         "liveTraffic": result.live_traffic,
+        "optimization": get_route_optimization(route.id),
         "route": _route_json(route, dispatcher=dispatcher),
         **({"warning": result.warning} if result.warning is not None else {}),
     }

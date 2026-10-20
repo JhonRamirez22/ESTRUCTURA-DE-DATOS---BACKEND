@@ -269,6 +269,12 @@ async def test_route_creation_optimizes_and_commits_route_and_ordered_points(
         ordered = sorted(route.delivery_points, key=lambda point: point.sequence_index or 0)
         assert [point.id for point in ordered] == [second_id, first_id]
         assert [point.sequence_index for point in ordered] == [0, 1]
+    # Si el orden óptimo difiere del orden base, se devuelve su trazado para compararlo.
+    optimization = payload["optimization"]
+    assert optimization["optimizedOrder"] == [str(second_id), str(first_id)]
+    if optimization["baselineOrder"] != optimization["optimizedOrder"]:
+        assert optimization["baselineGeometry"]["type"] == "LineString"
+    assert optimization["savedMinutes"] is None or optimization["savedMinutes"] >= 0
 
 
 @pytest.mark.asyncio
@@ -297,6 +303,19 @@ async def test_route_creation_applies_tomtom_factor_and_returns_coverage(
     assert payload["liveTraffic"]["adjustedSegments"] == 1
     assert payload["liveTraffic"]["coverageRatio"] == 1.0
     assert len(traffic.coordinates) == 1
+    # El resumen explica la ruta: escalera de mejoras y el punto medido por TomTom en la calle.
+    optimization = payload["optimization"]
+    assert [step["step"] for step in optimization["ladder"]] == [
+        "nearestNeighbor", "twoOpt", "orOpt", "aiOrder",
+    ]
+    assert optimization["tomtom"]["adjusted"] == 1
+    assert len(optimization["trafficPoints"]) == 1
+    point = optimization["trafficPoints"][0]
+    assert len(point["point"]) == 2 and point["level"] in {
+        "FLUIDO", "MODERADO", "ALTO", "MUY_ALTO", "CERRADO",
+    }
+    listed = await client.get("/api/rutas", headers={"Cookie": _cookie("dispatcher")})
+    assert listed.json()["routes"][0]["optimization"]["optimizedMinutes"] == 12.0
 
 
 @pytest.mark.asyncio
