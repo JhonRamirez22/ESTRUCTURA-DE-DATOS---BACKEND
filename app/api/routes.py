@@ -580,3 +580,86 @@ async def get_route_navigation(
         result = await cast(RouteProvider, route_provider).get_route(coordinates)
         if result["geometry_provider"] not in {"OSRM", "ORS"}:
             return _error(
+                "El proveedor no verificó una geometría vial; no se mostrará una línea recta.",
+                503,
+            )
+        return _json(
+            {
+                "navigation": {
+                    "geometry": result["geometry"],
+                    "geometryProvider": result["geometry_provider"],
+                    "distanceMeters": result["distance_meters"],
+                    "durationMinutes": result["duration_minutes"],
+                    "source": result["geometry_provider"].lower(),
+                    "nextDeliveryPointId": str(remaining[0].id),
+                    "remainingDeliveryPointIds": [str(point.id) for point in remaining],
+                }
+            },
+            headers=_NO_STORE,
+        )
+    except RoutingClientError as error:
+        _LOGGER.warning(
+            "No se pudo actualizar la navegación vial",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error(
+            "No se pudo obtener una ruta por calles. "
+            "La navegación no se reemplazó por una línea recta.",
+            503,
+        )
+    except SQLAlchemyError as error:
+        _log_database_error("No se pudo consultar la navegación", error)
+        return _error("No se pudo actualizar la navegación de la ruta.", 500)
+
+
+@router.get("/{route_id}/eta")
+async def get_route_eta(
+    route_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    providers: Annotated[
+        tuple[CachedMatrixProvider, CachedRouteProvider],
+        Depends(get_routing_providers),
+    ],
+) -> JSONResponse:
+    authorized = _authorize_route_id(route_id, claims)
+    if isinstance(authorized, JSONResponse):
+        return authorized
+    route_uuid, _dispatcher = authorized
+    try:
+        route = await RouteRepository(session).load_route(route_uuid)
+        if route is None:
+            return _error("La ruta no existe.", 404)
+        if (
+            claims is not None
+            and claims["role"] == "courier"
+            and route.courier_id != _claim_courier_id(claims)
+        ):
+            return _error("La ruta no existe.", 404)
+
+        points = sorted(
+            (
+                point
+                for point in route.delivery_points
+                if point.status.value in {"PENDING", "EN_ROUTE"}
+            ),
+            key=lambda point: point.sequence_index if point.sequence_index is not None else 0,
+        )
+        estimated_at = _date_json(datetime.now(UTC))
+        if not points:
+            return _json(
+                {
+                    "approximate": False,
+                    "estimatedAt": estimated_at,
+                    "etas": [],
+                    "matrixSource": None,
+                    "routeId": str(route.id),
+                    "warning": "No hay paradas pendientes para estimar.",
+                }
+            )
+
+        courier = route.courier
+        if (
+            courier.current_lat is None
+            or courier.current_lng is None
+            or not is_courier_location_fresh(courier.last_location_at)
