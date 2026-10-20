@@ -616,3 +616,80 @@ async def _verify_courier_login(access_code: str, session: AsyncSession) -> str 
 
 def _configured_secret(settings: Settings) -> str | None:
     secret = (
+        settings.auth_secret.get_secret_value().strip()
+        if settings.auth_secret is not None
+        else None
+    )
+    if secret is None and settings.is_development:
+        secret = DEVELOPMENT_SESSION_SECRET
+    if secret is None or len(secret.encode("utf-8")) < 32:
+        return None
+    return secret
+
+
+def _dispatcher_code(settings: Settings) -> str | None:
+    access_code = (
+        settings.dispatcher_access_code.get_secret_value().strip()
+        if settings.dispatcher_access_code is not None
+        else None
+    )
+    if access_code is None and settings.is_development:
+        return DEVELOPMENT_DISPATCHER_CODE
+    return access_code
+
+
+def _required_page_role(path: str) -> SessionRole | None:
+    if path == "/dashboard" or path.startswith("/dashboard/"):
+        return "dispatcher"
+    if path == "/pedidos" or path.startswith("/pedidos/"):
+        return "dispatcher"
+    if path == "/personal" or path.startswith("/personal/"):
+        return "dispatcher"
+    if path == "/auditoria" or path.startswith("/auditoria/"):
+        return "dispatcher"
+    if path == "/historial" or path.startswith("/historial/"):
+        return "dispatcher"
+    if path == "/repartidor" or path.startswith("/repartidor/"):
+        return "courier"
+    return None
+
+
+def _home_for_role(role: SessionRole) -> str:
+    return "/dashboard" if role == "dispatcher" else "/repartidor"
+
+
+def _safe_redirect_target(role: SessionRole, value: object) -> str:
+    fallback = "/dashboard" if role == "dispatcher" else "/repartidor"
+    if not isinstance(value, str) or not value.startswith("/"):
+        return fallback
+    if value.startswith("//") or "\\" in value:
+        return fallback
+
+    target = urlsplit(value)
+    path = target.path
+    if role == "dispatcher":
+        allowed = path == "/dashboard" or path.startswith("/dashboard/")
+        allowed = allowed or path == "/pedidos" or path.startswith("/pedidos/")
+    else:
+        allowed = path == "/repartidor" or path.startswith("/repartidor/")
+    if not allowed or target.scheme or target.netloc:
+        return fallback
+    return urlunsplit(("", "", path, target.query, target.fragment))
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        content={"error": message},
+        status_code=status_code,
+        headers={"Cache-Control": "no-store, private"},
+    )
+
+
+def _audit(
+    session: AsyncSession, request: Request, action: str,
+    account_id: UUID | None = None, *, outcome: str = "allowed",
+) -> None:
+    session.add(SecurityAuditEvent(
+        account_id=account_id, action=action, outcome=outcome,
+        request_id=getattr(request.state, "request_id", str(uuid4())), created_at=utc_now(),
+    ))
