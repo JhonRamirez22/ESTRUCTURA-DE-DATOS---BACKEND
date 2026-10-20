@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import Mock
 from uuid import UUID
 
 import httpx
@@ -121,6 +123,12 @@ async def test_security_headers_request_id_and_body_limit(client: httpx.AsyncCli
     UUID(response.headers["X-Request-ID"])
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["Referrer-Policy"] == "no-referrer"
+    https_response = await client.get(
+        "/api/v1/auth/session", headers={"X-Forwarded-Proto": "https"}
+    )
+    assert https_response.headers["Strict-Transport-Security"] == (
+        "max-age=31536000; includeSubDomains"
+    )
     oversized = await client.post("/api/v1/auth/login", content="x" * 65537)
     assert oversized.status_code == 413
 
@@ -278,7 +286,12 @@ async def test_email_login_uses_account_role_and_private_session(
 async def test_email_login_invalid_unknown_disabled_and_rate_limit(
     client: httpx.AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # El tiempo restante no debe variar con la carga del equipo durante la prueba.
+    clock = Mock(wraps=datetime)
+    clock.now.return_value = datetime.now(UTC)
+    monkeypatch.setattr("app.services.customer_chat_rate_limiter.datetime", clock)
     async with session_factory() as session:
         session.add(
             Account(

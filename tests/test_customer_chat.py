@@ -40,7 +40,7 @@ from app.services.customer_order_chat import (
 )
 from app.services.route_planner import get_routing_providers
 from app.services.traffic import get_traffic_service
-from app.settings import Settings
+from app.settings import Settings, get_settings
 
 
 class _FakeAssistant:
@@ -171,7 +171,10 @@ async def session_factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[As
 async def client(
     session_factory: async_sessionmaker[AsyncSession],
     routing_providers: tuple[_FakeMatrixProvider, _FakeRouteProvider],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[httpx.AsyncClient]:
+    monkeypatch.setenv("AUTH_SECRET", "customer-chat-test-secret-with-at-least-32-bytes")
+    get_settings.cache_clear()
     async def override_session() -> AsyncIterator[AsyncSession]:
         async with session_factory() as session:
             yield session
@@ -185,6 +188,7 @@ async def client(
         ) as test_client:
             yield test_client
     finally:
+        get_settings.cache_clear()
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(get_routing_providers, None)
         app.dependency_overrides.pop(get_traffic_service, None)

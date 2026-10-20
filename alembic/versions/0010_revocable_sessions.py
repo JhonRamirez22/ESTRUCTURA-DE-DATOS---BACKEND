@@ -46,9 +46,15 @@ def upgrade() -> None:
             sa.Column("request_id", sa.String(36), nullable=False),
             sa.Column("created_at", sa.DateTime(), nullable=False),
         )
-        op.create_index("security_audit_events_created_idx", "security_audit_events", ["created_at"])
+        op.create_index(
+            "security_audit_events_created_idx",
+            "security_audit_events",
+            ["created_at"],
+        )
 
 
 def downgrade() -> None:
     # No se usa durante rollback de aplicación: preserva auditoría y las sesiones emitidas.
-    raise RuntimeError("Rollback de código únicamente; conserva las tablas de seguridad.")
+    raise RuntimeError(
+        "Rollback de código únicamente; conserva las tablas de seguridad."
+    )
