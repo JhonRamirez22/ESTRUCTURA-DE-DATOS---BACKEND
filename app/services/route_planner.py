@@ -23,6 +23,7 @@ from app.core.ai.route_traffic import (
 from app.core.location.courier_location import is_courier_location_fresh
 from app.core.location.pasto_area import is_within_pasto_service_area
 from app.core.optimization.nearest_neighbor import nearest_neighbor
+from app.core.optimization.order_verifier import verify_candidate_order
 from app.core.optimization.two_opt import two_opt
 from app.core.routing.cached_matrix_provider import (
     CachedMatrixProvider,
@@ -58,6 +59,7 @@ from app.models import (
 from app.repositories.notification_repository import NotificationRepository
 from app.repositories.route_repository import RouteRepository
 from app.services.customer_notifications import enqueue_order_assigned_notification
+from app.services.route_order_advisor import MAX_AI_ORDER_STOPS, RouteOrderAdvisor
 from app.services.route_traffic_advisor import RouteTrafficAdvisor
 from app.settings import get_settings
 
@@ -117,6 +119,7 @@ class OptimizedRoutePlan:
     warning: str | None
     traffic_ai: dict[str, object]
     live_traffic: dict[str, object] = field(default_factory=dict)
+    ai_order: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +208,7 @@ async def build_optimized_route_plan(
     route_provider: RouteProvider,
     traffic_ai_advisor: RouteTrafficAdvisor | None = None,
     traffic_provider: TrafficProvider | None = None,
+    order_advisor: RouteOrderAdvisor | None = None,
     allow_on_route_courier: bool = False,
     existing_route_id: UUID | None = None,
     now: datetime | None = None,
@@ -413,6 +417,14 @@ async def build_optimized_route_plan(
     if not math.isfinite(optimized_duration):
         raise RouteConflictError("No existe un camino conectado que cubra todos los pedidos.")
 
+    ai_order = await _verified_ai_order(
+        order_advisor, optimization_matrix, optimized_route, has_road_times
+    )
+    if ai_order["accepted"]:
+        optimized_route = cast(list[int], ai_order.pop("route"))
+        optimized_duration = _route_cost(optimization_matrix, optimized_route)
+    ai_order.pop("route", None)
+
     final_coordinates = [coordinates[index] for index in optimized_route]
     if final_coordinates != ordered_coordinates:
         route_result = await route_provider.get_route(final_coordinates)
@@ -458,6 +470,7 @@ async def build_optimized_route_plan(
         warning=matrix_result.get("warning"),
         traffic_ai=traffic_ai,
         live_traffic=live_traffic,
+        ai_order=ai_order,
     )
 
 
@@ -947,6 +960,46 @@ def _validate_transition(current: RouteStatus, target: RouteStatus) -> None:
     }
     if current != target and target not in allowed[current]:
         raise RouteConflictError(f"No se puede cambiar una ruta {current} a {target}.")
+
+
+async def _verified_ai_order(
+    advisor: RouteOrderAdvisor | None,
+    matrix: Sequence[Sequence[float | None]],
+    current_route: list[int],
+    has_road_times: bool,
+) -> dict[str, object]:
+    """Pide un orden a la IA y solo lo acepta si Dijkstra confirma que baja el costo."""
+    result: dict[str, object] = {"source": "deterministic", "proposed": False, "accepted": False}
+    if advisor is None:
+        result["reason"] = "IA de orden no configurada."
+        return result
+    if not has_road_times or not 2 < len(matrix) <= MAX_AI_ORDER_STOPS:
+        result["reason"] = "La IA de orden se usa con tiempos viales y entre 2 y 24 paradas."
+        return result
+    try:
+        suggested = await advisor.suggest_order(matrix, current_route)
+    except Exception as error:
+        _LOGGER.warning(
+            "La IA de orden no respondió de forma utilizable",
+            extra={"error_type": type(error).__name__},
+        )
+        result["reason"] = "La IA de orden no respondió; se conserva el orden del algoritmo."
+        return result
+    verification = verify_candidate_order(matrix, current_route, suggested)
+    direct_better = _route_cost(matrix, suggested) < _route_cost(matrix, current_route)
+    accepted = verification.accepted and direct_better
+    result.update({
+        "source": "external-ai",
+        "proposed": suggested != current_route,
+        "accepted": accepted,
+        "savingMinutes": round(verification.saving_minutes, 1) if accepted else 0.0,
+        "reason": verification.reason if accepted or not verification.accepted
+        else "no mejora el costo directo",
+        "verifiedWith": "dijkstra",
+    })
+    if accepted:
+        result["route"] = suggested
+    return result
 
 
 def _route_cost(matrix: Sequence[Sequence[float | None]], route: Sequence[int]) -> float:

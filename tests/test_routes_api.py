@@ -1135,3 +1135,48 @@ async def test_optimization_summary_requires_groq_and_never_changes_routes(
         "/api/v1/optimizaciones/resumen", headers={"Cookie": _cookie("dispatcher")},
     )
     assert response.status_code == 503
+
+
+class _FakeOrderAdvisor:
+    def __init__(self, order: list[int] | None) -> None:
+        self._order = order
+
+    async def suggest_order(self, durations_minutes, current_order):  # type: ignore[no-untyped-def]
+        if self._order is None:
+            raise RuntimeError("proveedor caído")
+        return self._order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("order", "expected_reason"), [
+    (None, "no respondió"),
+    ([0, 1, 1], "inválido"),
+])
+async def test_ai_order_is_never_applied_when_it_fails_or_is_invalid(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    order: list[int] | None,
+    expected_reason: str,
+) -> None:
+    from app.services.route_order_advisor import get_route_order_advisor
+
+    await _create_courier(session_factory)
+    first_id = await _create_point(session_factory)
+    second_id = await _create_point(session_factory, address="Calle 18 # 20-30")
+    created = await client.post(
+        "/api/rutas", headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(first_id), str(second_id)]},
+    )
+    route = created.json()["route"]
+    app.dependency_overrides[get_route_order_advisor] = lambda: _FakeOrderAdvisor(order)
+    try:
+        proposal = await client.post(
+            f"/api/v1/rutas/{route['id']}/propuesta",
+            headers={"Cookie": _cookie("courier", _COURIER_ID)},
+        )
+    finally:
+        app.dependency_overrides.pop(get_route_order_advisor, None)
+    assert proposal.status_code == 200, proposal.text
+    ai_order = proposal.json()["aiOrder"]
+    assert ai_order["accepted"] is False
+    assert expected_reason in str(ai_order["reason"])

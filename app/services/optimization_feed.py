@@ -55,6 +55,8 @@ def record_proposal(route_id: UUID, body: dict[str, object], *, cached: bool) ->
             "improvementMinutes": improvement_minutes,
             "trafficSegments": segments,
             "aiApplied": _ai_applied(body),
+            "aiOrderAccepted": _ai_order(body, "accepted") is True,
+            "aiOrderSavingMinutes": _ai_order(body, "savingMinutes") or 0.0,
         }
     )
 
@@ -70,6 +72,8 @@ def record_applied(route_id: UUID, body: dict[str, object]) -> None:
             "improvementMinutes": None,
             "trafficSegments": _traffic_segments(body),
             "aiApplied": _ai_applied(body),
+            "aiOrderAccepted": False,
+            "aiOrderSavingMinutes": 0.0,
         }
     )
 
@@ -105,6 +109,11 @@ def _traffic_segments(body: dict[str, object]) -> int:
         if isinstance(used, int):
             return used
     return 0
+
+
+def _ai_order(body: dict[str, object], key: str) -> object:
+    ai_order = body.get("aiOrder")
+    return ai_order.get(key) if isinstance(ai_order, dict) else None
 
 
 def _ai_applied(body: dict[str, object]) -> bool:

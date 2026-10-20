@@ -35,6 +35,7 @@ from app.models import (
 )
 from app.repositories.route_repository import RouteRepository
 from app.services.optimization_feed import record_applied, record_proposal
+from app.services.route_order_advisor import RouteOrderAdvisor, get_route_order_advisor
 from app.services.route_planner import (
     MAX_ROUTE_STOPS,
     MatrixProvider,
@@ -154,6 +155,7 @@ async def create_route(
     ],
     advisor: Annotated[RouteTrafficAdvisor | None, Depends(get_route_traffic_advisor)],
     traffic: Annotated[TrafficService | None, Depends(get_traffic_service)],
+    order_advisor: Annotated[RouteOrderAdvisor | None, Depends(get_route_order_advisor)],
 ) -> JSONResponse:
     if claims is None:
         return _error("Debes iniciar sesión para continuar.", 401)
@@ -174,6 +176,7 @@ async def create_route(
             route_provider=cast(RouteProvider, route_provider),
             traffic_ai_advisor=advisor,
             traffic_provider=traffic,
+            order_advisor=order_advisor,
         )
         result = await create_optimized_route(session, plan)
         return _json(_operation_json(result), status_code=201, headers=_NO_STORE)
@@ -274,6 +277,7 @@ async def recalculate_route_endpoint(
     ],
     advisor: Annotated[RouteTrafficAdvisor | None, Depends(get_route_traffic_advisor)],
     traffic: Annotated[TrafficService | None, Depends(get_traffic_service)],
+    order_advisor: Annotated[RouteOrderAdvisor | None, Depends(get_route_order_advisor)],
 ) -> JSONResponse:
     if claims is None:
         return _error("Debes iniciar sesión para continuar.", 401)
@@ -312,6 +316,7 @@ async def recalculate_route_endpoint(
             route_provider=cast(RouteProvider, route_provider),
             traffic_ai_advisor=advisor,
             traffic_provider=traffic,
+            order_advisor=order_advisor,
             allow_on_route_courier=True,
             existing_route_id=parsed_id,
         )
@@ -364,6 +369,7 @@ async def propose_route_endpoint(
     ],
     advisor: Annotated[RouteTrafficAdvisor | None, Depends(get_route_traffic_advisor)],
     traffic: Annotated[TrafficService | None, Depends(get_traffic_service)],
+    order_advisor: Annotated[RouteOrderAdvisor | None, Depends(get_route_order_advisor)],
 ) -> JSONResponse:
     """Calcula el orden óptimo con tráfico e IA sin guardar nada; aplicarlo usa /recalcular."""
     if claims is None:
@@ -408,6 +414,7 @@ async def propose_route_endpoint(
             route_provider=cast(RouteProvider, route_provider),
             traffic_ai_advisor=advisor,
             traffic_provider=traffic,
+            order_advisor=order_advisor,
             allow_on_route_courier=True,
             existing_route_id=parsed_id,
         )
@@ -454,6 +461,7 @@ def _proposal_json(plan: OptimizedRoutePlan, current_ids: list[UUID]) -> dict[st
         "matrixSource": plan.matrix_source,
         "trafficAi": plan.traffic_ai,
         "liveTraffic": plan.live_traffic,
+        "aiOrder": plan.ai_order,
         "warning": plan.warning,
         "computedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
     }
