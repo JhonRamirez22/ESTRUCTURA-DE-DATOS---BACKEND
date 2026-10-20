@@ -508,3 +508,87 @@ async def _stop_location(courier_id: UUID, session: AsyncSession) -> JSONRespons
         return _error("No se pudo detener el seguimiento.", 500)
 
 
+async def _read_json_object(request: Request) -> dict[str, object] | JSONResponse:
+    try:
+        value: object = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error("El body debe ser JSON válido.", 400)
+    if not isinstance(value, dict):
+        return _error("El body debe ser un objeto JSON.", 400)
+    return {str(key): item for key, item in value.items()}
+
+
+def _parse_uuid(
+    value: str | None, message: str = "El identificador del repartidor no es válido."
+) -> UUID:
+    if not value:
+        raise HTTPException(status_code=400, detail=message)
+    try:
+        return UUID(value)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=message) from error
+
+
+def _parse_recorded_at(value: str | None) -> datetime | JSONResponse:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    if value is None:
+        return now
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return _error("recordedAt debe ser una fecha ISO válida.", 400)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(UTC).replace(tzinfo=None)
+    if parsed < now - COURIER_LOCATION_MAX_AGE or parsed > now + timedelta(seconds=15):
+        return _error(
+            "La ubicación está desactualizada o tiene una fecha futura; vuelve a obtener GPS.",
+            400,
+        )
+    return parsed
+
+
+def _courier_view(courier: Courier, now: datetime) -> CourierView:
+    view = CourierView.model_validate(courier)
+    if is_courier_location_fresh(courier.last_location_at, now):
+        return view
+    return view.model_copy(update={"current_lat": None, "current_lng": None})
+
+
+def _string_field_error(error: ValidationError) -> str:
+    location = error.errors()[0].get("loc", ())
+    field = str(location[0]) if location else "name"
+    return f"{field} debe ser un string no vacío."
+
+
+def _iso_utc(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return normalized.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        content={"error": message},
+        status_code=status_code,
+        headers=_NO_STORE_PRIVATE,
+    )
+
+
+def _json(
+    content: object,
+    status_code: int = 200,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    return JSONResponse(content=content, status_code=status_code, headers=headers)
+
+
+def _log_db_error(message: str, error: Exception) -> None:
+    _LOGGER.error(message, extra={"error_type": type(error).__name__})
+
+
+class CourierNotFoundError(Exception):
+    pass
+
+
+_NO_STORE_PRIVATE = {"Cache-Control": "no-store, private"}
