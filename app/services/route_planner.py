@@ -586,3 +586,87 @@ def _apply_time_windows(
             windows[index] = window
         if point.priority > 1:
             priority[index] = float(point.priority)
+    if not windows:
+        return None
+    plan = plan_with_windows(matrix, route, windows, priority)
+    changed = plan.route != route and plan.after.objective < plan.before.objective - 1e-9
+    return {
+        "applied": changed,
+        "route": plan.route if changed else route,
+        "windowedStops": len(windows),
+        "lateStopsBefore": plan.before.late_stops,
+        "lateStopsAfter": plan.after.late_stops if changed else plan.before.late_stops,
+        "lateMinutesBefore": round(_plain_lateness(plan.before, windows, route), 1),
+        "lateMinutesAfter": round(
+            _plain_lateness(plan.after, windows, plan.route) if changed
+            else _plain_lateness(plan.before, windows, route), 1,
+        ),
+    }
+
+
+def _plain_lateness(
+    evaluation: WindowEvaluation, windows: Mapping[int, Window], route: Sequence[int]
+) -> float:
+    """Minutos de retraso sin ponderar por prioridad, para mostrarlos al despachador."""
+    total = 0.0
+    for node, arrival in zip(route, evaluation.arrivals, strict=False):
+        window = windows.get(node)
+        if window is not None and arrival > window.latest:
+            total += arrival - window.latest
+    return total
+
+
+def _optimization_summary(
+    *,
+    delivery_point_ids: Sequence[UUID],
+    matrix: Sequence[Sequence[float | None]],
+    baseline_route: Sequence[int],
+    two_opt_route: Sequence[int],
+    or_opt_duration: float,
+    refined: RefineResult,
+    final_route: Sequence[int],
+    baseline_geometry: GeoJsonLineString | None,
+    live_traffic: Mapping[str, object],
+    traffic_ai: Mapping[str, object],
+    ai_order: Mapping[str, object],
+    computed_at: datetime,
+) -> dict[str, object]:
+    """Explica la ruta con costos de la misma matriz ajustada por tráfico."""
+
+    def minutes(value: float) -> float | None:
+        return round(value, 1) if math.isfinite(value) else None
+
+    def ids(route: Sequence[int]) -> list[str]:
+        return [str(delivery_point_ids[index - 1]) for index in route[1:]]
+
+    baseline = _route_cost(matrix, baseline_route)
+    final = _route_cost(matrix, final_route)
+    observations = cast(list[dict[str, object]], live_traffic.get("observations", []))
+    legs = [
+        {
+            "fromStop": "courier" if start == 0 else str(delivery_point_ids[start - 1]),
+            "toStop": str(delivery_point_ids[end - 1]),
+            "minutes": _leg_minutes(matrix[start][end]),
+        }
+        for start, end in zip(final_route, final_route[1:], strict=False)
+    ]
+    alternatives = [
+        {
+            "step": name,
+            "minutes": minutes(value),
+            "deltaMinutes": minutes(value - final) if math.isfinite(value - final) else None,
+        }
+        for name, value in (
+            ("nearestNeighbor", baseline),
+            ("twoOpt", _route_cost(matrix, two_opt_route)),
+            ("orOpt", or_opt_duration),
+            ("refine", refined.cost),
+        )
+    ]
+    return {
+        "legs": legs,
+        "alternatives": alternatives,
+        "ladder": [
+            {"step": "nearestNeighbor", "minutes": minutes(baseline)},
+            {"step": "twoOpt", "minutes": minutes(_route_cost(matrix, two_opt_route))},
+            {"step": "orOpt", "minutes": minutes(or_opt_duration)},
