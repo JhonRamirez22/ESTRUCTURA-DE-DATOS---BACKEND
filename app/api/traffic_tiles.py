@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import Response
 
@@ -64,6 +64,7 @@ async def traffic_tile(
     claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
     session: Annotated[AsyncSession, Depends(get_session)],
     service: Annotated[TrafficService | None, Depends(get_traffic_service)],
+    t: Annotated[int | None, Query(ge=0)] = None,
 ) -> Response:
     identity = _authorize(claims)
     try:
@@ -83,7 +84,10 @@ async def traffic_tile(
             429, "Límite temporal de consultas de tráfico.", headers={"Retry-After": str(retry)}
         )
     try:
-        tile = await service.get_flow_tile(z, x, y)
+        current_bucket = int(datetime.now(UTC).timestamp() // TRAFFIC_CACHE_TTL_SECONDS)
+        # Tolera un reloj cliente ligeramente desfasado sin permitir claves de caché arbitrarias.
+        bucket = t if t is not None and abs(t - current_bucket) <= 1 else current_bucket
+        tile = await service.get_flow_tile(z, x, y, refresh_bucket=bucket)
     except TrafficNoCoverageError as error:
         raise HTTPException(404, "Sin cobertura de tráfico para esta área.") from error
     except TrafficRateLimitError as error:

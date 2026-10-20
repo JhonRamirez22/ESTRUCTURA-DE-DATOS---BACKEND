@@ -69,6 +69,25 @@ async def test_png_cache_hit_miss_and_exact_ttl_boundary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_new_refresh_bucket_does_not_reuse_previous_snapshot_within_ttl() -> None:
+    calls = 0
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=PNG, headers={"Content-Type": "image/png"})
+
+    service = TrafficService(api_key="test", transport=httpx.MockTransport(respond))
+    try:
+        await service.get_flow_tile(*pasto_tile(), refresh_bucket=1)
+        await service.get_flow_tile(*pasto_tile(), refresh_bucket=1)
+        await service.get_flow_tile(*pasto_tile(), refresh_bucket=2)
+        assert calls == 2
+    finally:
+        await service.aclose()
+
+
+@pytest.mark.asyncio
 async def test_lru_uses_linked_list_and_evicts_least_recent_tile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -110,9 +129,9 @@ async def test_rate_limit_serves_marked_stale_data_only_for_bounded_time() -> No
         api_key="test", transport=httpx.MockTransport(respond), monotonic=lambda: clock[0]
     )
     try:
-        first = await service.get_flow_tile(*pasto_tile())
+        first = await service.get_flow_tile(*pasto_tile(), refresh_bucket=1)
         clock[0] = 90
-        stale = await service.get_flow_tile(*pasto_tile())
+        stale = await service.get_flow_tile(*pasto_tile(), refresh_bucket=2)
         assert stale.cache_status == "STALE" and stale.observed_at == first.observed_at
         z, x, y = pasto_tile(18)
         with pytest.raises(TrafficRateLimitError):

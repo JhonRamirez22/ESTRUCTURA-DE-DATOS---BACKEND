@@ -67,6 +67,7 @@ class _TileCacheEntry:
     key: str
     stored_at: float
     data: TrafficTile
+    refresh_bucket: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,12 +114,19 @@ class TrafficService:
         self._tile_nodes: dict[str, DoublyLinkedNode[_TileCacheEntry]] = {}
         self.last_tile: TrafficTile | None = None
 
-    async def get_flow_tile(self, z: int, x: int, y: int) -> TrafficTile:
+    async def get_flow_tile(
+        self, z: int, x: int, y: int, *, refresh_bucket: int | None = None
+    ) -> TrafficTile:
         validate_traffic_tile(z, x, y)
         key = f"{z}/{x}/{y}"
         cached = self._tile_nodes.get(key)
         now = self._monotonic()
-        if cached and now - cached.value.stored_at < TRAFFIC_CACHE_TTL_SECONDS:
+        # Un ciclo nuevo refresca la tesela, pero conserva la anterior ante caída del proveedor.
+        if (
+            cached
+            and cached.value.refresh_bucket == refresh_bucket
+            and now - cached.value.stored_at < TRAFFIC_CACHE_TTL_SECONDS
+        ):
             self._tiles.move_to_front(cached)
             self.last_tile = cached.value.data
             return cached.value.data
@@ -143,7 +151,7 @@ class TrafficService:
         if existing:
             self._tiles.remove(existing)
         self._tile_nodes[key] = self._tiles.appendleft(
-            _TileCacheEntry(key, self._monotonic(), data)
+            _TileCacheEntry(key, self._monotonic(), data, refresh_bucket)
         )
         while len(self._tiles) > TRAFFIC_TILE_CACHE_MAX_ENTRIES:
             evicted = self._tiles.pop_back()
