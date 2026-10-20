@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.core.auth import SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS, create_session_token
+from app.core.auth import SESSION_MAX_AGE_SECONDS, create_session_token, session_cookie_name
 from app.core.routing.cached_matrix_provider import MatrixProviderResult
 from app.core.routing.contracts import Coordinate, RouteResult
 from app.db.session import get_session
@@ -310,7 +310,7 @@ async def test_route_creation_persists_atomically_in_postgres() -> None:
         ) as client:
             response = await client.post(
                 "/api/rutas",
-                headers={"Cookie": f"{SESSION_COOKIE_NAME}={token}"},
+                headers={"Cookie": f"{session_cookie_name('dispatcher')}={token}"},
                 json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(_POINT_ID)]},
             )
 

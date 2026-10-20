@@ -66,11 +66,11 @@ async def test_logout_revokes_cookie_replay_on_both_versions(
 ) -> None:
     login = await client.post(f"{prefix}/auth/login", json={"accessCode": DISPATCHER_CODE})
     assert login.status_code == 200
-    raw = client.cookies.get("rutas-pasto-session")
+    raw = client.cookies.get("rutas-pasto-dispatch-session")
     assert raw is not None and len(raw) == 43
     assert (await client.post(f"{prefix}/auth/logout")).status_code == 200
     replay = await client.get(
-        f"{prefix}/auth/session", headers={"Cookie": f"rutas-pasto-session={raw}"},
+        f"{prefix}/auth/session", headers={"Cookie": f"rutas-pasto-dispatch-session={raw}"},
     )
     assert replay.json() == {"authenticated": False}
 
@@ -96,7 +96,7 @@ async def test_old_stateless_cookie_no_longer_authorizes(client: httpx.AsyncClie
 
     token = create_session_token("dispatcher", int(time()) + 3600, SESSION_SECRET)
     response = await client.get(
-        "/api/v1/auth/session", headers={"Cookie": f"rutas-pasto-session={token}"},
+        "/api/v1/auth/session", headers={"Cookie": f"rutas-pasto-dispatch-session={token}"},
     )
     assert response.json() == {"authenticated": False}
 
@@ -229,7 +229,7 @@ async def test_dispatcher_login_sets_private_cookie_and_does_not_disclose_claims
 
     assert response.status_code == 200
     assert response.json() == {"authenticated": True, "redirectTo": "/dashboard"}
-    assert "rutas-pasto-session=" in response.headers["set-cookie"]
+    assert "rutas-pasto-dispatch-session=" in response.headers["set-cookie"]
     assert "HttpOnly" in response.headers["set-cookie"]
     assert "SameSite=Strict" in response.headers["set-cookie"]
     assert response.headers["cache-control"] == "no-store, private"
@@ -472,3 +472,61 @@ async def test_external_return_to_is_rejected(
     )
 
     assert response.json() == {"authenticated": True, "redirectTo": "/dashboard"}
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_and_courier_sessions_coexist_in_one_browser(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier_id = "a1b2c3d4-0000-4000-8000-00000000c0de"
+    access_code = create_courier_access_code(courier_id)
+    async with session_factory() as session:
+        session.add(Courier(
+            id=UUID(courier_id),
+            name="Repartidor de prueba",
+            phone="3000000001",
+            status=CourierStatus.AVAILABLE,
+            credential=CourierCredential(access_code_hash=hash_courier_access_code(access_code)),
+        ))
+        await session.commit()
+
+    dispatcher = await client.post("/api/v1/auth/login", json={"accessCode": DISPATCHER_CODE})
+    assert dispatcher.status_code == 200
+    dispatch_cookie = client.cookies.get("rutas-pasto-dispatch-session")
+    assert dispatch_cookie is not None
+
+    courier = await client.post("/api/v1/auth/login", json={"accessCode": access_code})
+    assert courier.status_code == 200
+    # El inicio de sesión del repartidor no reemplaza la cookie de despacho.
+    assert client.cookies.get("rutas-pasto-dispatch-session") == dispatch_cookie
+    assert client.cookies.get("rutas-pasto-courier-session") is not None
+
+    dispatcher_page = await client.get(
+        "/api/v1/auth/access", params={"path": "/dashboard"},
+        headers={"X-Session-Role": "dispatcher"},
+    )
+    courier_page = await client.get(
+        "/api/v1/auth/access", params={"path": "/repartidor"},
+    )
+    assert dispatcher_page.json()["allowed"] is True
+    assert courier_page.json()["allowed"] is True
+
+    dispatcher_session = await client.get(
+        "/api/v1/auth/session", headers={"X-Session-Role": "dispatcher"},
+    )
+    assert dispatcher_session.headers.get("X-Session-Role") == "dispatcher"
+    assert "X-CSRF-Token" in dispatcher_session.headers
+
+    # Cerrar la sesión de repartidor no cierra la de despacho.
+    await client.post(
+        "/api/v1/auth/logout",
+        headers={
+            "X-Session-Role": "courier",
+            "X-CSRF-Token": courier.headers["X-CSRF-Token"],
+        },
+    )
+    still_dispatcher = await client.get(
+        "/api/v1/auth/session", headers={"X-Session-Role": "dispatcher"},
+    )
+    assert still_dispatcher.headers.get("X-Session-Role") == "dispatcher"

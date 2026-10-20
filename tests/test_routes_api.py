@@ -17,9 +17,9 @@ from sqlalchemy.orm import selectinload
 
 from app.core.ai.route_traffic import RouteTrafficAdjustment, RouteTrafficAdvice
 from app.core.auth import (
-    SESSION_COOKIE_NAME,
     SESSION_MAX_AGE_SECONDS,
     create_session_token,
+    session_cookie_name,
 )
 from app.core.routing.contracts import Coordinate, RouteResult
 from app.core.traffic.tomtom import TrafficData, TrafficLevel
@@ -194,7 +194,7 @@ def _cookie(role: str, courier_id: UUID | None = None) -> str:
         _SESSION_SECRET,
         str(courier_id) if courier_id else None,
     )
-    return f"{SESSION_COOKIE_NAME}={token}"
+    return f"{session_cookie_name(role)}={token}"
 
 
 async def _create_courier(

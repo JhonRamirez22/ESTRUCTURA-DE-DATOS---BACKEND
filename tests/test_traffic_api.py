@@ -9,7 +9,7 @@ from fastapi import FastAPI
 
 from app.api.auth import get_optional_session
 from app.api.traffic import router
-from app.core.auth import SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS, create_session_token
+from app.core.auth import SESSION_MAX_AGE_SECONDS, create_session_token, session_cookie_name
 from app.core.traffic.tomtom import TrafficData, TrafficLevel
 from app.services.traffic import get_traffic_service
 from app.settings import get_settings
@@ -41,7 +41,7 @@ def _cookie(role: str = "dispatcher") -> str:
         _SESSION_SECRET,
         "courier-test-id" if role == "courier" else None,
     )
-    return f"{SESSION_COOKIE_NAME}={token}"
+    return f"{session_cookie_name(role)}={token}"
 
 
 @pytest.mark.asyncio

@@ -57,7 +57,7 @@ async def test_real_postgres_login_cookie_csrf_and_revocation(
                 "/api/v1/auth/login", json={"email": email, "password": password},
             )
             assert login.status_code == 200
-            token = client.cookies.get("rutas-pasto-session")
+            token = client.cookies.get("rutas-pasto-dispatch-session")
             assert token is not None
             async with factory() as session:
                 record = await session.get(AccessSession, token_digest(token))
@@ -71,7 +71,7 @@ async def test_real_postgres_login_cookie_csrf_and_revocation(
             )
             assert logout.status_code == 200
             replay = await client.get(
-                "/api/v1/auth/session", headers={"Cookie": f"rutas-pasto-session={token}"},
+                "/api/v1/auth/session", headers={"Cookie": f"rutas-pasto-dispatch-session={token}"},
             )
             assert replay.json() == {"authenticated": False}
         async with factory() as session:

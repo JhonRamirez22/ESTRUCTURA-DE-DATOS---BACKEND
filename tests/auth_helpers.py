@@ -8,6 +8,11 @@ from app.settings import get_settings
 
 
 async def business_identity(request: Request) -> SessionClaims | None:
-    return verify_session_token(
-        read_session_token(request.headers.get("cookie")), _configured_secret(get_settings())
-    )
+    secret = _configured_secret(get_settings())
+    for role in ("dispatcher", "courier"):
+        claims = verify_session_token(
+            read_session_token(request.headers.get("cookie"), role), secret
+        )
+        if claims is not None:
+            return claims
+    return None

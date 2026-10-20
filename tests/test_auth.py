@@ -12,6 +12,7 @@ from app.core.auth import (
     matches_access_code,
     read_session_token,
     session_cookie,
+    session_cookie_name,
     verify_courier_access_code,
     verify_session_token,
 )
@@ -64,9 +65,11 @@ def test_access_code_comparison_and_cookie_contract() -> None:
 
     assert matches_access_code("same-code", "same-code")
     assert not matches_access_code("same-code", "other-code")
-    assert read_session_token(f"other=x; rutas-pasto-session={token}") == token
-    assert read_session_token("other=x") is None
-    assert "HttpOnly" in session_cookie(token, secure=True)
-    assert "SameSite=Strict" in session_cookie(token, secure=True)
-    assert "Secure" in session_cookie(token, secure=True)
-    assert "Max-Age=0" in cleared_session_cookie(secure=False)
+    dispatch_cookie = session_cookie_name("dispatcher")
+    assert read_session_token(f"other=x; {dispatch_cookie}={token}", "dispatcher") == token
+    assert read_session_token(f"{dispatch_cookie}={token}", "courier") is None
+    assert read_session_token("other=x", "dispatcher") is None
+    assert "HttpOnly" in session_cookie(token, "dispatcher", secure=True)
+    assert "SameSite=Strict" in session_cookie(token, "courier", secure=True)
+    assert "Secure" in session_cookie(token, "dispatcher", secure=True)
+    assert "Max-Age=0" in cleared_session_cookie(dispatch_cookie, secure=False)

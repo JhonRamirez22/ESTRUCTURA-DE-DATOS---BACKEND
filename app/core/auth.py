@@ -11,7 +11,7 @@ import secrets
 import time
 from typing import Literal, NotRequired, TypedDict, cast
 
-SESSION_COOKIE_NAME = "rutas-pasto-session"
+LEGACY_SESSION_COOKIE_NAME = "rutas-pasto-session"
 SESSION_MAX_AGE_SECONDS = 8 * 60 * 60
 SCRYPT_KEY_LENGTH = 64
 SCRYPT_N = 16_384
@@ -19,6 +19,10 @@ SCRYPT_R = 8
 SCRYPT_P = 1
 
 SessionRole = Literal["dispatcher", "courier"]
+SESSION_COOKIE_NAMES: dict[SessionRole, str] = {
+    "dispatcher": "rutas-pasto-dispatch-session",
+    "courier": "rutas-pasto-courier-session",
+}
 
 
 class SessionClaims(TypedDict):
@@ -135,19 +139,32 @@ def verify_session_token(
     return cast(SessionClaims, value)
 
 
-def read_session_token(cookie_header: str | None) -> str | None:
+def session_cookie_name(role: SessionRole) -> str:
+    """Cada rol tiene su propia cookie: un inicio de sesión en otro rol no reemplaza la primera."""
+    return SESSION_COOKIE_NAMES[role]
+
+
+def read_session_token(cookie_header: str | None, role: SessionRole) -> str | None:
+    return _read_cookie(cookie_header, session_cookie_name(role))
+
+
+def read_legacy_session_token(cookie_header: str | None) -> str | None:
+    return _read_cookie(cookie_header, LEGACY_SESSION_COOKIE_NAME)
+
+
+def _read_cookie(cookie_header: str | None, cookie_name: str) -> str | None:
     if not cookie_header:
         return None
     for entry in cookie_header.split(";"):
         name, separator, value = entry.strip().partition("=")
-        if name == SESSION_COOKIE_NAME:
+        if name == cookie_name:
             return value if separator and value else None
     return None
 
 
-def session_cookie(token: str, secure: bool) -> str:
+def session_cookie(token: str, role: SessionRole, secure: bool) -> str:
     parts = [
-        f"{SESSION_COOKIE_NAME}={token}",
+        f"{session_cookie_name(role)}={token}",
         "Path=/",
         "HttpOnly",
         "SameSite=Strict",
@@ -158,9 +175,9 @@ def session_cookie(token: str, secure: bool) -> str:
     return "; ".join(parts)
 
 
-def cleared_session_cookie(secure: bool) -> str:
+def cleared_session_cookie(cookie_name: str, secure: bool) -> str:
     parts = [
-        f"{SESSION_COOKIE_NAME}=",
+        f"{cookie_name}=",
         "Path=/",
         "HttpOnly",
         "SameSite=Strict",

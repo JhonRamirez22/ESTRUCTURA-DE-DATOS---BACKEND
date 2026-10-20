@@ -14,9 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.api.couriers import get_location_event_queue, get_write_session_factory
 from app.core.auth import (
-    SESSION_COOKIE_NAME,
     SESSION_MAX_AGE_SECONDS,
     create_session_token,
+    session_cookie_name,
     verify_courier_access_code,
 )
 from app.db.base import Base
@@ -104,7 +104,7 @@ def _cookie(role: str, courier_id: str | None = None) -> str:
         _SESSION_SECRET,
         courier_id,
     )
-    return f"{SESSION_COOKIE_NAME}={token}"
+    return f"{session_cookie_name(role)}={token}"
 
 
 async def _create_courier(

@@ -10,7 +10,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.core.auth import SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS, create_session_token
+from app.core.auth import SESSION_MAX_AGE_SECONDS, create_session_token, session_cookie_name
 from app.db.base import Base
 from app.db.session import get_session
 from app.main import app
@@ -62,7 +62,7 @@ def _dispatcher_cookie() -> str:
         int(time.time()) + SESSION_MAX_AGE_SECONDS,
         _SESSION_SECRET,
     )
-    return f"{SESSION_COOKIE_NAME}={token}"
+    return f"{session_cookie_name('dispatcher')}={token}"
 
 
 @pytest.mark.asyncio

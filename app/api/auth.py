@@ -20,12 +20,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import JSONResponse
 
 from app.core.auth import (
+    LEGACY_SESSION_COOKIE_NAME,
+    SESSION_COOKIE_NAMES,
     SessionClaims,
     SessionRole,
     cleared_session_cookie,
     matches_access_code,
     read_session_token,
     session_cookie,
+    session_cookie_name,
     verify_courier_access_code,
 )
 from app.core.passwords import hash_password, verify_password
@@ -42,6 +45,7 @@ from app.schemas.auth import (
     SessionResponse,
 )
 from app.services.access_sessions import (
+    SessionIdentity,
     create_access_session,
     csrf_matches,
     csrf_token,
@@ -54,6 +58,7 @@ from app.services.customer_chat_rate_limiter import CustomerChatRateLimiter
 from app.settings import Settings, get_settings
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+SESSION_ROLE_HEADER = "X-Session-Role"
 DEVELOPMENT_DISPATCHER_CODE = "rutas-pasto-local-dispatcher-code"
 DEVELOPMENT_SESSION_SECRET = "rutas-pasto-local-session-secret-not-for-production"
 _DUMMY_PASSWORD_HASH = hash_password("dummy-account-password-never-used")
@@ -156,17 +161,24 @@ async def _login_response(
 ) -> JSONResponse:
     token = await create_access_session(session, account_id=account.id)
     await session.commit()
+    role = cast(SessionRole, account.role)
     payload = LoginResponse(
         authenticated=True,
-        redirect_to=_safe_redirect_target(cast(SessionRole, account.role), return_to),
+        redirect_to=_safe_redirect_target(role, return_to),
     )
+    secure = settings.node_env == "production"
     response = JSONResponse(
         content=payload.model_dump(by_alias=True),
         headers={
-            "Set-Cookie": session_cookie(token, settings.node_env == "production"),
+            "Set-Cookie": session_cookie(token, role, secure),
             "Cache-Control": "no-store, private",
             "X-CSRF-Token": csrf_token(token, secret),
+            SESSION_ROLE_HEADER: role,
         },
+    )
+    # La cookie compartida anterior se elimina para que no compita con las de cada rol.
+    response.headers.append(
+        "Set-Cookie", cleared_session_cookie(LEGACY_SESSION_COOKIE_NAME, secure)
     )
     return response
 
@@ -230,9 +242,12 @@ async def read_session(
     claims = await get_optional_session(request, session)
     headers = {"Cache-Control": "no-store, private"}
     secret = _configured_secret(settings)
-    token = read_session_token(request.headers.get("cookie"))
-    if claims is not None and token and secret:
-        headers["X-CSRF-Token"] = csrf_token(token, secret)
+    if claims is not None and secret:
+        role = claims["role"]
+        token = read_session_token(request.headers.get("cookie"), role)
+        if token:
+            headers["X-CSRF-Token"] = csrf_token(token, secret)
+            headers[SESSION_ROLE_HEADER] = role
     payload = SessionResponse(authenticated=claims is not None)
     return JSONResponse(
         content=payload.model_dump(),
@@ -246,8 +261,8 @@ async def check_page_access(
     session: Annotated[AsyncSession, Depends(get_session)],
     path: Annotated[str, Query(min_length=1, max_length=256)],
 ) -> PageAccessResponse:
-    claims = await get_optional_session(request, session)
     if path == "/acceso":
+        claims = await get_optional_session(request, session)
         if claims is None:
             return PageAccessResponse(allowed=True)
         return PageAccessResponse(allowed=False, redirect_to=_home_for_role(claims["role"]))
@@ -255,11 +270,14 @@ async def check_page_access(
     required_role = _required_page_role(path)
     if required_role is None:
         raise HTTPException(status_code=400, detail="La ruta no requiere una sesión de rol.")
-    if claims is None:
-        return PageAccessResponse(allowed=False, redirect_to="/acceso")
-    if claims["role"] == required_role:
+    # Cada rol tiene su cookie: una sesión de repartidor no impide entrar al panel de despacho.
+    if await _resolve_session(request, session, role=required_role) is not None:
         return PageAccessResponse(allowed=True)
-    return PageAccessResponse(allowed=False, redirect_to=_home_for_role(claims["role"]))
+    other_role: SessionRole = "courier" if required_role == "dispatcher" else "dispatcher"
+    other = await _resolve_session(request, session, role=other_role)
+    if other is None:
+        return PageAccessResponse(allowed=False, redirect_to="/acceso")
+    return PageAccessResponse(allowed=False, redirect_to=_home_for_role(other["role"]))
 
 
 @router.post("/logout", response_model=LogoutResponse)
@@ -268,38 +286,78 @@ async def logout(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> JSONResponse:
     settings = get_settings()
-    claims = await get_optional_session(request, session)
-    await revoke_access_session(session, read_session_token(request.headers.get("cookie")))
-    if claims and claims.get("accountId"):
-        _audit(session, request, "logout", UUID(claims["accountId"]))
+    secure = settings.node_env == "production"
+    cookie_header = request.headers.get("cookie")
+    requested = _requested_role(request)
+    # Sin rol explícito se cierran todas las sesiones de este navegador.
+    roles: tuple[SessionRole, ...] = (requested,) if requested else ("dispatcher", "courier")
+    for role in roles:
+        claims = await _resolve_session(request, session, role=role)
+        await revoke_access_session(session, read_session_token(cookie_header, role))
+        if claims and claims.get("accountId"):
+            _audit(session, request, "logout", UUID(claims["accountId"]))
     await session.commit()
-    return JSONResponse(
+    response = JSONResponse(
         content={"ok": True},
-        headers={
-            "Set-Cookie": cleared_session_cookie(settings.node_env == "production"),
-            "Cache-Control": "no-store, private",
-        },
+        headers={"Cache-Control": "no-store, private"},
     )
+    for role in roles:
+        response.headers.append(
+            "Set-Cookie", cleared_session_cookie(session_cookie_name(role), secure)
+        )
+    if requested is None:
+        response.headers.append(
+            "Set-Cookie", cleared_session_cookie(LEGACY_SESSION_COOKIE_NAME, secure)
+        )
+    return response
 
 
 async def get_optional_session(
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> SessionClaims | None:
-    """Revalida cuenta y sesión en cada petición; las cookies firmadas antiguas no autorizan."""
+    """Dependencia de FastAPI: la sesión según `X-Session-Role` o la primera válida."""
+    return await _resolve_session(request, session)
+
+
+async def _resolve_session(
+    request: Request,
+    session: AsyncSession,
+    role: SessionRole | None = None,
+) -> SessionClaims | None:
+    """Revalida cuenta y sesión en cada petición; las cookies firmadas antiguas no autorizan.
+
+    Con `role` solo se consulta la cookie de ese rol. Sin él se usa el rol indicado en
+    `X-Session-Role` y, si no llega, la primera sesión válida (despacho, luego repartidor).
+    """
     settings = get_settings()
     secret = _configured_secret(settings)
     if secret is None:
         return None
-    token = read_session_token(request.headers.get("cookie"))
-    identity = await resolve_access_session(session, token)
-    await session.commit()
-    if identity is None:
-        return None
-    if request.method not in {"GET", "HEAD", "OPTIONS"}:
-        _validate_origin(request, required=True)
-        if not token or not csrf_matches(token, request.headers.get("X-CSRF-Token"), secret):
-            raise HTTPException(status_code=403, detail="La verificación CSRF falló.")
+    if role is not None:
+        roles: tuple[SessionRole, ...] = (role,)
+    elif (requested := _requested_role(request)) is not None:
+        roles = (requested,)
+    else:
+        roles = ("dispatcher", "courier")
+    cookie_header = request.headers.get("cookie")
+    for candidate in roles:
+        token = read_session_token(cookie_header, candidate)
+        if token is None:
+            continue
+        identity = await resolve_access_session(session, token)
+        await session.commit()
+        if identity is None:
+            continue
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            _validate_origin(request, required=True)
+            if not csrf_matches(token, request.headers.get("X-CSRF-Token"), secret):
+                raise HTTPException(status_code=403, detail="La verificación CSRF falló.")
+        return _claims_from_identity(identity)
+    return None
+
+
+def _claims_from_identity(identity: SessionIdentity) -> SessionClaims:
     claims: SessionClaims = {
         "role": cast(SessionRole, identity.role),
         "expiresAt": int(identity.expires_at.replace(tzinfo=UTC).timestamp()),
@@ -309,6 +367,28 @@ async def get_optional_session(
     if identity.courier_id:
         claims["courierId"] = str(identity.courier_id)
     return claims
+
+
+def _requested_role(request: Request) -> SessionRole | None:
+    value = request.headers.get(SESSION_ROLE_HEADER)
+    if value is None:
+        return None
+    if value not in SESSION_COOKIE_NAMES:
+        raise HTTPException(status_code=400, detail="El rol de sesión no es válido.")
+    return value
+
+
+async def _role_claims(
+    role: SessionRole,
+    claims: SessionClaims | None,
+    request: Request,
+    session: AsyncSession,
+) -> SessionClaims | None:
+    """Prefiere la sesión del rol pedido; si no existe, devuelve la otra para responder 403."""
+    if claims is not None and claims["role"] == role:
+        return claims
+    own = await _resolve_session(request, session, role=role)
+    return own if own is not None else claims
 
 
 def _validate_origin(request: Request, *, required: bool = False) -> None:
@@ -326,8 +406,11 @@ def _validate_origin(request: Request, *, required: bool = False) -> None:
 
 
 async def require_dispatcher_session(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
     claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
 ) -> SessionClaims:
+    claims = await _role_claims("dispatcher", claims, request, session)
     if claims is None:
         raise HTTPException(
             status_code=401,
@@ -344,8 +427,11 @@ async def require_dispatcher_session(
 
 
 async def require_courier_session(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
     claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
 ) -> SessionClaims:
+    claims = await _role_claims("courier", claims, request, session)
     if claims is None:
         raise HTTPException(
             status_code=401,

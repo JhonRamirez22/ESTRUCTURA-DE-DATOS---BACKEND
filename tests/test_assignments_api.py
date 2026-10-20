@@ -21,9 +21,9 @@ from app.core.ai.assignment_traffic import (
 )
 from app.core.ai.route_traffic import RouteTrafficAdvice
 from app.core.auth import (
-    SESSION_COOKIE_NAME,
     SESSION_MAX_AGE_SECONDS,
     create_session_token,
+    session_cookie_name,
 )
 from app.core.routing.contracts import Coordinate, RouteResult
 from app.core.traffic.tomtom import TrafficData, TrafficLevel
@@ -178,7 +178,7 @@ def _dispatcher_cookie() -> str:
         int(time()) + SESSION_MAX_AGE_SECONDS,
         _SESSION_SECRET,
     )
-    return f"{SESSION_COOKIE_NAME}={token}"
+    return f"{session_cookie_name('dispatcher')}={token}"
 
 
 @pytest.mark.asyncio
