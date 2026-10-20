@@ -98,3 +98,6 @@ for router in (
     if get_settings().legacy_api_alias_enabled:
         # Solo para pruebas o migraciones: mismas dependencias y permisos que /api/v1.
         app.include_router(router, prefix="/api", include_in_schema=False)
+if not get_settings().legacy_api_alias_enabled:
+    # El health check del balanceador consulta /api/health: es lo único que queda sin versión.
+    app.include_router(health_router, prefix="/api", include_in_schema=False)

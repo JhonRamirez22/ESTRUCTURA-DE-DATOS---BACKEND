@@ -31,3 +31,26 @@ async def test_malformed_bearer_is_unauthorized(anonymous_client) -> None:  # no
         "/api/v1/pedidos", headers={"Authorization": "Bearer corto"}
     )
     assert response.status_code in {401, 403}
+
+
+def test_balancer_health_path_survives_without_legacy_alias() -> None:
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import asyncio, httpx\n"
+        "from app.main import app\n"
+        "async def main():\n"
+        "    t = httpx.ASGITransport(app=app, raise_app_exceptions=False)\n"
+        "    async with httpx.AsyncClient(transport=t, base_url='http://t') as c:\n"
+        "        h = (await c.get('/api/health')).status_code\n"
+        "        o = (await c.get('/api/pedidos')).status_code\n"
+        "    print(h != 404, o == 404)\n"
+        "asyncio.run(main())\n"
+    )
+    env = {**os.environ, "LEGACY_API_ALIAS_ENABLED": "false"}
+    out = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert out.splitlines()[-1] == "True True"
