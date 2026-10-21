@@ -670,3 +670,87 @@ def _optimization_summary(
             {"step": "nearestNeighbor", "minutes": minutes(baseline)},
             {"step": "twoOpt", "minutes": minutes(_route_cost(matrix, two_opt_route))},
             {"step": "orOpt", "minutes": minutes(or_opt_duration)},
+            {
+                "step": "refine",
+                "minutes": minutes(refined.cost),
+                "kind": refined.kind,
+                "provenOptimal": refined.proven_optimal,
+                "lowerBoundMinutes": (
+                    minutes(refined.lower_bound) if refined.lower_bound is not None else None
+                ),
+            },
+            {
+                "step": "aiOrder",
+                "minutes": minutes(final),
+                "accepted": bool(ai_order.get("accepted")),
+                "proposed": bool(ai_order.get("proposed")),
+            },
+        ],
+        "baselineMinutes": minutes(baseline),
+        "optimizedMinutes": minutes(final),
+        "savedMinutes": minutes(baseline - final) if math.isfinite(baseline - final) else None,
+        "baselineOrder": ids(baseline_route),
+        "optimizedOrder": ids(final_route),
+        "baselineGeometry": baseline_geometry,
+        "trafficPoints": [
+            {
+                "point": item.get("point"),
+                "level": item.get("level"),
+                "multiplier": item.get("trafficMultiplier"),
+                "closed": bool(item.get("roadClosure")),
+                "observedAt": item.get("observedAt"),
+            }
+            for item in observations
+            if item.get("point") is not None
+        ],
+        "tomtom": {
+            "configured": bool(live_traffic.get("configured")),
+            "applied": bool(live_traffic.get("applied")),
+            "sampled": live_traffic.get("sampledSegments", 0),
+            "adjusted": live_traffic.get("adjustedSegments", 0),
+            "closed": live_traffic.get("closedSegments", 0),
+            "segments": live_traffic.get("routeSegments", 0),
+        },
+        "groq": {
+            "trafficSource": traffic_ai.get("source"),
+            "trafficApplied": bool(traffic_ai.get("applied")),
+            "model": traffic_ai.get("model"),
+            "orderProposed": bool(ai_order.get("proposed")),
+            "orderAccepted": bool(ai_order.get("accepted")),
+            "orderSavingMinutes": ai_order.get("savingMinutes"),
+            "orderReason": ai_order.get("reason"),
+        },
+        "computedAt": computed_at.replace(tzinfo=UTC).isoformat(),
+    }
+
+
+def _bogota_hour(observed_utc: datetime) -> int:
+    """Hora local de Bogotá (UTC-5) de una medición en UTC; el perfil horario usa hora local."""
+    return (observed_utc + _BOGOTA_OFFSET).hour
+
+
+async def _persist_traffic_history(
+    session: AsyncSession, route_id: UUID, live_traffic: Mapping[str, object]
+) -> None:
+    """Guarda mediciones por tramo y hora solo si el interruptor está encendido."""
+    if not get_settings().traffic_history_enabled:
+        return
+    rows: list[TrafficObservation] = []
+    for item in cast(list[dict[str, object]], live_traffic.get("observations", [])):
+        point = item.get("point")
+        if not isinstance(point, list) or len(point) != 2:
+            continue
+        observed = datetime.fromisoformat(str(item["observedAt"])).replace(tzinfo=None)
+        rows.append(
+            TrafficObservation(
+                route_id=route_id,
+                from_stop=str(item["fromStopId"]),
+                to_stop=str(item["toStopId"]),
+                multiplier=cast(float | None, item.get("trafficMultiplier")),
+                level=str(item.get("level") or "FLUIDO"),
+                road_closure=bool(item.get("roadClosure")),
+                point_lng=float(point[0]),
+                point_lat=float(point[1]),
+                hour_of_day=_bogota_hour(observed),
+                observed_at=observed,
+            )
