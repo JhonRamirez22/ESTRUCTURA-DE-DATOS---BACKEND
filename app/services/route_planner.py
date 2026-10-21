@@ -1004,3 +1004,86 @@ async def undo_route_recalculation(
         route = await repository.lock_route_with_delivery_points(route_id)
         if route is None:
             raise RoutePlanningError("La ruta no existe.", 404)
+        if route.status not in _ACTIVE_ROUTE_STATUSES:
+            raise RouteConflictError("Solo se puede restaurar una ruta planificada o en progreso.")
+
+        revisions = await repository.list_route_revisions(route_id)
+        history: Stack[RouteRevision] = Stack()
+        for revision in revisions:
+            history.push(revision)
+        revision_to_restore = history.pop()
+        if revision_to_restore is None:
+            raise RouteConflictError("La ruta no tiene un recálculo anterior para restaurar.")
+        snapshot = _read_route_revision_snapshot(revision_to_restore.snapshot)
+
+        points = await repository.lock_route_delivery_points(route_id)
+        active_points = [point for point in points if point.status in _ACTIVE_POINT_STATUSES]
+        points_by_id = {point.id: point for point in active_points}
+        snapshot_ids = {point_id for point_id, _sequence in snapshot.active_stops}
+        if not snapshot_ids.issubset(points_by_id):
+            raise RouteConflictError(
+                "No se puede restaurar: una parada anterior ya cambió de estado o salió de la ruta."
+            )
+
+        released_points = [
+            point for point in active_points if point.id not in snapshot_ids
+        ]
+        if any(point.status != DeliveryPointStatus.PENDING for point in released_points):
+            raise RouteConflictError(
+                "No se puede restaurar: una parada agregada ya inició su entrega."
+            )
+
+        # Liberar índices primero evita colisiones con la restricción única route_id/sequence_index.
+        for point in active_points:
+            point.sequence_index = None
+        for point in released_points:
+            point.route_id = None
+        await session.flush()
+
+        for point_id, sequence_index in snapshot.active_stops:
+            points_by_id[point_id].sequence_index = sequence_index
+        restored_at = datetime.now(UTC).replace(tzinfo=None)
+        route.estimated_duration_minutes = snapshot.estimated_duration_minutes
+        route.estimated_distance_meters = snapshot.estimated_distance_meters
+        route.baseline_duration_minutes = snapshot.baseline_duration_minutes
+        route.baseline_distance_meters = snapshot.baseline_distance_meters
+        route.geometry = snapshot.geometry
+        route.geometry_provider = snapshot.geometry_provider
+        route.updated_at = restored_at
+        route.optimized_at = restored_at
+        await repository.delete_route_revision(revision_to_restore.id)
+        await session.flush()
+
+        remaining_revisions = await repository.list_route_revisions(route_id)
+        updated = await repository.load_route(route_id)
+        if updated is None:
+            raise RuntimeError("La ruta restaurada no pudo volver a consultarse.")
+        result = RouteUndoResult(
+            route=updated,
+            can_undo=bool(remaining_revisions),
+            released_delivery_point_ids=tuple(point.id for point in released_points),
+        )
+    return result
+
+
+async def update_route_status(
+    session: AsyncSession,
+    route_id: UUID,
+    next_status: RouteStatus,
+    actor: EventActor = SYSTEM_ACTOR,
+) -> Route:
+    await session.rollback()
+    async with session.begin():
+        repository = RouteRepository(session)
+        route = await repository.lock_route_with_delivery_points(route_id)
+        if route is None:
+            raise RoutePlanningError("La ruta no existe.", 404)
+        _validate_transition(route.status, next_status)
+        if next_status == RouteStatus.COMPLETED and any(
+            point.status in _ACTIVE_POINT_STATUSES for point in route.delivery_points
+        ):
+            raise RouteConflictError("No se puede completar una ruta con pedidos pendientes.")
+
+        now = datetime.now(UTC).replace(tzinfo=None)
+        recorder = DeliveryEventRecorder(session)
+        if next_status == RouteStatus.CANCELLED:
