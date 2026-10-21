@@ -1170,3 +1170,86 @@ def _validate_courier_position(
             "La ubicación del repartidor cambió mientras se calculaba la ruta."
         )
     if not is_courier_location_fresh(courier.last_location_at, now):
+        raise RouteConflictError(
+            "La ubicación GPS del repartidor venció mientras se calculaba la ruta."
+        )
+
+
+def _build_route_revision_snapshot(
+    route: Route,
+    active_points: Sequence[DeliveryPoint],
+) -> dict[str, object]:
+    ordered_stops: list[dict[str, object]] = []
+    for point in active_points:
+        sequence_index = point.sequence_index
+        if sequence_index is None or sequence_index < 0:
+            raise RouteConflictError(
+                "No se puede guardar el historial: falta el orden de una parada."
+            )
+        ordered_stops.append(
+            {"deliveryPointId": str(point.id), "sequenceIndex": sequence_index}
+        )
+    ordered_stops.sort(key=lambda stop: cast(int, stop["sequenceIndex"]))
+    return {
+        "version": 1,
+        "estimatedDurationMinutes": route.estimated_duration_minutes,
+        "estimatedDistanceMeters": route.estimated_distance_meters,
+        "baselineDurationMinutes": route.baseline_duration_minutes,
+        "baselineDistanceMeters": route.baseline_distance_meters,
+        "geometry": route.geometry,
+        "geometryProvider": route.geometry_provider.value if route.geometry_provider else None,
+        "activeStops": ordered_stops,
+    }
+
+
+def _read_route_revision_snapshot(value: object) -> _RouteRevisionSnapshot:
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise RouteConflictError("El historial de la ruta no tiene un formato restaurable.")
+
+    estimated_duration = _snapshot_number(value.get("estimatedDurationMinutes"))
+    estimated_distance = _snapshot_number(value.get("estimatedDistanceMeters"))
+    raw_baseline_duration = value.get("baselineDurationMinutes")
+    raw_baseline_distance = value.get("baselineDistanceMeters")
+    baseline_duration = _snapshot_optional_number(raw_baseline_duration)
+    baseline_distance = _snapshot_optional_number(raw_baseline_distance)
+    raw_stops = value.get("activeStops")
+    if (
+        estimated_duration is None
+        or estimated_distance is None
+        or not isinstance(raw_stops, list)
+        or not raw_stops
+    ):
+        raise RouteConflictError("El historial de la ruta está incompleto y no se puede restaurar.")
+    if (raw_baseline_duration is not None and baseline_duration is None) or (
+        raw_baseline_distance is not None and baseline_distance is None
+    ):
+        raise RouteConflictError("El historial contiene métricas no restaurables.")
+
+    active_stops: list[tuple[UUID, int]] = []
+    for raw_stop in raw_stops:
+        if not isinstance(raw_stop, dict):
+            raise RouteConflictError("El historial de la ruta contiene una parada inválida.")
+        try:
+            point_id = UUID(str(raw_stop.get("deliveryPointId")))
+        except (ValueError, TypeError, AttributeError) as error:
+            raise RouteConflictError(
+                "El historial de la ruta contiene una parada inválida."
+            ) from error
+        sequence_index = raw_stop.get("sequenceIndex")
+        if (
+            isinstance(sequence_index, bool)
+            or not isinstance(sequence_index, int)
+            or sequence_index < 0
+        ):
+            raise RouteConflictError("El historial de la ruta contiene un orden inválido.")
+        active_stops.append((point_id, sequence_index))
+    if (
+        len({point_id for point_id, _index in active_stops}) != len(active_stops)
+        or len({index for _point_id, index in active_stops}) != len(active_stops)
+    ):
+        raise RouteConflictError("El historial de la ruta contiene un orden duplicado.")
+
+    raw_provider = value.get("geometryProvider")
+    try:
+        provider = RouteGeometryProvider(raw_provider) if raw_provider is not None else None
+    except ValueError as error:
