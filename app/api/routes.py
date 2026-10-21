@@ -912,3 +912,86 @@ def _point_json(point: DeliveryPoint, *, dispatcher: bool) -> dict[str, object]:
     payload: dict[str, object] = {
         "id": str(point.id),
         "address": point.address,
+        "lat": point.lat,
+        "lng": point.lng,
+        "timeWindow": point.time_window,
+        "priority": point.priority,
+        "status": point.status.value,
+        "sequenceIndex": point.sequence_index,
+    }
+    if dispatcher:
+        payload.update(
+            {
+                "orderId": point.order_id,
+                "trackingToken": point.tracking_token,
+                "routeId": str(point.route_id) if point.route_id else None,
+            }
+        )
+    return payload
+
+
+def _read_route_geometry(value: object) -> GeoJsonLineString | None:
+    if not isinstance(value, dict) or value.get("type") != "LineString":
+        return None
+    coordinates = value.get("coordinates")
+    if not isinstance(coordinates, list):
+        return None
+    parsed: list[Coordinate] = []
+    for coordinate in coordinates:
+        if (
+            not isinstance(coordinate, (list, tuple))
+            or len(coordinate) != 2
+            or any(
+                isinstance(part, bool) or not isinstance(part, (int, float)) for part in coordinate
+            )
+        ):
+            return None
+        parsed.append((float(coordinate[0]), float(coordinate[1])))
+    return {"type": "LineString", "coordinates": parsed}
+
+
+def _operation_json(
+    result: RouteOperationResult, *, dispatcher: bool = True
+) -> dict[str, object]:
+    route = result.route
+    point_ids = result.ordered_delivery_point_ids
+    return {
+        "matrixSource": result.matrix_source,
+        "orderedDeliveryPointIds": [str(point_id) for point_id in point_ids],
+        "trafficAi": result.traffic_ai,
+        "liveTraffic": result.live_traffic,
+        "optimization": get_route_optimization(route.id),
+        "route": _route_json(route, dispatcher=dispatcher),
+        **({"warning": result.warning} if result.warning is not None else {}),
+    }
+
+
+def _authorize_route_id(
+    route_id: str,
+    claims: SessionClaims | None,
+) -> tuple[UUID, bool] | JSONResponse:
+    parsed = _parse_uuid(route_id)
+    if parsed is None:
+        return _error("La ruta no existe.", 404)
+    if claims is None:
+        return _error("Debes iniciar sesión para consultar rutas.", 401)
+    if claims["role"] == "courier" and _claim_courier_id(claims) is None:
+        return _error("La sesión de repartidor no es válida.", 403)
+    return parsed, claims["role"] == "dispatcher"
+
+
+def _claim_courier_id(claims: SessionClaims) -> UUID | None:
+    try:
+        value = claims.get("courierId")
+        return UUID(value) if value else None
+    except ValueError:
+        return None
+
+
+def _parse_query_courier_id(raw: str | None) -> UUID | None | JSONResponse:
+    if raw is None:
+        return None
+    parsed = _parse_uuid(raw)
+    return parsed if parsed is not None else _error("courierId debe ser un UUID válido.", 400)
+
+
