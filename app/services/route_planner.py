@@ -1336,3 +1336,86 @@ async def _verified_ai_order(
 
 
 def _route_cost(matrix: Sequence[Sequence[float | None]], route: Sequence[int]) -> float:
+    total = 0.0
+    for index, source in enumerate(route[:-1]):
+        cost = matrix[source][route[index + 1]]
+        total += math.inf if cost is None else cost
+    return total
+
+
+async def _apply_live_traffic_to_route(
+    traffic_provider: TrafficProvider,
+    matrix: Sequence[Sequence[float | None]],
+    route: Sequence[int],
+    ordered_coordinates: Sequence[Coordinate],
+    geometry: GeoJsonLineString,
+    *,
+    baseline_matrix: Sequence[Sequence[float | None]] | None = None,
+) -> tuple[list[list[float | None]], dict[str, object]]:
+    """Consulta pocos puntos sobre las calles y ajusta solo las aristas muestreadas."""
+    tomtom_base_matrix = baseline_matrix if baseline_matrix is not None else matrix
+    legs = [
+        (start, end, tomtom_base_matrix[start][end])
+        for start, end in zip(route, route[1:], strict=False)
+    ]
+    samples = sample_route_leg_points(geometry, ordered_coordinates)
+    base_summary: dict[str, object] = {
+        "source": "tomtom",
+        "configured": True,
+        "applied": False,
+        "routeSegments": len(legs),
+        "requestedSegments": 0,
+        "sampledSegments": 0,
+        "adjustedSegments": 0,
+        "closedSegments": 0,
+        "staleSegments": 0,
+        "lowConfidenceSegments": 0,
+        "errorSegments": 0,
+        "coverageRatio": 0.0,
+    }
+    if not legs or len(samples) != len(legs):
+        base_summary["warning"] = (
+            "No se pudieron alinear las paradas con la geometría vial; "
+            "se conservaron los tiempos de base."
+        )
+        return [list(row) for row in matrix], base_summary
+
+    # La primera etapa siempre se mide; el resto prioriza los tramos más costosos.
+    prioritized_legs = sorted(
+        enumerate(legs),
+        key=lambda item: (
+            item[0] != 0,
+            -(item[1][2] if item[1][2] is not None else -1.0),
+        ),
+    )[:MAX_TOMTOM_ROUTE_SAMPLES]
+    base_summary["requestedSegments"] = len(prioritized_legs)
+    responses = await asyncio.gather(
+        *(
+            traffic_provider.get_flow_segment(samples[leg_index])
+            for leg_index, _leg in prioritized_legs
+        ),
+        return_exceptions=True,
+    )
+
+    adjusted_matrix = [list(row) for row in matrix]
+    sampled_count = 0
+    adjusted_count = 0
+    closed_count = 0
+    stale_count = 0
+    low_confidence_count = 0
+    error_count = 0
+    observations: list[dict[str, object]] = []
+    for (leg_index, (start, end, base_cost)), response in zip(
+        prioritized_legs,
+        responses,
+        strict=True,
+    ):
+        if isinstance(response, asyncio.CancelledError):
+            raise response
+        if isinstance(response, BaseException):
+            if not isinstance(response, Exception):
+                raise response
+            error_count += 1
+            _LOGGER.warning(
+                "TomTom Traffic falló para un tramo; se mantiene el costo vial base",
+                extra={"error_type": type(response).__name__},
