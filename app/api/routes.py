@@ -995,3 +995,86 @@ def _parse_query_courier_id(raw: str | None) -> UUID | None | JSONResponse:
     return parsed if parsed is not None else _error("courierId debe ser un UUID válido.", 400)
 
 
+def _parse_uuid(value: str) -> UUID | None:
+    try:
+        return UUID(value)
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+async def _read_model[T: BaseModel](request: Request, model: type[T]) -> T | JSONResponse:
+    try:
+        raw: object = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error("El body debe ser JSON válido.", 400)
+    if not isinstance(raw, dict):
+        return _error("El body debe ser un objeto JSON.", 400)
+    try:
+        return model.model_validate(raw)
+    except ValidationError as error:
+        return _validation_error(error)
+
+
+async def _read_optional_model[T: BaseModel](
+    request: Request,
+    model: type[T],
+) -> T | JSONResponse:
+    raw_body = await request.body()
+    if not raw_body.strip():
+        return model.model_validate({})
+    try:
+        raw: object = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _error("El body debe ser JSON válido.", 400)
+    if not isinstance(raw, dict):
+        return _error("El body debe ser un objeto JSON.", 400)
+    try:
+        return model.model_validate(raw)
+    except ValidationError as error:
+        return _validation_error(error)
+
+
+def _validation_error(error: ValidationError) -> JSONResponse:
+    first = error.errors()[0]
+    field = str(first.get("loc", ["body"])[-1])
+    if field == "courier_id":
+        message = "courierId debe ser un UUID válido."
+    elif field == "delivery_point_ids":
+        message = f"deliveryPointIds debe contener entre 1 y {MAX_ROUTE_STOPS} UUID válidos."
+    elif field == "status":
+        message = "status debe ser PLANNED, IN_PROGRESS, COMPLETED o CANCELLED."
+    else:
+        message = "El body de la solicitud no es válido."
+    return _error(message, 400)
+
+
+def _date_json(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return normalized.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _log_database_error(message: str, error: Exception) -> None:
+    _LOGGER.warning(message, extra={"error_type": type(error).__name__})
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        content={"error": message},
+        status_code=status_code,
+        headers=_NO_STORE,
+    )
+
+
+def _json(
+    content: dict[str, object],
+    *,
+    status_code: int = 200,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    return JSONResponse(
+        content=content,
+        status_code=status_code,
+        headers=headers or _NO_STORE,
+    )
