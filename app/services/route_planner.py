@@ -838,3 +838,86 @@ async def create_optimized_routes_batch(
                 geometry=plan.geometry,
                 geometry_provider=plan.geometry_provider,
                 optimized_at=planned_at,
+            )
+            repository.add_route(route)
+            await session.flush()
+            await _assign_delivery_points(
+                session,
+                route.id,
+                plan.ordered_delivery_point_ids,
+                expected_coordinates=dict(plan.planned_delivery_point_coordinates),
+                allowed_statuses=(DeliveryPointStatus.PENDING,),
+            )
+            assigned_points = await repository.get_delivery_points(
+                plan.ordered_delivery_point_ids
+            )
+            DeliveryEventRecorder(session).assigned(
+                assigned_points, route.id, plan.courier_id, actor
+            )
+            queued_by_channel = {
+                CustomerNotificationChannel.EMAIL: 0,
+                CustomerNotificationChannel.SMS: 0,
+            }
+            for point in assigned_points:
+                for channel in await enqueue_order_assigned_notification(session, point, route.id):
+                    queued_by_channel[channel] += 1
+            notification_repository.add(
+                Notification(
+                    kind=NotificationKind.ROUTE_CREATED,
+                    recipient_id=str(plan.courier_id),
+                    title="Ruta asignada",
+                    message=(
+                        f"Se asignó una ruta con "
+                        f"{len(plan.ordered_delivery_point_ids)} paradas."
+                    ),
+                )
+            )
+            await session.flush()
+            saved_route = await repository.load_route(route.id)
+            if saved_route is None:
+                raise RuntimeError("La ruta recién creada no pudo volver a consultarse.")
+            ROUTE_OPTIMIZATIONS.put(saved_route.id, plan.optimization)
+            await _persist_traffic_history(session, saved_route.id, plan.live_traffic)
+            results.append(
+                RouteOperationResult(
+                    saved_route,
+                    plan.ordered_delivery_point_ids,
+                    plan.matrix_source,
+                    plan.warning,
+                    plan.traffic_ai,
+                    sum(queued_by_channel.values()),
+                    tuple(queued_by_channel.items()),
+                    plan.live_traffic,
+                )
+            )
+    return results
+
+
+async def recalculate_route(
+    session: AsyncSession,
+    route_id: UUID,
+    plan: OptimizedRoutePlan,
+    previous_active_ids: Sequence[UUID],
+) -> RouteOperationResult:
+    await session.rollback()
+    async with session.begin():
+        repository = RouteRepository(session)
+        notification_repository = NotificationRepository(session)
+        route = await repository.lock_route(route_id)
+        if route is None:
+            raise RoutePlanningError("La ruta no existe.", 404)
+        if route.status not in _ACTIVE_ROUTE_STATUSES:
+            raise RouteConflictError("Solo se pueden recalcular rutas planificadas o en progreso.")
+        if route.courier_id != plan.courier_id:
+            raise RouteConflictError("La ruta cambió de repartidor mientras se recalculaba.")
+
+        courier = await repository.get_courier(route.courier_id, for_update=True)
+        if courier is None:
+            raise RoutePlanningError("El courier de la ruta ya no existe.", 404)
+        _validate_courier_position(courier, plan, datetime.now(UTC).replace(tzinfo=None))
+
+        all_route_points = await repository.lock_route_delivery_points(route_id)
+        active_points = [
+            point for point in all_route_points if point.status in _ACTIVE_POINT_STATUSES
+        ]
+        currently_active_ids = {point.id for point in active_points}
