@@ -829,3 +829,86 @@ async def get_route_live_traffic(
             and route.courier_id != _claim_courier_id(claims)
         ):
             return _error("La ruta no existe.", 404)
+        if route.status not in {RouteStatus.PLANNED, RouteStatus.IN_PROGRESS}:
+            return _error("El tráfico en vivo solo está disponible para rutas activas.", 409)
+        geometry = _read_route_geometry(route.geometry)
+        if (
+            geometry is None
+            or route.geometry_provider is None
+            or any(
+                not is_within_pasto_service_area(lat, lon)
+                for lon, lat in geometry["coordinates"]
+            )
+        ):
+            return _error("La ruta no tiene geometría vial válida dentro de Pasto.", 409)
+        overlay = await sample_route_traffic_overlay(geometry, traffic)
+        return _json(overlay, headers=_NO_STORE)
+    except SQLAlchemyError as error:
+        _log_database_error("No se pudo cargar el tráfico de la ruta", error)
+        return _error("No se pudo cargar el tráfico de la ruta.", 500)
+
+
+def _route_json(
+    route: Route,
+    *,
+    dispatcher: bool,
+    can_undo: bool = False,
+) -> dict[str, object]:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    courier = route.courier
+    fresh = (
+        courier.current_lat is not None
+        and courier.current_lng is not None
+        and is_courier_location_fresh(courier.last_location_at, now)
+        and is_within_pasto_service_area(courier.current_lat, courier.current_lng)
+    )
+    ordered_points = sorted(
+        route.delivery_points,
+        key=lambda point: (
+            point.sequence_index is None,
+            point.sequence_index if point.sequence_index is not None else 0,
+        ),
+    )
+    courier_json: dict[str, object] = {
+        "currentLat": courier.current_lat if fresh else None,
+        "currentLng": courier.current_lng if fresh else None,
+    }
+    if dispatcher:
+        courier_json.update(
+            {
+                "id": str(courier.id),
+                "name": courier.name,
+                "phone": courier.phone,
+                "status": courier.status.value,
+                "lastLocationAt": _date_json(courier.last_location_at),
+            }
+        )
+    route_data: dict[str, object] = {
+        "id": str(route.id),
+        "status": route.status.value,
+        "estimatedDurationMinutes": route.estimated_duration_minutes,
+        "estimatedDistanceMeters": route.estimated_distance_meters,
+        "baselineDurationMinutes": route.baseline_duration_minutes,
+        "baselineDistanceMeters": route.baseline_distance_meters,
+        "geometry": route.geometry,
+        "geometryProvider": route.geometry_provider.value if route.geometry_provider else None,
+        "startedAt": _date_json(route.started_at),
+        "completedAt": _date_json(route.completed_at),
+        "optimizedAt": _date_json(route.optimized_at or route.created_at),
+        "createdAt": _date_json(route.created_at),
+        "updatedAt": _date_json(route.updated_at),
+        "courier": courier_json,
+        "deliveryPoints": [_point_json(point, dispatcher=dispatcher) for point in ordered_points],
+        # Cómo se optimizó (escalera, tráfico TomTom, IA); null si el proceso se reinició.
+        "optimization": get_route_optimization(route.id),
+    }
+    if dispatcher:
+        route_data["courierId"] = str(route.courier_id)
+        route_data["canUndo"] = can_undo
+    return route_data
+
+
+def _point_json(point: DeliveryPoint, *, dispatcher: bool) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "id": str(point.id),
+        "address": point.address,
