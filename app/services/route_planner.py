@@ -1253,3 +1253,86 @@ def _read_route_revision_snapshot(value: object) -> _RouteRevisionSnapshot:
     try:
         provider = RouteGeometryProvider(raw_provider) if raw_provider is not None else None
     except ValueError as error:
+        raise RouteConflictError("El historial contiene un proveedor vial inválido.") from error
+    geometry = value.get("geometry")
+    if geometry is not None and (
+        not isinstance(geometry, dict)
+        or geometry.get("type") != "LineString"
+        or not isinstance(geometry.get("coordinates"), list)
+    ):
+        raise RouteConflictError("El historial no contiene una geometría vial restaurable.")
+
+    return _RouteRevisionSnapshot(
+        estimated_duration_minutes=estimated_duration,
+        estimated_distance_meters=estimated_distance,
+        baseline_duration_minutes=baseline_duration,
+        baseline_distance_meters=baseline_distance,
+        geometry=geometry,
+        geometry_provider=provider,
+        active_stops=tuple(active_stops),
+    )
+
+
+def _snapshot_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _snapshot_optional_number(value: object) -> float | None:
+    return None if value is None else _snapshot_number(value)
+
+
+def _validate_transition(current: RouteStatus, target: RouteStatus) -> None:
+    allowed: dict[RouteStatus, set[RouteStatus]] = {
+        RouteStatus.PLANNED: {RouteStatus.IN_PROGRESS, RouteStatus.CANCELLED},
+        RouteStatus.IN_PROGRESS: {RouteStatus.COMPLETED, RouteStatus.CANCELLED},
+        RouteStatus.COMPLETED: set(),
+        RouteStatus.CANCELLED: set(),
+    }
+    if current != target and target not in allowed[current]:
+        raise RouteConflictError(f"No se puede cambiar una ruta {current} a {target}.")
+
+
+async def _verified_ai_order(
+    advisor: RouteOrderAdvisor | None,
+    matrix: Sequence[Sequence[float | None]],
+    current_route: list[int],
+    has_road_times: bool,
+) -> dict[str, object]:
+    """Pide un orden a la IA y solo lo acepta si Dijkstra confirma que baja el costo."""
+    result: dict[str, object] = {"source": "deterministic", "proposed": False, "accepted": False}
+    if advisor is None:
+        result["reason"] = "IA de orden no configurada."
+        return result
+    if not has_road_times or not 2 < len(matrix) <= MAX_AI_ORDER_STOPS:
+        result["reason"] = "La IA de orden se usa con tiempos viales y entre 2 y 24 paradas."
+        return result
+    try:
+        suggested = await advisor.suggest_order(matrix, current_route)
+    except Exception as error:
+        _LOGGER.warning(
+            "La IA de orden no respondió de forma utilizable",
+            extra={"error_type": type(error).__name__},
+        )
+        result["reason"] = "La IA de orden no respondió; se conserva el orden del algoritmo."
+        return result
+    verification = verify_candidate_order(matrix, current_route, suggested)
+    direct_better = _route_cost(matrix, suggested) < _route_cost(matrix, current_route)
+    accepted = verification.accepted and direct_better
+    result.update({
+        "source": "external-ai",
+        "proposed": suggested != current_route,
+        "accepted": accepted,
+        "savingMinutes": round(verification.saving_minutes, 1) if accepted else 0.0,
+        "reason": verification.reason if accepted or not verification.accepted
+        else "no mejora el costo directo",
+        "verifiedWith": "dijkstra",
+    })
+    if accepted:
+        result["route"] = suggested
+    return result
+
+
+def _route_cost(matrix: Sequence[Sequence[float | None]], route: Sequence[int]) -> float:
