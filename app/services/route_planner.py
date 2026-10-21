@@ -1087,3 +1087,86 @@ async def update_route_status(
         now = datetime.now(UTC).replace(tzinfo=None)
         recorder = DeliveryEventRecorder(session)
         if next_status == RouteStatus.CANCELLED:
+            recorder.released(
+                [p for p in route.delivery_points if p.status in _ACTIVE_POINT_STATUSES],
+                actor,
+                "route cancelled",
+            )
+            await repository.release_active_delivery_points(
+                route_id,
+                _ACTIVE_POINT_STATUSES,
+                reset_to_pending=True,
+            )
+        elif next_status == RouteStatus.IN_PROGRESS:
+            recorder.started(
+                [p for p in route.delivery_points if p.status == DeliveryPointStatus.PENDING],
+                actor,
+            )
+            await repository.mark_pending_delivery_points_en_route(route_id)
+            if route.started_at is None:
+                route.started_at = now
+
+        route.status = next_status
+        if next_status in {RouteStatus.COMPLETED, RouteStatus.CANCELLED}:
+            route.completed_at = route.completed_at or now
+            await repository.delete_route_revisions(route_id)
+            courier = await repository.get_courier(route.courier_id, for_update=True)
+            if courier is not None:
+                courier.status = CourierStatus.AVAILABLE
+        elif next_status == RouteStatus.IN_PROGRESS:
+            courier = await repository.get_courier(route.courier_id, for_update=True)
+            if courier is not None:
+                courier.status = CourierStatus.ON_ROUTE
+        await session.flush()
+        updated = await repository.load_route(route_id)
+        if updated is None:
+            raise RuntimeError("La ruta actualizada no pudo volver a consultarse.")
+    return updated
+
+
+async def _assign_delivery_points(
+    session: AsyncSession,
+    route_id: UUID,
+    ordered_ids: Sequence[UUID],
+    *,
+    expected_coordinates: Mapping[UUID, Coordinate],
+    allowed_statuses: Sequence[DeliveryPointStatus],
+    sequence_start: int = 0,
+) -> None:
+    repository = RouteRepository(session)
+    for sequence_index, point_id in enumerate(ordered_ids, start=sequence_start):
+        expected_coordinate = expected_coordinates.get(point_id)
+        if expected_coordinate is None:
+            raise RoutePlanningError(
+                f"El plan no contiene las coordenadas originales del punto {point_id}."
+            )
+        longitude, latitude = expected_coordinate
+        assigned = await repository.try_assign_delivery_point(
+            route_id=route_id,
+            point_id=point_id,
+            allowed_statuses=allowed_statuses,
+            expected_latitude=latitude,
+            expected_longitude=longitude,
+            sequence_index=sequence_index,
+        )
+        if not assigned:
+            raise RouteConflictError(
+                f"El delivery point {point_id} cambió mientras se guardaba o calculaba la ruta."
+            )
+
+
+def _validate_courier_position(
+    courier: Courier,
+    plan: OptimizedRoutePlan,
+    now: datetime,
+) -> None:
+    current_location = (
+        (courier.current_lng, courier.current_lat)
+        if courier.current_lng is not None and courier.current_lat is not None
+        else None
+    )
+    if current_location != plan.planned_courier_location:
+        raise RouteConflictError(
+            "La ubicación del repartidor cambió mientras se calculaba la ruta."
+        )
+    if not is_courier_location_fresh(courier.last_location_at, now):
