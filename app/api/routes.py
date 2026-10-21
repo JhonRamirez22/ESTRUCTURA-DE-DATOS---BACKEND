@@ -746,3 +746,86 @@ async def get_route_traffic_profile(
 ) -> JSONResponse:
     authorized = _authorize_route_id(route_id, claims)
     if isinstance(authorized, JSONResponse):
+        return authorized
+    route_uuid, _dispatcher = authorized
+    try:
+        repository = RouteRepository(session)
+        route = await repository.get_route_record(route_uuid)
+        if route is None:
+            return _error("La ruta no existe.", 404)
+        if (
+            claims is not None
+            and claims["role"] == "courier"
+            and route.courier_id != _claim_courier_id(claims)
+        ):
+            return _error("La ruta no existe.", 404)
+        if route.started_at is None:
+            return _error(
+                "La ruta no tiene un inicio registrado; no se puede aislar su historial GPS.",
+                409,
+            )
+        geometry = _read_route_geometry(route.geometry)
+        if geometry is None:
+            return _error(
+                "La ruta no tiene geometría vial para construir segmentos.",
+                409,
+            )
+        segments = derive_road_segments(geometry, route.estimated_duration_minutes)
+        route_end = route.completed_at or datetime.now(UTC).replace(tzinfo=None)
+        event_rows = await repository.list_location_events(
+            courier_id=route.courier_id,
+            start_at=route.started_at,
+            end_at=route_end,
+        )
+        samples = match_location_events_to_segments(
+            [LocationEventPoint((event.lng, event.lat), event.recorded_at) for event in event_rows],
+            segments,
+        )
+        factors = calculate_congestion_factors(samples)
+        return _json(
+            {
+                "factors": [{"factor": factor, "key": key} for key, factor in factors.items()],
+                "routeId": str(route_uuid),
+                "eventCount": len(event_rows),
+                "sampleCount": len(samples),
+                "segmentCount": len(segments),
+                "warning": (
+                    "El perfil solo usa GPS de esta ruta; generalizarlo a toda la ciudad "
+                    "requiere un catálogo vial persistido."
+                ),
+            },
+            headers=_NO_STORE,
+        )
+    except (ValueError, SQLAlchemyError) as error:
+        if isinstance(error, SQLAlchemyError):
+            _log_database_error("No se pudo leer el perfil de tráfico", error)
+            return _error("No se pudo calcular el perfil histórico de tráfico.", 500)
+        _LOGGER.warning(
+            "La geometría de ruta no cumple el contrato de tráfico",
+            extra={"error_type": type(error).__name__},
+        )
+        return _error("No se pudo calcular el perfil histórico de tráfico.", 409)
+
+
+@router.get("/{route_id}/trafico-vivo")
+async def get_route_live_traffic(
+    route_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+    traffic: Annotated[TrafficService | None, Depends(get_traffic_service)],
+) -> JSONResponse:
+    """Devuelve muestras TomTom recientes solo sobre la geometría vial de la ruta."""
+    authorized = _authorize_route_id(route_id, claims)
+    if isinstance(authorized, JSONResponse):
+        return authorized
+    route_uuid, _dispatcher = authorized
+    try:
+        route = await RouteRepository(session).load_route(route_uuid)
+        if route is None:
+            return _error("La ruta no existe.", 404)
+        if (
+            claims is not None
+            and claims["role"] == "courier"
+            and route.courier_id != _claim_courier_id(claims)
+        ):
+            return _error("La ruta no existe.", 404)
