@@ -921,3 +921,86 @@ async def recalculate_route(
             point for point in all_route_points if point.status in _ACTIVE_POINT_STATUSES
         ]
         currently_active_ids = {point.id for point in active_points}
+        if currently_active_ids != set(previous_active_ids):
+            raise RouteConflictError("Un pedido cambió mientras se recalculaba la ruta.")
+        snapshot = _build_route_revision_snapshot(route, active_points)
+        repository.add_route_revision(
+            RouteRevision(
+                route_id=route_id,
+                revision_number=await repository.next_route_revision_number(route_id),
+                snapshot=snapshot,
+            )
+        )
+        await session.flush()
+        await repository.prune_route_revisions(route_id, MAX_ROUTE_REVISIONS)
+        next_sequence_index = max(
+            (
+                point.sequence_index
+                for point in all_route_points
+                if point.status in _TERMINAL_POINT_STATUSES
+                and point.sequence_index is not None
+            ),
+            default=-1,
+        ) + 1
+
+        # Las paradas terminales conservan su vínculo e índice como historial de la ruta.
+        await repository.release_active_delivery_points(
+            route_id,
+            _ACTIVE_POINT_STATUSES,
+            reset_to_pending=False,
+        )
+        await _assign_delivery_points(
+            session,
+            route_id,
+            plan.ordered_delivery_point_ids,
+            expected_coordinates=dict(plan.planned_delivery_point_coordinates),
+            allowed_statuses=_ACTIVE_POINT_STATUSES,
+            sequence_start=next_sequence_index,
+        )
+        optimized_at = datetime.now(UTC).replace(tzinfo=None)
+        route.estimated_duration_minutes = plan.estimated_duration_minutes
+        route.estimated_distance_meters = plan.estimated_distance_meters
+        route.baseline_duration_minutes = plan.baseline_duration_minutes
+        route.baseline_distance_meters = plan.baseline_distance_meters
+        route.geometry = plan.geometry
+        route.geometry_provider = plan.geometry_provider
+        route.updated_at = optimized_at
+        route.optimized_at = optimized_at
+        notification_repository.add(
+            Notification(
+                kind=NotificationKind.ROUTE_RECALCULATED,
+                recipient_id=str(route.courier_id),
+                title="Ruta recalculada",
+                message=(
+                    f"La ruta ahora tiene {len(plan.ordered_delivery_point_ids)} paradas activas."
+                ),
+            )
+        )
+        await session.flush()
+        updated = await repository.load_route(route_id)
+        if updated is None:
+            raise RuntimeError("La ruta recalculada no pudo volver a consultarse.")
+        ROUTE_OPTIMIZATIONS.put(updated.id, plan.optimization)
+        await _persist_traffic_history(session, updated.id, plan.live_traffic)
+        result = RouteOperationResult(
+            updated,
+            plan.ordered_delivery_point_ids,
+            plan.matrix_source,
+            plan.warning,
+            plan.traffic_ai,
+            live_traffic=plan.live_traffic,
+        )
+    return result
+
+
+async def undo_route_recalculation(
+    session: AsyncSession,
+    route_id: UUID,
+) -> RouteUndoResult:
+    """Restaura el snapshot persistido más reciente de una ruta activa, en orden LIFO."""
+    await session.rollback()
+    async with session.begin():
+        repository = RouteRepository(session)
+        route = await repository.lock_route_with_delivery_points(route_id)
+        if route is None:
+            raise RoutePlanningError("La ruta no existe.", 404)
