@@ -754,3 +754,87 @@ async def _persist_traffic_history(
                 hour_of_day=_bogota_hour(observed),
                 observed_at=observed,
             )
+        )
+    if not rows:
+        return
+    try:
+        # Punto de guardado: un fallo del historial no debe deshacer la ruta recién creada.
+        async with session.begin_nested():
+            session.add_all(rows)
+    except SQLAlchemyError as error:
+        _LOGGER.warning(
+            "No se pudo guardar el historial de tráfico; la ruta se conserva",
+            extra={"error_type": type(error).__name__},
+        )
+
+
+def _leg_minutes(value: float | None) -> float | None:
+    if value is None or not math.isfinite(value):
+        return None
+    return round(value, 1)
+
+
+def _traffic_level(multiplier: float | None, closed: bool) -> str:
+    """Misma escala que el mapa: de fluido a cerrado según cuánto se alarga el tramo."""
+    if closed:
+        return "CERRADO"
+    if multiplier is None or not math.isfinite(multiplier) or multiplier < 1.15:
+        return "FLUIDO"
+    if multiplier < 1.5:
+        return "MODERADO"
+    if multiplier < 2.0:
+        return "ALTO"
+    return "MUY_ALTO"
+
+
+async def create_optimized_route(
+    session: AsyncSession,
+    plan: OptimizedRoutePlan,
+    actor: EventActor = SYSTEM_ACTOR,
+) -> RouteOperationResult:
+    results = await create_optimized_routes_batch(session, [plan], actor)
+    return results[0]
+
+
+async def create_optimized_routes_batch(
+    session: AsyncSession,
+    plans: Sequence[OptimizedRoutePlan],
+    actor: EventActor = SYSTEM_ACTOR,
+) -> list[RouteOperationResult]:
+    if not plans:
+        raise RoutePlanningError("Se requiere al menos una asignación para aplicar.", 400)
+    courier_ids = [plan.courier_id for plan in plans]
+    if len(set(courier_ids)) != len(courier_ids):
+        raise RouteConflictError("Cada courier solo puede aparecer una vez en assignments.")
+
+    # Preflight SELECTs used an implicit read transaction; restart before locking/persisting.
+    await session.rollback()
+    results: list[RouteOperationResult] = []
+    async with session.begin():
+        repository = RouteRepository(session)
+        notification_repository = NotificationRepository(session)
+        couriers_by_id = await repository.lock_couriers(courier_ids)
+        if len(couriers_by_id) != len(courier_ids):
+            raise RoutePlanningError("Un courier solicitado ya no existe.", 404)
+        if any(
+            couriers_by_id[courier_id].status != CourierStatus.AVAILABLE
+            for courier_id in courier_ids
+        ):
+            raise RouteConflictError("Un courier ya no está AVAILABLE.")
+        planned_at = datetime.now(UTC).replace(tzinfo=None)
+        for plan in plans:
+            _validate_courier_position(couriers_by_id[plan.courier_id], plan, planned_at)
+        if await repository.has_active_route(courier_ids, _ACTIVE_ROUTE_STATUSES):
+            raise RouteConflictError("Un courier ya tiene una ruta planificada o en progreso.")
+
+        for plan in plans:
+            route = Route(
+                courier_id=plan.courier_id,
+                status=RouteStatus.PLANNED,
+                estimated_duration_minutes=plan.estimated_duration_minutes,
+                estimated_distance_meters=plan.estimated_distance_meters,
+                baseline_duration_minutes=plan.baseline_duration_minutes,
+                baseline_distance_meters=plan.baseline_distance_meters,
+                geometry=plan.geometry,
+                geometry_provider=plan.geometry_provider,
+                optimized_at=planned_at,
