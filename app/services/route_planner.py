@@ -1419,3 +1419,86 @@ async def _apply_live_traffic_to_route(
             _LOGGER.warning(
                 "TomTom Traffic falló para un tramo; se mantiene el costo vial base",
                 extra={"error_type": type(response).__name__},
+            )
+            continue
+
+        sampled_count += 1
+        if response.cache_status == "STALE":
+            stale_count += 1
+        observation: dict[str, object] = {
+            "fromStopId": f"stop-{start}", "toStopId": f"stop-{end}",
+            "trafficMultiplier": response.travel_time_multiplier,
+            "confidence": response.confidence, "roadClosure": response.road_closure,
+            "observedAt": response.timestamp.isoformat(), "cacheStatus": response.cache_status,
+            # Punto medido sobre la calle ([lng, lat]) y nivel para dibujarlo en el mapa.
+            "point": list(samples[leg_index]),
+            "level": _traffic_level(response.travel_time_multiplier, response.road_closure),
+        }
+        if response.road_closure:
+            observations.append(observation)
+            adjusted_matrix[start][end] = None
+            closed_count += 1
+            continue
+        if response.confidence < MIN_TOMTOM_CONFIDENCE:
+            low_confidence_count += 1
+            continue
+        multiplier = response.travel_time_multiplier
+        if base_cost is None or multiplier is None or not math.isfinite(multiplier):
+            low_confidence_count += 1
+            continue
+        adjusted_matrix[start][end] = base_cost * multiplier
+        observations.append(observation)
+        adjusted_count += 1
+
+    route_segment_count = len(legs)
+    applied_count = adjusted_count + closed_count
+    warning_parts: list[str] = []
+    if applied_count:
+        warning_parts.append(
+            "Estimación de tráfico TomTom parcial: se ajustaron "
+            f"{adjusted_count} tramos y se marcaron {closed_count} cerrados."
+        )
+    else:
+        warning_parts.append(
+            "TomTom no entregó factores utilizables; se conservaron los tiempos viales de base."
+        )
+    if len(prioritized_legs) < route_segment_count:
+        warning_parts.append(
+            f"Se consultaron como máximo {MAX_TOMTOM_ROUTE_SAMPLES} de "
+            f"{route_segment_count} tramos para controlar latencia y cuota."
+        )
+    if error_count:
+        warning_parts.append(f"{error_count} consultas fallaron y conservaron costo base.")
+    if low_confidence_count:
+        warning_parts.append(
+            f"Se omitieron {low_confidence_count} respuestas sin confianza suficiente."
+        )
+    if stale_count:
+        warning_parts.append(f"{stale_count} tramos usaron datos recientes en caché.")
+
+    base_summary.update(
+        {
+            "applied": applied_count > 0,
+            "sampledSegments": sampled_count,
+            "adjustedSegments": adjusted_count,
+            "closedSegments": closed_count,
+            "staleSegments": stale_count,
+            "lowConfidenceSegments": low_confidence_count,
+            "errorSegments": error_count,
+            "coverageRatio": sampled_count / route_segment_count if route_segment_count else 0,
+            "warning": " ".join(warning_parts),
+            "observations": observations,
+        }
+    )
+    return adjusted_matrix, base_summary
+
+
+def _validate_matrix_shape(matrix: Sequence[Sequence[float | None]], expected: int) -> None:
+    if len(matrix) != expected or any(len(row) != expected for row in matrix):
+        raise RoutePlanningError("El proveedor devolvió una matriz de tiempos inválida.", 502)
+
+
+def _as_naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
