@@ -33,3 +33,38 @@ def upgrade() -> None:
         op.add_column(_POINTS, sa.Column("scheduled_for", sa.DateTime(), nullable=True))
     if _SCHEDULE_INDEX not in {ix["name"] for ix in inspector.get_indexes(_POINTS)}:
         op.create_index(_SCHEDULE_INDEX, _POINTS, ["scheduled_for"])
+    if _EVENTS not in inspector.get_table_names():
+        op.create_table(
+            _EVENTS,
+            sa.Column("id", sa.Uuid(), primary_key=True),
+            sa.Column(
+                "delivery_point_id", sa.Uuid(),
+                sa.ForeignKey(f"{_POINTS}.id", ondelete="SET NULL", onupdate="CASCADE"),
+            ),
+            sa.Column("order_ref", sa.Text(), nullable=False),
+            sa.Column("event_type", sa.String(24), nullable=False),
+            sa.Column("from_status", sa.String(16)),
+            sa.Column("to_status", sa.String(16)),
+            sa.Column("route_id", sa.Uuid()),
+            sa.Column("courier_id", sa.Uuid()),
+            sa.Column("actor_role", sa.String(16), nullable=False),
+            sa.Column("actor_account_id", sa.Uuid()),
+            sa.Column("detail", sa.String(200)),
+            sa.Column("occurred_at", sa.DateTime(), nullable=False),
+        )
+        op.create_index(
+            "delivery_events_point_time_idx", _EVENTS, ["delivery_point_id", "occurred_at"]
+        )
+        op.create_index("delivery_events_time_idx", _EVENTS, ["occurred_at"])
+
+
+def downgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    if _EVENTS in inspector.get_table_names():
+        op.drop_table(_EVENTS)
+    if _SCHEDULE_INDEX in {ix["name"] for ix in inspector.get_indexes(_POINTS)}:
+        op.drop_index(_SCHEDULE_INDEX, table_name=_POINTS)
+    columns = {col["name"] for col in inspector.get_columns(_POINTS)}
+    for name in ("scheduled_for", "delivered_at", "created_at"):
+        if name in columns:
+            op.drop_column(_POINTS, name)
