@@ -61,3 +61,65 @@ def _find_missing_constraints_and_indexes(inspector: Inspector) -> list[str]:
         table_name = table.name
         actual_primary_key = tuple(
             inspector.get_pk_constraint(table_name).get("constrained_columns") or ()
+        )
+        expected_primary_key = tuple(column.name for column in table.primary_key.columns)
+        if actual_primary_key != expected_primary_key:
+            missing.append(f"{table_name}.primary_key")
+
+        actual_unique = actual_unique_signatures(inspector, table_name)
+        for constraint in table.constraints:
+            if not isinstance(constraint, UniqueConstraint):
+                continue
+            expected = (constraint.name, tuple(column.name for column in constraint.columns))
+            if expected not in actual_unique:
+                missing.append(f"{table_name}.unique:{constraint.name or expected[1]}")
+
+        actual_foreign_keys = {
+            (
+                tuple(foreign_key.get("constrained_columns") or ()),
+                foreign_key.get("referred_table"),
+                tuple(foreign_key.get("referred_columns") or ()),
+                _normalize_action(foreign_key.get("options", {}).get("ondelete")),
+                _normalize_action(foreign_key.get("options", {}).get("onupdate")),
+            )
+            for foreign_key in inspector.get_foreign_keys(table_name)
+        }
+        for constraint in table.constraints:
+            if not isinstance(constraint, ForeignKeyConstraint):
+                continue
+            elements = tuple(constraint.elements)
+            expected_foreign_key = (
+                tuple(element.parent.name for element in elements),
+                elements[0].column.table.name,
+                tuple(element.column.name for element in elements),
+                _normalize_action(constraint.ondelete),
+                _normalize_action(constraint.onupdate),
+            )
+            if expected_foreign_key not in actual_foreign_keys:
+                missing.append(
+                    f"{table_name}.foreign_key:{','.join(expected_foreign_key[0])}"
+                )
+
+        actual_indexes = {
+            (
+                index.get("name"),
+                tuple(index.get("column_names") or ()),
+                bool(index.get("unique")),
+            )
+            for index in inspector.get_indexes(table_name)
+        }
+        for index in table.indexes:
+            if not isinstance(index, Index):
+                continue
+            expected_index = (
+                index.name,
+                tuple(column.name for column in index.columns),
+                bool(index.unique),
+            )
+            if expected_index not in actual_indexes:
+                missing.append(f"{table_name}.index:{index.name}")
+    return missing
+
+
+def _normalize_action(value: str | None) -> str | None:
+    return value.upper() if value is not None else None
