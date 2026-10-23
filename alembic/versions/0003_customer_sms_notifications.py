@@ -26,3 +26,31 @@ def upgrade() -> None:
                 "sms_notifications_enabled",
                 Boolean,
                 nullable=False,
+                server_default=text("false"),
+            ),
+        )
+
+    outbox_columns = {
+        column["name"] for column in inspect(bind).get_columns("customer_notification_outbox")
+    }
+    channel_type = ENUM(
+        "EMAIL",
+        "SMS",
+        name="customer_notification_channel",
+        create_type=False,
+    )
+    if bind.dialect.name == "postgresql":
+        channel_type.create(bind, checkfirst=True)
+    if "channel" not in outbox_columns:
+        op.add_column(
+            "customer_notification_outbox",
+            Column("channel", channel_type, nullable=False, server_default="EMAIL"),
+        )
+    if "recipient_phone" not in outbox_columns:
+        op.add_column(
+            "customer_notification_outbox",
+            Column("recipient_phone", String(20), nullable=True),
+        )
+def downgrade() -> None:
+    # Evita borrar destinatarios y consentimientos sin un proceso explícito de retención.
+    pass
