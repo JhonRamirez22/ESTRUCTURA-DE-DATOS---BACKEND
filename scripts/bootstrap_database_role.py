@@ -56,3 +56,61 @@ async def bootstrap_database_role(settings: Settings) -> None:
 
         grant_database = await connection.fetchval(
             "SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', $1, $2)",
+            database,
+            app_username,
+        )
+        grant_schema = await connection.fetchval(
+            "SELECT format('GRANT USAGE, CREATE ON SCHEMA public TO %I', $1)", app_username
+        )
+        if not isinstance(grant_database, str) or not isinstance(grant_schema, str):
+            raise RuntimeError("No se pudieron preparar los permisos de la aplicación")
+        await connection.execute(grant_database)
+        await connection.execute(grant_schema)
+    finally:
+        await connection.close()
+
+    _LOGGER.info("Se verificó el rol PostgreSQL de la aplicación y sus permisos mínimos.")
+
+
+def _required(value: str | None, name: str) -> str:
+    normalized = value.strip() if value is not None else ""
+    if not normalized:
+        raise ValueError(f"{name} debe configurarse para inicializar el rol de PostgreSQL")
+    return normalized
+
+
+def _required_secret(value: SecretStr | None, name: str) -> str:
+    if value is None:
+        raise ValueError(f"{name} debe configurarse para inicializar el rol de PostgreSQL")
+    secret = value.get_secret_value().strip()
+    if not secret:
+        raise ValueError(f"{name} debe configurarse para inicializar el rol de PostgreSQL")
+    return secret
+
+
+def _validate_identifier(value: str, name: str) -> None:
+    if not _ROLE_PATTERN.fullmatch(value):
+        raise ValueError(f"{name} debe usar solo letras, números y guion bajo")
+
+
+def _ssl_argument(settings: Settings) -> bool | str | ssl.SSLContext:
+    mode = settings.database_ssl_mode
+    if mode == "disable":
+        return False
+    if mode == "require":
+        return "require"
+    if not settings.database_ssl_root_cert:
+        raise ValueError("DATABASE_SSL_ROOT_CERT es requerido al verificar el certificado de RDS")
+
+    context = ssl.create_default_context(cafile=settings.database_ssl_root_cert)
+    context.check_hostname = mode == "verify-full"
+    return context
+
+
+async def _main() -> None:
+    await bootstrap_database_role(get_settings())
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    asyncio.run(_main())
