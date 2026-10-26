@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
@@ -25,8 +25,33 @@ from app.services.route_planner import get_route_optimization
 router = APIRouter(prefix="/inteligencia", tags=["inteligencia"])
 _NO_STORE = {"Cache-Control": "no-store, private, max-age=0"}
 # Respuestas de la IA por conjunto de pendientes o ruta: evita repetir llamadas a Groq.
-_GROUP_CACHE: LruCache[tuple[str, ...], dict[str, object]] = LruCache(64)
-_EXPLAIN_CACHE: LruCache[str, dict[str, object]] = LruCache(128)
+_GROUP_CACHE: LruCache[tuple[str, ...], dict[str, Any]] = LruCache(64)
+_EXPLAIN_CACHE: LruCache[str, dict[str, Any]] = LruCache(128)
+
+
+async def cached_groups(
+    key: tuple[str, ...], locations: list[PendingLocation]
+) -> dict[str, Any]:
+    """Grupos con caché, pero solo si la IA respondió: un fallo pasajero no se recuerda."""
+    cached = _GROUP_CACHE.get(key)
+    if cached is not None:
+        return {**cached, "cached": True}
+    result = await suggest_groups(locations)
+    ai = result["ai"]
+    if isinstance(ai, dict) and ai.get("proposed"):
+        _GROUP_CACHE.put(key, result)
+    return {**result, "cached": False}
+
+
+async def cached_explanation(key: str, summary: dict[str, Any]) -> dict[str, Any]:
+    """Explicación con caché solo si es texto de Groq validado, no el de respaldo."""
+    cached = _EXPLAIN_CACHE.get(key)
+    if cached is not None:
+        return {**cached, "cached": True}
+    result = await explain_route(summary)
+    if result.get("source") == "groq-validated":
+        _EXPLAIN_CACHE.put(key, result)
+    return {**result, "cached": False}
 
 
 @router.get("/agrupaciones")
@@ -43,11 +68,7 @@ async def suggest_order_groups(
         for index, point in enumerate(pending)
     ]
     cache_key = tuple(sorted(f"{loc.ident}:{loc.lat:.5f}:{loc.lng:.5f}" for loc in locations))
-    cached = _GROUP_CACHE.get(cache_key)
-    if cached is not None:
-        return JSONResponse({**cached, "cached": True}, headers=_NO_STORE)
-
-    result = await suggest_groups(locations)
+    result = await cached_groups(cache_key, locations)
     by_alias = {loc.alias: loc.ident for loc in locations}
     groups = [
         {
@@ -58,8 +79,7 @@ async def suggest_order_groups(
         }
         for group in result["groups"]
     ]
-    payload = {"groups": groups, "ai": result["ai"], "cached": False}
-    _GROUP_CACHE.put(cache_key, {"groups": groups, "ai": result["ai"]})
+    payload = {"groups": groups, "ai": result["ai"], "cached": result["cached"]}
     return JSONResponse(payload, headers=_NO_STORE)
 
 
@@ -78,9 +98,4 @@ async def explain_optimization(
             {"error": "Esta ruta aún no tiene resumen de optimización."}, status_code=404
         )
     key = f"{route_id}:{summary.get('computedAt')}"
-    cached = _EXPLAIN_CACHE.get(key)
-    if cached is not None:
-        return JSONResponse({**cached, "cached": True}, headers=_NO_STORE)
-    result = await explain_route(summary)
-    _EXPLAIN_CACHE.put(key, result)
-    return JSONResponse({**result, "cached": False}, headers=_NO_STORE)
+    return JSONResponse(await cached_explanation(key, dict(summary)), headers=_NO_STORE)

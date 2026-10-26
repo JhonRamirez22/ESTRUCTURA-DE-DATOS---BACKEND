@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import Protocol, cast
 from uuid import UUID
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ai.route_traffic import (
@@ -640,7 +641,17 @@ async def _persist_traffic_history(
                 observed_at=observed,
             )
         )
-    session.add_all(rows)
+    if not rows:
+        return
+    try:
+        # Punto de guardado: un fallo del historial no debe deshacer la ruta recién creada.
+        async with session.begin_nested():
+            session.add_all(rows)
+    except SQLAlchemyError as error:
+        _LOGGER.warning(
+            "No se pudo guardar el historial de tráfico; la ruta se conserva",
+            extra={"error_type": type(error).__name__},
+        )
 
 
 def _leg_minutes(value: float | None) -> float | None:

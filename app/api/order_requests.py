@@ -198,7 +198,8 @@ async def lookup_address(
         result = await resolve_address(data.address, geocoder, advisor)
     except AddressGeocoderError:
         return _error("La búsqueda no respondió; marca el punto en el mapa.", 503)
-    _LOOKUP_CACHE.put(cache_key, result)
+    if should_cache_lookup(result):
+        _LOOKUP_CACHE.put(cache_key, result)
     return JSONResponse({**result, "cached": False}, headers=_NO_STORE)
 
 
@@ -251,13 +252,25 @@ async def reject_order_request(
 NEARBY_STOP_RADIUS_M = 150.0
 
 
+def should_cache_lookup(result: dict[str, object]) -> bool:
+    """Solo se recuerdan búsquedas con candidatos: un vacío puede ser un fallo pasajero."""
+    return bool(result.get("candidates"))
+
+
 async def _nearby_stop_notice(
     repository: DeliveryPointRepository, lat: float, lng: float
 ) -> dict[str, object] | None:
     """Aviso discreto si la dirección queda cerca de una parada ya programada."""
     lat_delta = NEARBY_STOP_RADIUS_M / 111_000
     lng_delta = NEARBY_STOP_RADIUS_M / (111_000 * max(0.2, math.cos(math.radians(lat))))
-    points = await repository.active_points_near(lat, lng, lat_delta, lng_delta)
+    try:
+        points = await repository.active_points_near(lat, lng, lat_delta, lng_delta)
+    except SQLAlchemyError as error:
+        # El aviso es opcional: si la consulta falla, la solicitud se registra sin él.
+        _LOGGER.warning(
+            "No se pudo buscar paradas cercanas", extra={"error_type": type(error).__name__}
+        )
+        return None
     best: tuple[DeliveryPoint, float] | None = None
     for point in points:
         distance = haversine_m(lat, lng, point.lat, point.lng)

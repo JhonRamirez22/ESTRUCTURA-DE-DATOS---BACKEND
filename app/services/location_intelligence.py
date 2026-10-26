@@ -27,8 +27,12 @@ from app.settings import get_settings
 
 _LOGGER = logging.getLogger(__name__)
 MAX_GROUP_SIZE = 6
+# El agrupamiento compara todos los pares (O(n²)): se acota para no bloquear el servidor.
+MAX_GROUP_INPUT = 300
 GROUP_RADIUS_M = 400.0
 _NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
+# Nombres con dígitos que no son cifras de tiempo: «2-opt», «3-opt», alias p-0 / stop-3.
+_NOT_FIGURES = re.compile(r"\b(?:[23]-opt|(?:p|stop)-\d+)\b", re.IGNORECASE)
 _GROUP_PROMPT = (
     "Eres un planificador de reparto. Recibes grupos candidatos de paradas con alias p-N y "
     "distancias en metros. Devuelve solo JSON con la forma "
@@ -114,6 +118,7 @@ async def _chat_json(
 
 def build_groups(pending: Sequence[PendingLocation]) -> list[dict[str, Any]]:
     """Grupos candidatos deterministas, con distancias entre miembros en metros."""
+    pending = list(pending)[:MAX_GROUP_INPUT]
     located = [Located(point.alias, point.lat, point.lng) for point in pending]
     by_alias = {point.alias: point for point in pending}
     groups = cluster_by_radius(located, GROUP_RADIUS_M, MAX_GROUP_SIZE)
@@ -208,7 +213,10 @@ def _validate_group_proposal(
 
 def verify_explanation(text: str, summary_numbers: Sequence[float]) -> bool:
     """Cada cifra del texto debe coincidir con una cifra del resumen verificado."""
-    found = [float(match.replace(",", ".")) for match in _NUMBER.findall(text)]
+    found = [
+        float(match.replace(",", "."))
+        for match in _NUMBER.findall(_NOT_FIGURES.sub(" ", text))
+    ]
     if not found:
         return True
     tolerance = 0.06
@@ -225,6 +233,8 @@ def deterministic_explanation(summary: Mapping[str, Any]) -> str:
         return "El orden base ya era el mejor con los tiempos medidos; no hubo cambios."
     base = ladder.get("nearestNeighbor")
     final = ladder.get("aiOrder") or ladder.get("orOpt")
+    if base is None or final is None:
+        return f"La ruta optimizada ahorra {round(saved, 1)} min frente al orden base."
     return (
         f"El orden base tardaba {base} min y el final {final} min, "
         f"un ahorro de {round(saved, 1)} min con la misma matriz de tiempos."

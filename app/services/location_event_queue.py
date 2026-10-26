@@ -35,6 +35,7 @@ class LocationEventQueue:
         self._guard = asyncio.Lock()
         self._idle = asyncio.Event()
         self._idle.set()
+        self._drain_task: asyncio.Task[None] | None = None
 
     @property
     def pending_count(self) -> int:
@@ -55,7 +56,8 @@ class LocationEventQueue:
             self._jobs.enqueue(_Job(run=run_as_object, result=future))
             if not self._processing:
                 self._processing = True
-                loop.create_task(self._drain())
+                # Se conserva la referencia: el bucle solo guarda referencias débiles a las tareas.
+                self._drain_task = loop.create_task(self._drain())
         return cast(T, await future)
 
     async def wait_until_idle(self) -> None:
