@@ -50,3 +50,54 @@ async def _cleanup(
                 point_filters.append(DeliveryPoint.route_id.in_(route_ids))
             if delivery_point_ids:
                 point_filters.append(DeliveryPoint.id.in_(delivery_point_ids))
+            if order_ids:
+                point_filters.append(DeliveryPoint.order_id.in_(order_ids))
+
+            point_filter = or_(*point_filters)
+            related_order_ids = list(
+                (await session.scalars(select(DeliveryPoint.order_id).where(point_filter))).all()
+            )
+
+            notification_filters = [
+                Notification.message.contains(order_id) for order_id in related_order_ids
+            ]
+            if courier_ids:
+                notification_filters.append(
+                    Notification.recipient_id.in_([str(courier_id) for courier_id in courier_ids])
+                )
+            if notification_filters:
+                await session.execute(delete(Notification).where(or_(*notification_filters)))
+
+            await session.execute(delete(DeliveryPoint).where(point_filter))
+            if courier_ids:
+                await session.execute(delete(Account).where(Account.courier_id.in_(courier_ids)))
+                await session.execute(delete(Route).where(Route.courier_id.in_(courier_ids)))
+                await session.execute(
+                    delete(LocationEvent).where(LocationEvent.courier_id.in_(courier_ids))
+                )
+                await session.execute(
+                    delete(CourierCredential).where(CourierCredential.courier_id.in_(courier_ids))
+                )
+                await session.execute(delete(Courier).where(Courier.id.in_(courier_ids)))
+    finally:
+        await engine.dispose()
+
+
+async def main() -> int:
+    parsed = _parse_arguments()
+    try:
+        await _cleanup(
+            courier_ids=parsed.courier_id,
+            delivery_point_ids=parsed.delivery_point_id,
+            order_ids=parsed.order_id,
+        )
+    except Exception:
+        print("No se pudieron limpiar los datos de prueba e2e.", file=sys.stderr)
+        return 1
+
+    print("Limpieza e2e completa.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
