@@ -60,3 +60,65 @@ def simulated_traffic(now: datetime) -> list[TrafficObservation]:
         multiplier = PEAK_HOURS.get(hour, 1.05)
         level = "MUY_ALTO" if multiplier >= 2.0 else "ALTO" if multiplier >= 1.5 else "FLUIDO"
         observed = day + timedelta(hours=hour, minutes=5)
+        rows.append(
+            TrafficObservation(
+                id=uuid4(),
+                route_id=None,
+                from_stop=f"{PREFIX}zona-centro",
+                to_stop=f"{PREFIX}zona-lunas",
+                multiplier=multiplier,
+                level=level,
+                road_closure=False,
+                point_lng=-77.2777,
+                point_lat=1.2154,
+                hour_of_day=hour,
+                observed_at=observed,
+            )
+        )
+    return rows
+
+
+async def main(apply: bool) -> None:
+    orders = simulated_orders()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    traffic = simulated_traffic(now)
+    if not apply:
+        print(
+            f"Simulación: crearía {len(orders)} pedidos {PREFIX} en {len(ZONES)} zonas y "
+            f"{len(traffic)} mediciones de tráfico. Agrega --apply para escribir."
+        )
+        return
+    created = 0
+    async with get_session_factory()() as session:
+        existing = set(
+            await session.scalars(
+                select(DeliveryPoint.order_id).where(DeliveryPoint.order_id.like(f"{PREFIX}%"))
+            )
+        )
+        for row in orders:
+            if row["order_id"] in existing:
+                continue
+            session.add(
+                DeliveryPoint(
+                    id=uuid4(),
+                    address=str(row["address"]),
+                    lat=float(row["lat"]),  # type: ignore[arg-type]
+                    lng=float(row["lng"]),  # type: ignore[arg-type]
+                    status=DeliveryPointStatus.PENDING,
+                    order_id=str(row["order_id"]),
+                    tracking_token=str(uuid4()),
+                )
+            )
+            created += 1
+        if not await session.scalar(
+            select(TrafficObservation.id).where(TrafficObservation.from_stop.like(f"{PREFIX}%")).limit(1)
+        ):
+            session.add_all(traffic)
+        await session.commit()
+    print(f"Listo: {created} pedidos {PREFIX} creados; las mediciones ya existían o se añadieron.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--apply", action="store_true", help="escribe en la base de datos")
+    asyncio.run(main(parser.parse_args().apply))
