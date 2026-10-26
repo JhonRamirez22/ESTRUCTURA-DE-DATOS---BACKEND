@@ -327,3 +327,26 @@ class CustomerChatRateLimitWindow(Base):
     guide_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False)
     request_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class TrafficObservation(Base):
+    """Medición de TomTom por tramo y hora; sirve para detectar congestión repetida."""
+
+    __tablename__ = "traffic_observations"
+    __table_args__ = (
+        Index("traffic_observations_observed_hour_idx", "observed_at", "hour_of_day"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    route_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("routes.id", ondelete="SET NULL", onupdate="CASCADE")
+    )
+    from_stop: Mapped[str] = mapped_column(String(32), nullable=False)
+    to_stop: Mapped[str] = mapped_column(String(32), nullable=False)
+    multiplier: Mapped[float | None] = mapped_column(Float)
+    level: Mapped[str] = mapped_column(String(16), nullable=False)
+    road_closure: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    point_lng: Mapped[float] = mapped_column(Float, nullable=False)
+    point_lat: Mapped[float] = mapped_column(Float, nullable=False)
+    hour_of_day: Mapped[int] = mapped_column(Integer, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False)

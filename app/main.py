@@ -19,6 +19,7 @@ from app.api.couriers import router as couriers_router
 from app.api.customer_chat import router as customer_chat_router
 from app.api.geocoding import router as geocoding_router
 from app.api.health import router as health_router
+from app.api.intelligence import router as intelligence_router
 from app.api.notifications import router as notifications_router
 from app.api.optimizations import router as optimizations_router
 from app.api.order_requests import router as order_requests_router
@@ -93,7 +94,7 @@ for router in (
     health_router, auth_router, addresses_router, notifications_router, customer_chat_router,
     geocoding_router, analytics_router, couriers_router, orders_router,
     assignments_router, routes_router, tracking_router, traffic_router, traffic_tiles_router,
-    optimizations_router, order_requests_router,
+    optimizations_router, order_requests_router, intelligence_router,
 ):
     app.include_router(router, prefix="/api/v1")
     if get_settings().legacy_api_alias_enabled:

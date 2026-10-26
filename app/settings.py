@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     ai_traffic_timeout_ms: int = 5_000
     ai_allow_location_data_sharing: bool = False
     ai_allow_route_location_sharing: bool = False
+    # Guarda cada medición de TomTom por tramo y hora (tabla traffic_observations). Apagado.
+    traffic_history_enabled: bool = False
     customer_chat_api_url: str | None = "https://api.groq.com/openai/v1/chat/completions"
     customer_chat_api_key: SecretStr | None = None
     customer_chat_model: str | None = "openai/gpt-oss-20b"

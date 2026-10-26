@@ -102,6 +102,21 @@ class DeliveryPointRepository:
         )
         return result.scalar_one_or_none() == point_id
 
+    async def active_points_near(
+        self, lat: float, lng: float, lat_delta: float, lng_delta: float
+    ) -> list[DeliveryPoint]:
+        """Paradas pendientes o en ruta dentro de un recuadro; el llamador mide la distancia."""
+        result = await self._session.scalars(
+            select(DeliveryPoint).where(
+                DeliveryPoint.status.in_(
+                    [DeliveryPointStatus.PENDING, DeliveryPointStatus.EN_ROUTE]
+                ),
+                DeliveryPoint.lat.between(lat - lat_delta, lat + lat_delta),
+                DeliveryPoint.lng.between(lng - lng_delta, lng + lng_delta),
+            ).limit(MAX_LIST_ROWS)
+        )
+        return list(result.all())
+
     async def count_requested(self) -> int:
         """Solicitudes de clientes en espera; acota cuántas puede acumular la bandeja."""
         total = await self._session.scalar(

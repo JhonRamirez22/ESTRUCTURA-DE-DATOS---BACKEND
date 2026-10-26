@@ -11,6 +11,7 @@ from app.models.entities import (
     Notification,
     Route,
     RouteRevision,
+    TrafficObservation,
 )
 from app.models.enums import (
     CourierStatus,
@@ -26,6 +27,7 @@ from app.models.security import AccessSession, SecurityAuditEvent
 
 __all__ = [
     "Account",
+    "TrafficObservation",
     "AccessSession",
     "SecurityAuditEvent",
     "Courier",

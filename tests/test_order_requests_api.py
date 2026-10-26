@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -188,3 +188,32 @@ async def test_public_address_lookup_requires_origin_and_caches_results(
     finally:
         app.dependency_overrides.pop(get_address_geocoder, None)
         app.dependency_overrides.pop(get_address_ai_advisor, None)
+
+
+@pytest.mark.asyncio
+async def test_request_near_a_scheduled_stop_gets_a_private_notice(
+    client: httpx.AsyncClient,  # noqa: F811
+    session_factory: async_sessionmaker[AsyncSession],  # noqa: F811
+) -> None:
+    async with session_factory() as session:
+        session.add(
+            DeliveryPoint(
+                id=uuid4(), address="Calle 18 # 22-14", lat=1.2136, lng=-77.2811,
+                status=DeliveryPointStatus.PENDING, order_id="DEMO-1",
+                tracking_token=str(uuid4()),
+            )
+        )
+        await session.commit()
+    near = await client.post(
+        "/api/v1/solicitudes", headers=_ORIGIN,
+        json={"address": "Calle 18 # 22-20 Centro", "lat": 1.21365, "lng": -77.2811},
+    )
+    assert near.status_code == 201
+    notice = near.json()["nearbyStop"]
+    assert notice["status"] == "PENDING" and notice["distanceMeters"] < 150
+    assert "DEMO-1" not in near.text and "Calle 18" not in near.text
+    far = await client.post(
+        "/api/v1/solicitudes", headers={**_ORIGIN, "X-Forwarded-For": "198.51.100.44"},
+        json={"address": "Carrera 40 # 19-02 Anganoy", "lat": 1.2300, "lng": -77.2900},
+    )
+    assert far.json()["nearbyStop"] is None

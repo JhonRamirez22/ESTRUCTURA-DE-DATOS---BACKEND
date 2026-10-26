@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import secrets
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -27,6 +28,7 @@ from app.core.location.pasto_area import (
     is_within_pasto_service_area,
     normalize_pasto_address,
 )
+from app.core.location.proximity import haversine_m
 from app.core.structures.lru_cache import LruCache
 from app.db.session import get_session
 from app.models import DeliveryPoint, DeliveryPointStatus
@@ -106,6 +108,7 @@ async def create_order_request(
             )
 
     repository = DeliveryPointRepository(session)
+    nearby = await _nearby_stop_notice(repository, data.lat, data.lng)
     try:
         if await repository.count_requested() >= MAX_WAITING_REQUESTS:
             await session.commit()
@@ -138,6 +141,8 @@ async def create_order_request(
             "trackingGuide": point.tracking_token,
             "reference": point.order_id,
             "status": "REQUESTED",
+            # Solo distancia y estado: nunca datos de otros clientes.
+            "nearbyStop": nearby,
         },
         status_code=201,
         headers=_NO_STORE,
@@ -241,6 +246,34 @@ async def reject_order_request(
     if not rejected:
         return _error("La solicitud ya fue resuelta o no existe.", 409)
     return JSONResponse({"ok": True}, headers=_NO_STORE)
+
+
+NEARBY_STOP_RADIUS_M = 150.0
+
+
+async def _nearby_stop_notice(
+    repository: DeliveryPointRepository, lat: float, lng: float
+) -> dict[str, object] | None:
+    """Aviso discreto si la dirección queda cerca de una parada ya programada."""
+    lat_delta = NEARBY_STOP_RADIUS_M / 111_000
+    lng_delta = NEARBY_STOP_RADIUS_M / (111_000 * max(0.2, math.cos(math.radians(lat))))
+    points = await repository.active_points_near(lat, lng, lat_delta, lng_delta)
+    best: tuple[DeliveryPoint, float] | None = None
+    for point in points:
+        distance = haversine_m(lat, lng, point.lat, point.lng)
+        if distance < NEARBY_STOP_RADIUS_M and (best is None or distance < best[1]):
+            best = (point, distance)
+    if best is None:
+        return None
+    point, distance = best
+    return {
+        "distanceMeters": round(distance),
+        "status": point.status.value,
+        "message": (
+            "Hay una parada programada a menos de 150 m; "
+            "el despacho puede sumar esta entrega a esa ruta."
+        ),
+    }
 
 
 def _client_key(request: Request) -> str:

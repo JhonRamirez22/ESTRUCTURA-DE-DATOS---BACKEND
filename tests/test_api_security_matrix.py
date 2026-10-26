@@ -23,6 +23,8 @@ PUBLIC_OPERATIONS = {
     ("GET", "/api/v1/seguimiento"),
     ("POST", "/api/v1/solicitudes"),
     ("POST", "/api/v1/solicitudes/direccion"),
+    ("GET", "/api/v1/inteligencia/agrupaciones"),
+    ("POST", "/api/v1/inteligencia/rutas/{}/explicar"),
     ("POST", "/api/v1/cliente/chat"),
     ("GET", "/api/v1/cliente/chat/estado"),
 }

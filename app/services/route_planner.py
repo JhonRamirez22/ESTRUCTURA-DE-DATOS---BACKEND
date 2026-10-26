@@ -57,6 +57,7 @@ from app.models import (
     RouteGeometryProvider,
     RouteRevision,
     RouteStatus,
+    TrafficObservation,
 )
 from app.repositories.notification_repository import NotificationRepository
 from app.repositories.route_repository import RouteRepository
@@ -541,7 +542,29 @@ def _optimization_summary(
     baseline = _route_cost(matrix, baseline_route)
     final = _route_cost(matrix, final_route)
     observations = cast(list[dict[str, object]], live_traffic.get("observations", []))
+    legs = [
+        {
+            "fromStop": "courier" if start == 0 else str(delivery_point_ids[start - 1]),
+            "toStop": str(delivery_point_ids[end - 1]),
+            "minutes": _leg_minutes(matrix[start][end]),
+        }
+        for start, end in zip(final_route, final_route[1:], strict=False)
+    ]
+    alternatives = [
+        {
+            "step": name,
+            "minutes": minutes(value),
+            "deltaMinutes": minutes(value - final) if math.isfinite(value - final) else None,
+        }
+        for name, value in (
+            ("nearestNeighbor", baseline),
+            ("twoOpt", _route_cost(matrix, two_opt_route)),
+            ("orOpt", or_opt_duration),
+        )
+    ]
     return {
+        "legs": legs,
+        "alternatives": alternatives,
         "ladder": [
             {"step": "nearestNeighbor", "minutes": minutes(baseline)},
             {"step": "twoOpt", "minutes": minutes(_route_cost(matrix, two_opt_route))},
@@ -589,6 +612,41 @@ def _optimization_summary(
         },
         "computedAt": computed_at.replace(tzinfo=UTC).isoformat(),
     }
+
+
+async def _persist_traffic_history(
+    session: AsyncSession, route_id: UUID, live_traffic: Mapping[str, object]
+) -> None:
+    """Guarda mediciones por tramo y hora solo si el interruptor está encendido."""
+    if not get_settings().traffic_history_enabled:
+        return
+    rows: list[TrafficObservation] = []
+    for item in cast(list[dict[str, object]], live_traffic.get("observations", [])):
+        point = item.get("point")
+        if not isinstance(point, list) or len(point) != 2:
+            continue
+        observed = datetime.fromisoformat(str(item["observedAt"])).replace(tzinfo=None)
+        rows.append(
+            TrafficObservation(
+                route_id=route_id,
+                from_stop=str(item["fromStopId"]),
+                to_stop=str(item["toStopId"]),
+                multiplier=cast(float | None, item.get("trafficMultiplier")),
+                level=str(item.get("level") or "FLUIDO"),
+                road_closure=bool(item.get("roadClosure")),
+                point_lng=float(point[0]),
+                point_lat=float(point[1]),
+                hour_of_day=observed.hour,
+                observed_at=observed,
+            )
+        )
+    session.add_all(rows)
+
+
+def _leg_minutes(value: float | None) -> float | None:
+    if value is None or not math.isfinite(value):
+        return None
+    return round(value, 1)
 
 
 def _traffic_level(multiplier: float | None, closed: bool) -> str:
@@ -689,6 +747,7 @@ async def create_optimized_routes_batch(
             if saved_route is None:
                 raise RuntimeError("La ruta recién creada no pudo volver a consultarse.")
             ROUTE_OPTIMIZATIONS.put(saved_route.id, plan.optimization)
+            await _persist_traffic_history(session, saved_route.id, plan.live_traffic)
             results.append(
                 RouteOperationResult(
                     saved_route,
@@ -792,6 +851,7 @@ async def recalculate_route(
         if updated is None:
             raise RuntimeError("La ruta recalculada no pudo volver a consultarse.")
         ROUTE_OPTIMIZATIONS.put(updated.id, plan.optimization)
+        await _persist_traffic_history(session, updated.id, plan.live_traffic)
         result = RouteOperationResult(
             updated,
             plan.ordered_delivery_point_ids,

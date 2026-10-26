@@ -142,6 +142,7 @@ async def test_sqlalchemy_schema_persists_existing_entities_and_constraints() ->
         "notifications",
         "routes",
         "route_revisions",
+        "traffic_observations",
     }
     finally:
         await engine.dispose()
