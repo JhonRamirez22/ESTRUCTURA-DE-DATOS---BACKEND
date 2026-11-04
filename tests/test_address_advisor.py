@@ -51,3 +51,56 @@ async def test_http_advisor_posts_contract_to_mock_transport_without_real_networ
         )
     )
 
+    assert result.normalized_address == "Carrera 25 # 4 sur 65"
+    assert request_body["task"] == "address_normalization"
+    assert request_body["model"] == "test-model"
+    assert request_body["input"]["coordinates"] == {"lat": 1.2136, "lng": -77.2811}  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_openai_chat_protocol_validates_json_content() -> None:
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(_address_response())}}]},
+        )
+
+    advisor = HttpAddressAiAdvisor(
+        api_url="https://model.example/v1/chat/completions",
+        api_key=None,
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(respond),
+    )
+    result = await advisor.normalize_address(
+        AddressAiRequest(
+            raw_address="cra 25 num 4 sur 65",
+            coordinates={"lat": 1.2136, "lng": -77.2811},
+        )
+    )
+    assert result.city == "Pasto"
+
+
+@pytest.mark.asyncio
+async def test_http_errors_are_sanitized_and_address_normalizer_falls_back() -> None:
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, text="private provider diagnostics")
+
+    advisor = HttpAddressAiAdvisor(
+        api_url="https://model.example/v1/normalize",
+        api_key=None,
+        model=None,
+        timeout_ms=200,
+        transport=httpx.MockTransport(respond),
+    )
+    with pytest.raises(AddressAiError, match="límite") as raised:
+        await advisor.normalize_address(
+            AddressAiRequest(
+                raw_address="cra 25 num 4 sur 65",
+                coordinates={"lat": 1.2136, "lng": -77.2811},
+            )
+        )
+    assert "private provider diagnostics" not in str(raised.value)
+
+    result = await normalize_address(
+        "cra 25 num 4 sur 65", 1.2136, -77.2811, _FailingAdvisor()
