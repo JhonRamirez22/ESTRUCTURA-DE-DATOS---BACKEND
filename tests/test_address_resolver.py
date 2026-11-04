@@ -48,3 +48,52 @@ async def test_local_abbreviations_use_tomtom_without_ai(text: str) -> None:
 
     advisor = FakeAdvisor()
     result = await resolve_address(text, AddressGeocoder(
+        api_key="test-key", transport=httpx.MockTransport(respond),
+    ), advisor)
+    assert result["source"] == "tomtom"
+    assert result["candidates"][0]["precision"] == "address"
+    assert len(seen) == 1 and not advisor.calls
+    assert "Sur-65" in seen[0] or "sur-65" in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_incomplete_number_is_never_silently_exact() -> None:
+    geocoder = AddressGeocoder(api_key="test", transport=httpx.MockTransport(
+        lambda _: httpx.Response(200, json={"results": [candidate()]}),
+    ))
+    result = await resolve_address("carrera 25 num 3", geocoder, None)
+    assert result["candidates"][0]["precision"] == "approximate"
+    assert "confirma" in result["warning"]
+
+
+@pytest.mark.asyncio
+async def test_ai_interprets_after_miss_but_only_tomtom_supplies_coordinates() -> None:
+    calls = 0
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"results": [] if calls == 1 else [candidate()]})
+
+    advisor = FakeAdvisor()
+    result = await resolve_address("carera 25 num 4 sur 65", AddressGeocoder(
+        api_key="test", transport=httpx.MockTransport(respond),
+    ), advisor)
+    assert result["source"] == "ai+tomtom"
+    assert result["candidates"][0]["lat"] == 1.21
+    assert len(advisor.calls) == 1 and calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proposed", ["Carrera 99 # 4 Sur-65", "Carrera 25 # 4-65"])
+async def test_ai_cannot_invent_numbers_or_drop_sur(proposed: str) -> None:
+    calls: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"results": []})
+
+    result = await resolve_address("carera 25 num 4 sur 65", AddressGeocoder(
+        api_key="test", transport=httpx.MockTransport(respond),
+    ), FakeAdvisor(proposed))
+    assert result["candidates"] == [] and len(calls) == 1
