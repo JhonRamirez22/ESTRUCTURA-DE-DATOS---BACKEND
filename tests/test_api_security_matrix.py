@@ -68,3 +68,73 @@ def _operations() -> list[tuple[str, str, dict[str, str], dict[str, str]]]:
             if method.upper() in {"HEAD", "OPTIONS"}:
                 continue
             path_values: dict[str, str] = {}
+            query_values: dict[str, str] = {}
+            for parameter in operation.get("parameters", []):
+                if parameter["in"] == "path":
+                    path_values[parameter["name"]] = _sample(parameter)
+                elif parameter["in"] == "query" and parameter.get("required"):
+                    query_values[parameter["name"]] = _sample(parameter)
+            rows.append((method.upper(), path, path_values, query_values))
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_every_non_public_operation_rejects_anonymous_callers(
+    anonymous_client: httpx.AsyncClient,
+) -> None:
+    operations = _operations()
+    assert len(operations) >= 45
+    open_operations: list[str] = []
+    for method, path, path_values, query_values in operations:
+        if (method, path) in PUBLIC_OPERATIONS:
+            continue
+        url = path
+        for name, value in path_values.items():
+            url = url.replace("{" + name + "}", value)
+        response = await anonymous_client.request(
+            method,
+            url,
+            params=query_values,
+            headers={"Origin": "http://localhost:3000"} if method != "GET" else {},
+            json={} if method in {"POST", "PUT", "PATCH"} else None,
+        )
+        if response.status_code not in {401, 403}:
+            open_operations.append(f"{method} {path} -> {response.status_code}")
+    assert open_operations == []
+
+
+@pytest.mark.asyncio
+async def test_public_tracking_is_rate_limited_per_guide(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api import tracking
+    from app.services.customer_chat_rate_limiter import CustomerChatRateLimiter
+
+    monkeypatch.delenv("AUTH_SECRET", raising=False)
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        tracking, "_TRACKING_LIMITER", CustomerChatRateLimiter(max_requests=3, window_seconds=60)
+    )
+
+    async def no_session() -> AsyncIterator[None]:
+        yield None
+
+    app.dependency_overrides[get_session] = no_session
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            codes = []
+            for _ in range(4):
+                response = await client.get(
+                    "/api/v1/seguimiento", params={"guia": "guia-de-prueba"}
+                )
+                codes.append(response.status_code)
+            other = await client.get("/api/v1/seguimiento", params={"guia": "otra-guia"})
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        get_settings.cache_clear()
+    assert codes[-1] == 429
+    assert 429 not in codes[:3]
+    assert other.status_code != 429
