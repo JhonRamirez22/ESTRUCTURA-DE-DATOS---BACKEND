@@ -47,3 +47,52 @@ _EXPECTED_OPERATIONS = frozenset(
         ("GET", "/api/rutas/{}/navegacion"),
         ("POST", "/api/rutas/{}/recalcular"),
         ("POST", "/api/rutas/{}/propuesta"),
+        ("POST", "/api/rutas/{}/deshacer-recalculo"),
+        ("GET", "/api/rutas/{}/trafico"),
+        ("GET", "/api/rutas/{}/trafico-vivo"),
+        ("GET", "/api/seguimiento"),
+        ("POST", "/api/solicitudes"),
+        ("POST", "/api/solicitudes/direccion"),
+        ("GET", "/api/inteligencia/agrupaciones"),
+        ("GET", "/api/inteligencia/sugerencias"),
+        ("GET", "/api/inteligencia/resumen-turno"),
+        ("GET", "/api/optimizaciones/en-vivo"),
+        ("GET", "/api/historial/envios"),
+        ("GET", "/api/historial/envios/{}/eventos"),
+        ("GET", "/api/demo/estado"),
+        ("POST", "/api/demo/renovar-gps"),
+        ("POST", "/api/auth/password"),
+        ("GET", "/api/auditoria/sujetos"),
+        ("GET", "/api/auditoria/informe"),
+        ("GET", "/api/auditoria/informe-general"),
+        ("GET", "/api/auditoria/descargas"),
+        ("GET", "/api/auditoria/eventos"),
+        ("POST", "/api/inteligencia/rutas/{}/explicar"),
+        ("POST", "/api/solicitudes/{}/aceptar"),
+        ("POST", "/api/solicitudes/{}/rechazar"),
+        ("GET", "/api/traffic"),
+        ("GET", "/api/trafico/estado"),
+        ("GET", "/api/trafico/tiles/{}/{}/{}.png"),
+    }
+)
+_DYNAMIC_SEGMENT = re.compile(r"\{[^/]+\}")
+
+
+def test_fastapi_implements_the_complete_http_api_contract() -> None:
+    actual_operations = {
+        (method.upper(), _DYNAMIC_SEGMENT.sub("{}", path.replace("/api/v1/", "/api/")))
+        for path, path_operations in app.openapi()["paths"].items()
+        for method in path_operations
+    }
+    missing = sorted(_EXPECTED_OPERATIONS - actual_operations)
+    unexpected = sorted(actual_operations - _EXPECTED_OPERATIONS)
+
+    assert not missing, f"FastAPI dejó de implementar operaciones públicas: {missing}"
+    assert not unexpected, f"FastAPI agregó operaciones no documentadas: {unexpected}"
+    assert all(path.startswith("/api/v1/") for path in app.openapi()["paths"])
+
+
+def test_openapi_documentation_is_not_published_as_a_public_route() -> None:
+    assert app.openapi_url is None
+    assert app.docs_url is None
+    assert app.redoc_url is None
