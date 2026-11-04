@@ -65,3 +65,70 @@ def _dispatcher_cookie() -> str:
     return f"{session_cookie_name('dispatcher')}={token}"
 
 
+@pytest.mark.asyncio
+async def test_analytics_requires_dispatcher_session(client: httpx.AsyncClient) -> None:
+    response = await client.get("/api/analitica")
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_analytics_excludes_cancelled_routes_and_aggregates_metrics(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        courier = Courier(
+            id=_COURIER_ID,
+            name="Repartidor de prueba",
+            phone="3000000000",
+            status=CourierStatus.AVAILABLE,
+        )
+        session.add_all(
+            [
+                courier,
+                Route(
+                    courier=courier,
+                    status=RouteStatus.COMPLETED,
+                    baseline_duration_minutes=20,
+                    estimated_duration_minutes=15,
+                    baseline_distance_meters=5_000,
+                    estimated_distance_meters=4_000,
+                ),
+                Route(
+                    courier=courier,
+                    status=RouteStatus.CANCELLED,
+                    baseline_duration_minutes=12,
+                    estimated_duration_minutes=8,
+                    baseline_distance_meters=2_000,
+                    estimated_distance_meters=1_000,
+                ),
+            ]
+        )
+        await session.commit()
+
+    response = await client.get(
+        "/api/analitica",
+        headers={"Cookie": _dispatcher_cookie()},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "metrics": {
+            "routeCount": 1,
+            "completedRouteCount": 1,
+            "estimatedDurationMinutes": 15.0,
+            "estimatedDistanceMeters": 4_000.0,
+            "timeSavedMinutes": 5.0,
+            "distanceSavedMeters": 1_000.0,
+            "routesWithBaseline": 1,
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_analytics_rejects_malformed_courier_id(client: httpx.AsyncClient) -> None:
+    response = await client.get(
+        "/api/analitica?courierId=not-a-uuid",
+        headers={"Cookie": _dispatcher_cookie()},
+    )
+    assert response.status_code == 400
