@@ -1,0 +1,50 @@
+{
+  "description": "Vectores compartidos por las estructuras TypeScript (src/core/structures) y Python (app/core/structures). Cambiar en ambos repos a la vez. expect: valor esperado, o {\"throws\": true} si la operación debe fallar.",
+  "cases": [
+    {
+      "name": "queue vacía",
+      "structure": "queue",
+      "ops": [
+        { "call": "is_empty", "expect": true },
+        { "call": "dequeue", "expect": null },
+        { "call": "peek", "expect": null },
+        { "call": "size", "expect": 0 }
+      ]
+    },
+    {
+      "name": "queue FIFO",
+      "structure": "queue",
+      "ops": [
+        { "call": "enqueue", "args": [1], "expect": null },
+        { "call": "enqueue", "args": [2], "expect": null },
+        { "call": "enqueue", "args": [3], "expect": null },
+        { "call": "size", "expect": 3 },
+        { "call": "peek", "expect": 1 },
+        { "call": "dequeue", "expect": 1 },
+        { "call": "dequeue", "expect": 2 },
+        { "call": "dequeue", "expect": 3 },
+        { "call": "is_empty", "expect": true }
+      ]
+    },
+    {
+      "name": "stack LIFO",
+      "structure": "stack",
+      "ops": [
+        { "call": "is_empty", "expect": true },
+        { "call": "pop", "expect": null },
+        { "call": "push", "args": [1], "expect": null },
+        { "call": "push", "args": [2], "expect": null },
+        { "call": "push", "args": [3], "expect": null },
+        { "call": "size", "expect": 3 },
+        { "call": "peek", "expect": 3 },
+        { "call": "pop", "expect": 3 },
+        { "call": "pop", "expect": 2 },
+        { "call": "size", "expect": 1 },
+        { "call": "pop", "expect": 1 },
+        { "call": "pop", "expect": null },
+        { "call": "is_empty", "expect": true }
+      ]
+    },
+    {
+      "name": "lista simple con inserción en extremos y remove",
+      "structure": "singly_linked_list",
