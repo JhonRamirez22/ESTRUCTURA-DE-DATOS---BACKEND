@@ -79,3 +79,84 @@ async def test_logout_revokes_cookie_replay_on_both_versions(
     replay = await client.get(
         f"{prefix}/auth/session", headers={"Cookie": f"rutas-pasto-dispatch-session={raw}"},
     )
+    assert replay.json() == {"authenticated": False}
+
+
+@pytest.mark.asyncio
+async def test_mutation_rejects_missing_csrf_and_foreign_origin(client: httpx.AsyncClient) -> None:
+    await client.post("/api/v1/auth/login", json={"accessCode": DISPATCHER_CODE})
+    for headers in (
+        {"X-CSRF-Token": ""},
+        {"Origin": "https://evil.example"},
+        {"Sec-Fetch-Site": "cross-site"},
+    ):
+        response = await client.post("/api/v1/auth/logout", headers=headers)
+        assert response.status_code == 403
+    assert (await client.get("/api/v1/auth/session")).json() == {"authenticated": True}
+
+
+@pytest.mark.asyncio
+async def test_old_stateless_cookie_no_longer_authorizes(client: httpx.AsyncClient) -> None:
+    from time import time
+
+    from app.core.auth import create_session_token
+
+    token = create_session_token("dispatcher", int(time()) + 3600, SESSION_SECRET)
+    response = await client.get(
+        "/api/v1/auth/session", headers={"Cookie": f"rutas-pasto-dispatch-session={token}"},
+    )
+    assert response.json() == {"authenticated": False}
+
+
+@pytest.mark.asyncio
+async def test_account_disable_is_checked_after_login(
+    client: httpx.AsyncClient, session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await client.post("/api/v1/auth/login", json={"accessCode": DISPATCHER_CODE})
+    async with session_factory() as session:
+        owner = await session.scalar(select(Account))
+        assert owner is not None
+        owner.enabled = False
+        await session.commit()
+    assert (await client.get("/api/v1/auth/session")).json() == {"authenticated": False}
+    async with session_factory() as session:
+        stored = await session.scalar(select(AccessSession))
+        assert stored is not None and stored.revoked_at is not None
+
+
+@pytest.mark.asyncio
+async def test_security_headers_request_id_and_body_limit(client: httpx.AsyncClient) -> None:
+    response = await client.get("/api/v1/auth/session", headers={"X-Request-ID": "malformed"})
+    UUID(response.headers["X-Request-ID"])
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["Referrer-Policy"] == "no-referrer"
+    https_response = await client.get(
+        "/api/v1/auth/session", headers={"X-Forwarded-Proto": "https"}
+    )
+    assert https_response.headers["Strict-Transport-Security"] == (
+        "max-age=31536000; includeSubDomains"
+    )
+    oversized = await client.post("/api/v1/auth/login", content="x" * 65537)
+    assert oversized.status_code == 413
+
+    async def chunks() -> AsyncIterator[bytes]:
+        yield b"x" * 32768
+        yield b"x" * 32769
+
+    streamed = await client.post("/api/v1/auth/login", content=chunks())
+    assert streamed.status_code == 413
+    legacy = await client.get("/api/auth/session")
+    assert legacy.headers["X-API-Deprecated"] == "true"
+
+
+def test_missing_environment_defaults_to_production_without_local_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("NODE_ENV", "AUTH_SECRET", "DISPATCHER_ACCESS_CODE"):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings(_env_file=None)
+
+    assert settings.node_env == "production"
+    assert not settings.is_development
+    assert _configured_secret(settings) is None
+    assert _dispatcher_code(settings) is None
