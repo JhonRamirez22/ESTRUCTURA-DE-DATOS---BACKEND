@@ -66,3 +66,70 @@ def test_worker_rejects_a_non_positive_poll_interval() -> None:
     with pytest.raises(ValueError, match="debe ser positivo"):
         asyncio.run(
             worker.run_customer_notification_worker(
+                _unused_session_factory(), asyncio.Event(), poll_interval_seconds=0
+            )
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("worker_enabled", "is_vercel"),
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+async def test_fastapi_lifespan_starts_worker_only_when_enabled_on_a_persistent_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    worker_enabled: bool,
+    is_vercel: bool,
+) -> None:
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def wait_for_shutdown(
+        _session_factory: async_sessionmaker[AsyncSession],
+        stop_event: asyncio.Event,
+        *,
+        poll_interval_seconds: float,
+    ) -> None:
+        assert poll_interval_seconds == Settings().customer_notification_poll_seconds
+        started.set()
+        await stop_event.wait()
+        stopped.set()
+
+    async def no_op() -> None:
+        return None
+
+    class _IdleLocationQueue:
+        async def wait_until_idle(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        application,
+        "get_settings",
+        lambda: Settings(
+            customer_notification_worker_enabled=worker_enabled,
+            auth_secret="unit-test-session-secret-with-at-least-32-bytes",
+        ),
+    )
+    if is_vercel:
+        monkeypatch.setenv("VERCEL", "1")
+    else:
+        monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.setattr(
+        application,
+        "any_customer_notification_delivery_configured",
+        lambda _settings: True,
+    )
+    monkeypatch.setattr(application, "get_session_factory", _unused_session_factory)
+    monkeypatch.setattr(application, "run_customer_notification_worker", wait_for_shutdown)
+    monkeypatch.setattr(application, "get_location_event_queue", _IdleLocationQueue)
+    monkeypatch.setattr(application, "close_routing_clients", no_op)
+    monkeypatch.setattr(application, "close_traffic_service", no_op)
+    monkeypatch.setattr(application, "dispose_engine", no_op)
+
+    worker_should_run = worker_enabled and not is_vercel
+    async with application.lifespan(application.app):
+        if worker_should_run:
+            await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert started.is_set() is worker_should_run
+    assert stopped.is_set() is worker_should_run
