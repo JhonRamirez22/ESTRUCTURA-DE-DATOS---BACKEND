@@ -82,3 +82,87 @@ class _FailingAssistant:
         estimated_minutes_from_now: float | None = None,
         estimate_basis: str = "",
     ) -> str:
+        del estimate_basis
+        raise self.error
+
+
+class _FakeMatrixProvider:
+    def __init__(self, *, fails: bool = False, source: str = "osrm") -> None:
+        self.coordinates: list[list[Coordinate]] = []
+        self.fails = fails
+        self.source = source
+
+    async def get_duration_matrix(self, coordinates: Sequence[Coordinate]) -> dict[str, object]:
+        self.coordinates.append(list(coordinates))
+        if self.fails:
+            raise RuntimeError("simulated routing outage")
+        size = len(coordinates)
+        durations: list[list[float | None]] = [
+            [0.0 if source == target else 11.0 for target in range(size)]
+            for source in range(size)
+        ]
+        distances: list[list[float | None]] = [
+            [0.0 if source == target else 1_000.0 for target in range(size)]
+            for source in range(size)
+        ]
+        return {
+            "durations_minutes": durations,
+            "distances_meters": distances,
+            "source": self.source,
+        }
+
+
+class _FakeRouteProvider:
+    def __init__(self, *, fails: bool = False) -> None:
+        self.coordinates: list[list[Coordinate]] = []
+        self.fails = fails
+
+    async def get_route(self, coordinates: Sequence[Coordinate]) -> RouteResult:
+        self.coordinates.append(list(coordinates))
+        if self.fails:
+            raise RuntimeError("simulated directions outage")
+        return {
+            "geometry": {"type": "LineString", "coordinates": list(coordinates)},
+            "geometry_provider": "OSRM",
+            "distance_meters": 825,
+            "duration_minutes": 7.5,
+        }
+
+
+class _FakeTrafficProvider:
+    async def get_flow_segment(self, coordinate: Coordinate) -> TrafficData:
+        del coordinate
+        return TrafficData(
+            current_speed_kmh=20,
+            free_flow_speed_kmh=40,
+            current_travel_time_seconds=90,
+            free_flow_travel_time_seconds=60,
+            confidence=0.9,
+            road_closure=False,
+            traffic_ratio=0.5,
+            traffic_level=TrafficLevel.ALTO,
+            travel_time_multiplier=1.5,
+            timestamp=datetime.now(UTC),
+            cache_status="LIVE",
+        )
+
+
+def test_customer_chat_uses_fast_groq_defaults_when_only_a_key_is_supplied() -> None:
+    assistant = create_customer_order_chat(Settings(customer_chat_api_key="test-only-key"))
+
+    assert isinstance(assistant, HttpOrderChatAssistant)
+    assert assistant._api_url == "https://api.groq.com/openai/v1/chat/completions"
+    assert assistant._model == "openai/gpt-oss-20b"
+
+
+@pytest_asyncio.fixture
+async def session_factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'customer-chat.sqlite'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        yield factory
+    finally:
+        await engine.dispose()
+
