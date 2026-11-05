@@ -53,3 +53,58 @@ async def test_h2_group_cache_does_not_keep_a_transient_ai_failure(
 @pytest.mark.asyncio
 async def test_h2_explanation_cache_keeps_only_validated_text(
     monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    intelligence._EXPLAIN_CACHE.clear()
+    answers = iter(
+        [
+            {"text": "determinista", "source": "deterministic"},
+            {"text": "de groq", "source": "groq-validated"},
+        ]
+    )
+
+    async def fake_explain(summary: object) -> dict[str, str]:
+        return next(answers)
+
+    monkeypatch.setattr(intelligence, "explain_route", fake_explain)
+    first = await intelligence.cached_explanation("r1:t", {})
+    second = await intelligence.cached_explanation("r1:t", {})
+    assert first["source"] == "deterministic"
+    assert second["source"] == "groq-validated"
+    third = await intelligence.cached_explanation("r1:t", {})
+    assert third["cached"] is True  # el texto validado sí se conserva
+
+
+# --- H3: un error de base de datos al buscar paradas cercanas no escapa ----------------
+class _BrokenRepository:
+    async def active_points_near(self, *args: object) -> list[object]:
+        raise SQLAlchemyError("boom")
+
+
+@pytest.mark.asyncio
+async def test_h3_nearby_lookup_failure_does_not_block_the_request() -> None:
+    notice = await order_requests._nearby_stop_notice(_BrokenRepository(), 1.21, -77.28)  # type: ignore[arg-type]
+    assert notice is None
+
+
+# --- H5: la tarea de vaciado de la cola queda referenciada -----------------------------
+@pytest.mark.asyncio
+async def test_h5_queue_keeps_a_reference_to_its_drain_task() -> None:
+    from app.services.location_event_queue import LocationEventQueue
+
+    queue = LocationEventQueue(max_pending=4)
+
+    async def work() -> int:
+        return 1
+
+    assert await queue.enqueue(work) == 1
+    assert hasattr(queue, "_drain_task")
+
+
+
+# --- H4: guardar el historial nunca debe romper el despacho ----------------------------
+@pytest.mark.asyncio
+async def test_h4_traffic_history_failure_does_not_break_the_dispatch_transaction(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from uuid import uuid4
+
