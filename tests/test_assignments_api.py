@@ -84,3 +84,89 @@ class FakeTrafficAdvisor:
     def __init__(self, *, fail_route_advice: bool = False) -> None:
         self.assignment_request: AssignmentTrafficRequest | None = None
         self.route_requests = 0
+        self.fail_route_advice = fail_route_advice
+
+    async def get_assignment_advice(
+        self,
+        request: AssignmentTrafficRequest,
+    ) -> AssignmentTrafficAdvice:
+        self.assignment_request = request
+        candidate = request.candidates[0]
+        return AssignmentTrafficAdvice(
+            (
+                AssignmentTrafficAdjustment(
+                    candidate.courier_id,
+                    candidate.order_id,
+                    1.4,
+                ),
+            ),
+            model="test-model",
+        )
+
+    async def get_route_advice(self, _request: object) -> Any:
+        self.route_requests += 1
+        if self.fail_route_advice:
+            raise RuntimeError("AI unavailable")
+        return RouteTrafficAdvice(adjustments=(), model="test-model")
+
+
+@pytest_asyncio.fixture
+async def session_factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'assignments.sqlite'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(connection: Connection, _record: object) -> None:
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        yield factory
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def client(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[httpx.AsyncClient]:
+    monkeypatch.setenv("AUTH_SECRET", _SESSION_SECRET)
+    monkeypatch.setenv("NODE_ENV", "test")
+    monkeypatch.setenv("AI_ALLOW_LOCATION_DATA_SHARING", "false")
+    monkeypatch.setenv("NOTIFICATION_SMTP_HOST", "")
+    monkeypatch.setenv("NOTIFICATION_SMTP_USERNAME", "")
+    monkeypatch.setenv("NOTIFICATION_SMTP_PASSWORD", "")
+    monkeypatch.setenv("NOTIFICATION_FROM_EMAIL", "")
+    monkeypatch.setenv("NOTIFICATION_SMS_TWILIO_ACCOUNT_SID", "")
+    monkeypatch.setenv("NOTIFICATION_SMS_TWILIO_AUTH_TOKEN", "")
+    monkeypatch.setenv("NOTIFICATION_SMS_TWILIO_FROM_PHONE", "")
+    get_settings.cache_clear()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_session_factory] = lambda: session_factory
+    app.dependency_overrides[get_routing_providers] = lambda: (
+        FakeMatrixProvider(),
+        FakeRouteProvider(),
+    )
+    app.dependency_overrides[get_route_traffic_advisor] = lambda: None
+    app.dependency_overrides[get_traffic_service] = lambda: None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(get_session_factory, None)
+        app.dependency_overrides.pop(get_routing_providers, None)
+        app.dependency_overrides.pop(get_route_traffic_advisor, None)
+        app.dependency_overrides.pop(get_traffic_service, None)
