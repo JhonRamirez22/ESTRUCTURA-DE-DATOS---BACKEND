@@ -52,3 +52,56 @@ async def test_saturated_database_pool_sheds_load_with_503_not_500() -> None:
     @api.get('/api/v1/saturado')
     async def saturated() -> None:
         raise PoolTimeout('QueuePool limit of size 10 overflow 10 reached')
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=api, raise_app_exceptions=False),
+        base_url='http://test',
+    ) as client:
+        response = await client.get('/api/v1/saturado')
+    assert response.status_code == 503
+    assert response.headers['Retry-After'] == '2'
+    assert 'QueuePool' not in response.text
+    assert response.json()['error'].startswith('El servicio está saturado')
+
+
+@pytest.mark.asyncio
+async def test_inflight_limit_sheds_excess_requests_and_exempts_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from app.settings import get_settings
+
+    monkeypatch.setenv('MAX_INFLIGHT_REQUESTS', '2')
+    get_settings.cache_clear()
+    release = asyncio.Event()
+    api = FastAPI()
+    api.add_middleware(HttpSecurityMiddleware)
+
+    @api.get('/api/v1/lento')
+    async def slow() -> dict[str, bool]:
+        await release.wait()
+        return {'ok': True}
+
+    @api.get('/api/v1/health')
+    async def health() -> dict[str, bool]:
+        return {'ok': True}
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api), base_url='http://test'
+        ) as client:
+            first = asyncio.create_task(client.get('/api/v1/lento'))
+            second = asyncio.create_task(client.get('/api/v1/lento'))
+            await asyncio.sleep(0.05)
+            shed = await client.get('/api/v1/lento')
+            assert shed.status_code == 503
+            assert shed.headers['Retry-After'] == '1'
+            # La salud no se descarta.
+            assert (await client.get('/api/v1/health')).status_code == 200
+            release.set()
+            assert (await first).status_code == 200
+            assert (await second).status_code == 200
+            assert (await client.get('/api/v1/lento')).status_code == 200  # el cupo se libera
+    finally:
+        get_settings.cache_clear()
