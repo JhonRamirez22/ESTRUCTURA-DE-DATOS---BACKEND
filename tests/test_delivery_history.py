@@ -72,3 +72,77 @@ async def factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[AsyncSessi
     try:
         yield maker
     finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def client(
+    factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[httpx.AsyncClient]:
+    monkeypatch.setenv("AUTH_SECRET", _SECRET)
+    monkeypatch.setenv("NODE_ENV", "test")
+    get_settings.cache_clear()
+
+    async def override() -> AsyncIterator[AsyncSession]:
+        async with factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override
+    app.dependency_overrides[get_session_factory] = lambda: factory
+    app.dependency_overrides[get_routing_providers] = lambda: (_Matrix(), _Roads())
+    app.dependency_overrides[get_route_traffic_advisor] = lambda: None
+    app.dependency_overrides[get_traffic_service] = lambda: None
+    app.dependency_overrides[get_route_order_advisor] = lambda: None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        for dependency in (
+            get_session_factory, get_routing_providers, get_route_traffic_advisor,
+            get_traffic_service, get_route_order_advisor,
+        ):
+            app.dependency_overrides.pop(dependency, None)
+        get_settings.cache_clear()
+
+
+def _cookie(role: str, courier_id: UUID | None = None) -> dict[str, str]:
+    token = create_session_token(
+        role,  # type: ignore[arg-type]
+        int(time()) + SESSION_MAX_AGE_SECONDS,
+        _SECRET,
+        str(courier_id) if courier_id else None,
+    )
+    return {"Cookie": f"{session_cookie_name(role)}={token}"}  # type: ignore[arg-type]
+
+
+async def _events(factory: async_sessionmaker[AsyncSession], ref: str) -> list[DeliveryEvent]:
+    async with factory() as session:
+        rows = await session.scalars(
+            select(DeliveryEvent).where(DeliveryEvent.order_ref == ref)
+            .order_by(DeliveryEvent.occurred_at.asc(), DeliveryEvent.event_type.asc())
+        )
+        return list(rows.all())
+
+
+async def _courier(factory: async_sessionmaker[AsyncSession]) -> UUID:
+    courier = Courier(
+        id=uuid4(), name="Ana", phone="+573001112233", status=CourierStatus.AVAILABLE,
+        current_lat=1.2136, current_lng=-77.2811,
+        last_location_at=datetime.now(UTC).replace(tzinfo=None),
+    )
+    async with factory() as session:
+        session.add(courier)
+        await session.commit()
+    return courier.id
+
+
+async def _create(client: httpx.AsyncClient, ref: str, **extra: Any) -> dict[str, Any]:
+    response = await client.post(
+        "/api/pedidos", headers=_cookie("dispatcher"), json={**_ORDER, "orderId": ref, **extra}
+    )
+    assert response.status_code == 201, response.text
+    return dict(response.json()["deliveryPoint"])
+
