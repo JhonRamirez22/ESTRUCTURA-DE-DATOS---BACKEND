@@ -61,3 +61,66 @@ async def test_failed_location_write_does_not_block_following_jobs() -> None:
 
 @pytest.mark.asyncio
 async def test_cancelled_request_does_not_abandon_accepted_location_write() -> None:
+    queue = LocationEventQueue()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completed: list[str] = []
+
+    async def first_job() -> str:
+        started.set()
+        await release.wait()
+        completed.append("first")
+        return "first"
+
+    async def following_job() -> str:
+        completed.append("following")
+        return "following"
+
+    cancelled_request = asyncio.create_task(queue.enqueue(first_job))
+    await started.wait()
+    cancelled_request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_request
+
+    following = asyncio.create_task(queue.enqueue(following_job))
+    draining = asyncio.create_task(queue.wait_until_idle())
+    await asyncio.sleep(0)
+    assert not draining.done()
+
+    release.set()
+    assert await following == "following"
+    await draining
+    assert completed == ["first", "following"]
+    assert queue.pending_count == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_until_idle_waits_for_all_accepted_jobs() -> None:
+    queue = LocationEventQueue()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def job() -> int:
+        started.set()
+        await release.wait()
+        return 1
+
+    queued = asyncio.create_task(queue.enqueue(job))
+    await started.wait()
+    draining = asyncio.create_task(queue.wait_until_idle())
+    await asyncio.sleep(0)
+    assert not draining.done()
+
+    release.set()
+    assert await queued == 1
+    await draining
+    assert queue.pending_count == 0
+
+
+def _keys_in_different_lanes(queue: object, lanes: int) -> tuple[str, str]:
+    from app.services.location_event_queue import ShardedLocationQueue
+
+    assert isinstance(queue, ShardedLocationQueue)
+    first = "courier-0"
+    for index in range(1, 500):
+        other = f"courier-{index}"
