@@ -52,3 +52,57 @@ def test_traslada_un_pedido_lejano_al_repartidor_que_ya_pasa_cerca() -> None:
 
 
 def test_intercambia_dos_pedidos_cuando_ninguno_solo_basta() -> None:
+    positions = [0, 100, 90, 10]  # A en 0, B en 100; pedido x en 90 (de A) y pedido y en 10 (de B)
+    matrix: list[list[float | None]] = [[float(abs(a - b)) for b in positions] for a in positions]
+    result = improve_assignment(
+        matrix, {"A": 0, "B": 1}, {"x": 2, "y": 3}, {"A": ["x"], "B": ["y"]}
+    )
+    assert result.assignments == {"A": ["y"], "B": ["x"]}
+    assert result.moves[0].kind == "swap"
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_nunca_empeora_conserva_pedidos_y_respeta_el_tope(seed: int) -> None:
+    rng = random.Random(seed)
+    couriers = rng.randint(2, 5)
+    orders = rng.randint(4, 24)
+    matrix, courier_index, order_index = _instance(couriers, orders, rng)
+    start = _greedy(matrix, courier_index, order_index)
+    result = improve_assignment(matrix, courier_index, order_index, start)
+    assert result.after.objective() <= result.before.objective() + 1e-9
+    flat = sorted(order for route in result.assignments.values() for order in route)
+    assert flat == sorted(order_index)
+    assert all(len(route) <= MAX_ORDERS_PER_COURIER for route in result.assignments.values())
+    assert result.after == estimate_cost(matrix, courier_index, order_index, result.assignments)
+
+
+def test_mejora_de_verdad_en_una_parte_de_los_repartos_por_cercania() -> None:
+    improved = 0
+    for seed in range(40):
+        rng = random.Random(1000 + seed)
+        matrix, courier_index, order_index = _instance(3, 15, rng)
+        start = _greedy(matrix, courier_index, order_index)
+        result = improve_assignment(matrix, courier_index, order_index, start)
+        improved += result.after.objective() < result.before.objective() - 0.5
+    assert improved >= 12  # el reparto por cercanía deja ahorros reales sobre la mesa
+
+
+def test_es_determinista() -> None:
+    rng = random.Random(7)
+    matrix, courier_index, order_index = _instance(3, 14, rng)
+    start = _greedy(matrix, courier_index, order_index)
+    first = improve_assignment(matrix, courier_index, order_index, start)
+    second = improve_assignment(matrix, courier_index, order_index, start)
+    assert first.assignments == second.assignments
+
+
+def test_no_manda_un_pedido_a_quien_no_puede_llegar() -> None:
+    positions = [0, 100, 10, 90]
+    matrix: list[list[float | None]] = [[float(abs(a - b)) for b in positions] for a in positions]
+    matrix[1][3] = None  # B no llega al pedido 90
+    matrix[3][1] = None
+    result = improve_assignment(
+        matrix, {"A": 0, "B": 1}, {"p10": 2, "p90": 3}, {"A": ["p10", "p90"], "B": []}
+    )
+    assert "p90" not in result.assignments["B"]
+
