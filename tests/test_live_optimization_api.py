@@ -63,3 +63,67 @@ class FakeRoutes:
         self.calls += 1
         return {
             "geometry": {"type": "LineString", "coordinates": list(coordinates)},
+            "geometry_provider": "OSRM", "distance_meters": 1000.0, "duration_minutes": 5.0,
+        }
+
+
+@pytest_asyncio.fixture
+async def factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'live.sqlite'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _fk(connection: Connection, _record: object) -> None:
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        yield maker
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def setup(
+    factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[tuple[httpx.AsyncClient, FakeMatrix, FakeRoutes]]:
+    monkeypatch.setenv("AUTH_SECRET", _SECRET)
+    monkeypatch.setenv("NODE_ENV", "test")
+    get_settings.cache_clear()
+    live_optimization._SHARED_CACHE.clear()
+    optimizations_module._LIVE_LIMITER._hits.clear()
+    matrix, routes = FakeMatrix(), FakeRoutes()
+
+    async def override() -> AsyncIterator[AsyncSession]:
+        async with factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override
+    app.dependency_overrides[get_routing_providers] = lambda: (matrix, routes)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            yield client, matrix, routes
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(get_routing_providers, None)
+        get_settings.cache_clear()
+
+
+def _cookie(role: str, courier_id: UUID | None = None) -> dict[str, str]:
+    token = create_session_token(
+        role,  # type: ignore[arg-type]
+        int(time()) + SESSION_MAX_AGE_SECONDS,
+        _SECRET,
+        str(courier_id) if courier_id else None,
+    )
+    return {"Cookie": f"{session_cookie_name(role)}={token}"}  # type: ignore[arg-type]
+
+
+async def _seed_route(
+    factory: async_sessionmaker[AsyncSession],
+    name: str,
