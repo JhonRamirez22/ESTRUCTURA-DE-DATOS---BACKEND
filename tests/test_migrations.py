@@ -73,3 +73,77 @@ def test_initial_migration_creates_all_tables_on_an_empty_database(
     assert "alembic_version" in actual_tables
 
 
+def test_account_migration_upgrades_0007_without_changing_existing_couriers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "accounts-upgrade.sqlite3"
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            courier = Courier(
+                name="Repartidor existente", phone="3000000000", status=CourierStatus.OFFLINE
+            )
+            session.add(courier)
+            session.commit()
+            courier_id = courier.id
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP TABLE accounts")
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database_path}")
+        get_settings.cache_clear()
+        config = Config(str(BACKEND_ROOT / "alembic.ini"))
+        config.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+        command.stamp(config, "0007_shared_chat_rate_limit")
+        command.upgrade(config, "head")
+        assert "accounts" in inspect(engine).get_table_names()
+        with Session(engine) as session:
+            assert session.get(Courier, courier_id) is not None
+    finally:
+        get_settings.cache_clear()
+        engine.dispose()
+
+
+def test_initial_migration_adopts_existing_tables_without_losing_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "existing.sqlite3"
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            courier = Courier(
+                name="Repartidor de prueba",
+                phone="3000000000",
+                status=CourierStatus.OFFLINE,
+            )
+            session.add(courier)
+            session.commit()
+            courier_id = courier.id
+
+        _upgrade_to_head(database_path, monkeypatch)
+
+        with Session(engine) as session:
+            preserved = session.get(Courier, courier_id)
+            assert preserved is not None
+            assert preserved.name == "Repartidor de prueba"
+            assert preserved.phone == "3000000000"
+    finally:
+        engine.dispose()
+
+
+def test_initial_migration_rejects_existing_schema_missing_required_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "missing-index.sqlite3"
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        Base.metadata.create_all(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql('DROP INDEX "routes_courier_id_idx"')
+    finally:
+        engine.dispose()
+
+    with pytest.raises(RuntimeError, match="routes.index:routes_courier_id_idx"):
