@@ -66,3 +66,70 @@ async def client(
         ) as test_client:
             yield test_client
     finally:
+        app.dependency_overrides.pop(get_session, None)
+        get_settings.cache_clear()
+
+
+def _cookie(role: str, courier_id: str | None = None) -> str:
+    token = create_session_token(
+        role, int(datetime.now().timestamp()) + SESSION_MAX_AGE_SECONDS, _SESSION_SECRET, courier_id
+    )
+    return f"{session_cookie_name(role)}={token}"
+
+
+@pytest.mark.asyncio
+async def test_notifications_reject_anonymous_and_prevent_recipient_enumeration(
+    client: httpx.AsyncClient,
+) -> None:
+    anonymous = await client.get("/api/notificaciones")
+    courier = await client.get(
+        "/api/notificaciones?recipientId=dispatcher",
+        headers={"Cookie": _cookie("courier", _COURIER_ID)},
+    )
+
+    assert anonymous.status_code == 401
+    assert courier.status_code == 403
+    assert courier.json() == {"error": "No puedes consultar avisos de otro usuario."}
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_lists_only_dispatcher_notifications(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        session.add_all(
+            [
+                Notification(
+                    kind=NotificationKind.ROUTE_CREATED,
+                    recipient_id="dispatcher",
+                    title="Ruta asignada",
+                    message="La ruta está lista.",
+                ),
+                Notification(
+                    kind=NotificationKind.ROUTE_CREATED,
+                    recipient_id=_COURIER_ID,
+                    title="Privada de repartidor",
+                    message="No debe verse en despacho.",
+                ),
+            ]
+        )
+        await session.commit()
+
+    response = await client.get(
+        "/api/notificaciones?recipientId=dispatcher&limit=5",
+        headers={"Cookie": _cookie("dispatcher")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["notifications"]) == 1
+    assert payload["notifications"][0]["recipientId"] == "dispatcher"
+    assert payload["notifications"][0]["title"] == "Ruta asignada"
+    assert response.headers["cache-control"] == "private, no-store, max-age=0"
+
+
+@pytest.mark.asyncio
+async def test_courier_sees_only_its_inbox_and_limit_is_clamped(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
