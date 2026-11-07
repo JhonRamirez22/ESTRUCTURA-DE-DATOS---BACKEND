@@ -38,3 +38,43 @@ def test_or_opt_moves_a_misplaced_stop_that_two_opt_keeps() -> None:
     assert improved[0] == 0
     assert improved == [0, 1, 2, 3, 4]
     assert _route_cost(matrix, improved) < _route_cost(matrix, route)
+
+
+def test_or_opt_never_worsens_and_keeps_every_stop_with_fixed_origin() -> None:
+    generator = random.Random(7)
+    for _ in range(40):
+        size = generator.randint(3, 8)
+        matrix: list[list[float | None]] = [
+            [0.0 if a == b else generator.uniform(1, 30) for b in range(size)] for a in range(size)
+        ]
+        start = two_opt(matrix, list(range(size)))
+        result = or_opt(matrix, start)
+        assert result[0] == 0
+        assert sorted(result) == list(range(size))
+        assert _route_cost(matrix, result) <= _route_cost(matrix, start) + 1e-9
+
+
+def test_or_opt_reaches_the_optimum_on_small_asymmetric_cases() -> None:
+    generator = random.Random(11)
+    reached = 0
+    for _ in range(30):
+        size = 6
+        matrix: list[list[float | None]] = [
+            [0.0 if a == b else generator.uniform(1, 20) for b in range(size)] for a in range(size)
+        ]
+        best = min(
+            _route_cost(matrix, [0, *perm]) for perm in itertools.permutations(range(1, size))
+        )
+        found = or_opt(matrix, two_opt(matrix, list(range(size))))
+        reached += abs(_route_cost(matrix, found) - best) < 1e-9
+    # Es una heurística: no garantiza el óptimo, pero debe alcanzarlo en la mayoría.
+    assert reached >= 15
+
+
+def test_or_opt_respects_missing_connections() -> None:
+    matrix: list[list[float | None]] = [
+        [0.0, 1.0, None],
+        [None, 0.0, 1.0],
+        [1.0, None, 0.0],
+    ]
+    assert or_opt(matrix, [0, 1, 2]) == [0, 1, 2]
