@@ -71,3 +71,76 @@ async def test_dispatcher_rejects_request_and_guide_stops_working(
         assert point is not None
     dispatcher = {"Cookie": _cookie("dispatcher")}
     rejected = await client.post(f"/api/v1/solicitudes/{point.id}/rechazar", headers=dispatcher)
+    assert rejected.status_code == 200
+    gone = await client.get("/api/v1/seguimiento", params={"guia": guide})
+    assert gone.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_only_dispatchers_resolve_requests_and_requests_cannot_be_patched(
+    client: httpx.AsyncClient,  # noqa: F811
+    session_factory: async_sessionmaker[AsyncSession],  # noqa: F811
+) -> None:
+    await _create(client)
+    async with session_factory() as session:
+        point = await session.scalar(select(DeliveryPoint))
+        assert point is not None
+    anonymous = await client.post(f"/api/v1/solicitudes/{point.id}/aceptar")
+    assert anonymous.status_code == 401
+    courier = {"Cookie": _cookie("courier", "f8fbc95f-643e-4fb3-9b82-8c42e0707311")}
+    as_courier = await client.post(f"/api/v1/solicitudes/{point.id}/aceptar", headers=courier)
+    assert as_courier.status_code == 403
+    patched = await client.patch(
+        f"/api/v1/pedidos/{point.id}",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"status": "PENDING"},
+    )
+    assert patched.status_code == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "payload", "expected"),
+    [
+        ({}, _VALID, 403),  # sin origen
+        ({"Origin": "https://evil.example"}, _VALID, 403),
+        (_ORIGIN, {**_VALID, "lat": 4.711, "lng": -74.07}, 400),  # Bogotá
+        (_ORIGIN, {**_VALID, "address": "abc"}, 400),
+        (_ORIGIN, {**_VALID, "customerPhone": "3001112233"}, 400),  # datos no pedidos
+        (_ORIGIN, {**_VALID, "address": "<script>alert(1)</script> calle 5"}, 400),
+    ],
+)
+async def test_public_request_rejects_unsafe_or_foreign_input(
+    client: httpx.AsyncClient,  # noqa: F811
+    headers: dict[str, str],
+    payload: dict[str, object],
+    expected: int,
+) -> None:
+    response = await client.post("/api/v1/solicitudes", headers=headers, json=payload)
+    assert response.status_code == expected
+
+
+@pytest.mark.asyncio
+async def test_public_requests_are_rate_limited_and_capped(
+    client: httpx.AsyncClient,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(order_requests, "_CLIENT_LIMITER", order_requests.CustomerChatRateLimiter(
+        max_requests=2, window_seconds=600
+    ))
+    statuses = [(await _create(client, **{"X-Forwarded-For": "203.0.113.7"})).status_code
+                for _ in range(3)]
+    assert statuses == [201, 201, 429]
+
+    monkeypatch.setattr(order_requests, "MAX_WAITING_REQUESTS", 2)
+    capped = await _create(client, **{"X-Forwarded-For": "198.51.100.9"})
+    assert capped.status_code == 503
+
+
+class _FakeGeocoder:
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    async def search(self, address: str) -> list[object]:
+        from app.services.address_geocoder import AddressSuggestion
+
