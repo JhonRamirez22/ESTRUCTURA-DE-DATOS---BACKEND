@@ -26,6 +26,7 @@ from app.core.location.pasto_area import is_within_pasto_service_area
 from app.core.optimization.nearest_neighbor import nearest_neighbor
 from app.core.optimization.or_opt import or_opt
 from app.core.optimization.order_verifier import verify_candidate_order
+from app.core.optimization.refine import RefineResult, refine_route
 from app.core.optimization.two_opt import two_opt
 from app.core.routing.cached_matrix_provider import (
     CachedMatrixProvider,
@@ -435,6 +436,11 @@ async def build_optimized_route_plan(
         raise RouteConflictError("No existe un camino conectado que cubra todos los pedidos.")
 
     or_opt_duration = optimized_duration
+    # Óptimo exacto (Held-Karp) en rutas cortas y búsqueda local iterada en largas; es CPU puro,
+    # así que no bloquea el bucle de eventos.
+    refined = await asyncio.to_thread(refine_route, optimization_matrix, optimized_route)
+    optimized_route = refined.route
+    optimized_duration = refined.cost
     ai_order = await _verified_ai_order(
         order_advisor, optimization_matrix, optimized_route, has_road_times
     )
@@ -475,6 +481,7 @@ async def build_optimized_route_plan(
         baseline_route=baseline_route,
         two_opt_route=two_opt_route,
         or_opt_duration=or_opt_duration,
+        refined=refined,
         final_route=optimized_route,
         baseline_geometry=baseline_geometry,
         live_traffic=live_traffic,
@@ -525,6 +532,7 @@ def _optimization_summary(
     baseline_route: Sequence[int],
     two_opt_route: Sequence[int],
     or_opt_duration: float,
+    refined: RefineResult,
     final_route: Sequence[int],
     baseline_geometry: GeoJsonLineString | None,
     live_traffic: Mapping[str, object],
@@ -561,6 +569,7 @@ def _optimization_summary(
             ("nearestNeighbor", baseline),
             ("twoOpt", _route_cost(matrix, two_opt_route)),
             ("orOpt", or_opt_duration),
+            ("refine", refined.cost),
         )
     ]
     return {
@@ -570,6 +579,15 @@ def _optimization_summary(
             {"step": "nearestNeighbor", "minutes": minutes(baseline)},
             {"step": "twoOpt", "minutes": minutes(_route_cost(matrix, two_opt_route))},
             {"step": "orOpt", "minutes": minutes(or_opt_duration)},
+            {
+                "step": "refine",
+                "minutes": minutes(refined.cost),
+                "kind": refined.kind,
+                "provenOptimal": refined.proven_optimal,
+                "lowerBoundMinutes": (
+                    minutes(refined.lower_bound) if refined.lower_bound is not None else None
+                ),
+            },
             {
                 "step": "aiOrder",
                 "minutes": minutes(final),

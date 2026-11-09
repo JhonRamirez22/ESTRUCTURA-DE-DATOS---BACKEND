@@ -306,7 +306,7 @@ async def test_route_creation_applies_tomtom_factor_and_returns_coverage(
     # El resumen explica la ruta: escalera de mejoras y el punto medido por TomTom en la calle.
     optimization = payload["optimization"]
     assert [step["step"] for step in optimization["ladder"]] == [
-        "nearestNeighbor", "twoOpt", "orOpt", "aiOrder",
+        "nearestNeighbor", "twoOpt", "orOpt", "refine", "aiOrder",
     ]
     assert optimization["tomtom"]["adjusted"] == 1
     assert len(optimization["trafficPoints"]) == 1

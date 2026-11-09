@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.settings import Settings
 
 
@@ -13,7 +15,9 @@ def test_production_requires_a_long_session_secret() -> None:
     assert not _settings(node_env="production", auth_secret="x" * 40).startup_problems()
 
 
-def test_development_is_only_allowed_with_a_local_database() -> None:
+def test_development_is_only_allowed_with_a_local_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Una DATABASE_URL del entorno (p. ej. la de las pruebas de integración) taparía el host.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     remote = _settings(node_env="development", database_host="db.example.rds.amazonaws.com")
     assert remote.startup_problems()
     assert _settings(node_env="development", database_host="127.0.0.1").startup_problems() == []
