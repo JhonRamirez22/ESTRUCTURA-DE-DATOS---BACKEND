@@ -76,3 +76,81 @@ class _MatrixProvider:
                 [0.0 if row == column else 650.0 for column in range(size)]
                 for row in range(size)
             ],
+            "source": "osrm",
+        }
+
+
+class _RouteProvider:
+    async def get_route(self, coordinates: Sequence[Coordinate]) -> RouteResult:
+        return {
+            "geometry": {"type": "LineString", "coordinates": list(coordinates)},
+            "geometry_provider": "OSRM",
+            "distance_meters": 650.0,
+            "duration_minutes": 4.5,
+        }
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_POSTGRES_INTEGRATION") != "1",
+    reason="Activa RUN_POSTGRES_INTEGRATION=1 para usar la base PostgreSQL configurada.",
+)
+@pytest.mark.asyncio
+async def test_route_revision_stack_persists_and_undoes_atomically_in_postgres() -> None:
+    settings = get_settings()
+    engine = create_async_engine(settings.sqlalchemy_database_url, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    courier_id = uuid4()
+    route_id = uuid4()
+    original_point_id = uuid4()
+    appended_point_id = uuid4()
+    seeded = False
+    original_geometry = {
+        "type": "LineString",
+        "coordinates": [[-77.2811, 1.2136], [-77.28, 1.214]],
+    }
+
+    try:
+        async with session_factory() as session:
+            session.add(
+                Courier(
+                    id=courier_id,
+                    name="Courier historial PG",
+                    phone=f"test-{courier_id.hex[:20]}",
+                    status=CourierStatus.AVAILABLE,
+                    current_lat=1.2136,
+                    current_lng=-77.2811,
+                    last_location_at=datetime.now(UTC).replace(tzinfo=None),
+                )
+            )
+            await session.flush()
+            session.add(
+                Route(
+                    id=route_id,
+                    courier_id=courier_id,
+                    status=RouteStatus.PLANNED,
+                    estimated_duration_minutes=15.0,
+                    estimated_distance_meters=1_800.0,
+                    baseline_duration_minutes=14.0,
+                    baseline_distance_meters=1_700.0,
+                    geometry=original_geometry,
+                    geometry_provider=RouteGeometryProvider.OSRM,
+                )
+            )
+            session.add_all(
+                [
+                    DeliveryPoint(
+                        id=original_point_id,
+                        address="Carrera 25 # 4 Sur-65, Pasto",
+                        lat=1.214,
+                        lng=-77.28,
+                        status=DeliveryPointStatus.PENDING,
+                        order_id=f"REVISION-{original_point_id}",
+                        tracking_token=f"TRACK-{original_point_id}",
+                        route_id=route_id,
+                        sequence_index=0,
+                    ),
+                    DeliveryPoint(
+                        id=appended_point_id,
+                        address="Calle 18 # 20-30, Pasto",
+                        lat=1.215,
+                        lng=-77.279,
