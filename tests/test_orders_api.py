@@ -76,3 +76,81 @@ async def client(
     async def override_session() -> AsyncIterator[AsyncSession]:
         async with session_factory() as session:
             yield session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(get_address_ai_advisor, None)
+        get_settings.cache_clear()
+
+
+def _cookie(role: str, courier_id: str | None = None) -> str:
+    token = create_session_token(
+        role,
+        int(time()) + SESSION_MAX_AGE_SECONDS,
+        _SESSION_SECRET,
+        courier_id,
+    )
+    return f"{session_cookie_name(role)}={token}"
+
+
+async def _create_courier(session_factory: async_sessionmaker[AsyncSession]) -> UUID:
+    courier_id = UUID(_COURIER_ID)
+    async with session_factory() as session:
+        session.add(
+            Courier(
+                id=courier_id,
+                name="Repartidor de prueba",
+                phone="3000000000",
+                status=CourierStatus.ON_ROUTE,
+            )
+        )
+        await session.commit()
+    return courier_id
+
+
+async def _create_delivery_point(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    route_id: UUID | None = None,
+    status: DeliveryPointStatus = DeliveryPointStatus.PENDING,
+) -> UUID:
+    point_id = uuid4()
+    async with session_factory() as session:
+        session.add(
+            DeliveryPoint(
+                id=point_id,
+                address="Carrera 25 # 4 sur 65",
+                lat=1.2136,
+                lng=-77.2811,
+                status=status,
+                order_id=f"PED-{point_id}",
+                tracking_token=f"guide-{point_id}",
+                route_id=route_id,
+                sequence_index=0 if route_id else None,
+            )
+        )
+        await session.commit()
+    return point_id
+
+
+@pytest.mark.asyncio
+async def test_order_collection_requires_dispatcher_and_creates_normalized_point(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    denied = await client.post(
+        "/api/pedidos",
+        json={"address": "cra 25 num 4 sur 65", "lat": 1.2136, "lng": -77.2811, "orderId": "P-1"},
+    )
+    assert denied.status_code == 401
+
+    created = await client.post(
+        "/api/pedidos",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={
