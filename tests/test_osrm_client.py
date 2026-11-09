@@ -73,3 +73,78 @@ async def test_osrm_normalizes_seconds_to_minutes_and_requests_road_geometry() -
     }
     assert requests[0].url.params["radiuses"] == f"{OSRM_MAX_SNAP_DISTANCE_METERS};50"
     assert requests[1].url.params["geometries"] == "geojson"
+
+
+@pytest.mark.asyncio
+async def test_osrm_distinguishes_rate_limit_and_http_errors_with_body() -> None:
+    async with OsrmClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(429, text="too many"))
+    ) as client:
+        with pytest.raises(OsrmRateLimitError, match="too many"):
+            await client.get_route(COORDINATES)
+
+    async with OsrmClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(500, text="upstream"))
+    ) as client:
+        with pytest.raises(OsrmClientError, match="HTTP 500.*upstream") as captured:
+            await client.get_route(COORDINATES)
+    assert captured.value.status == 500
+    assert captured.value.response_body == "upstream"
+
+
+@pytest.mark.asyncio
+async def test_osrm_converts_http_timeout_to_typed_error() -> None:
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("request took too long", request=request)
+
+    async with OsrmClient(
+        timeout_seconds=0.01,
+        transport=httpx.MockTransport(timeout_handler),
+    ) as client:
+        with pytest.raises(OsrmTimeoutError, match="10 ms"):
+            await client.get_route(COORDINATES)
+
+
+@pytest.mark.asyncio
+async def test_osrm_rejects_unsnapped_or_skipped_waypoints() -> None:
+    too_far = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            json={
+                "code": "Ok",
+                "waypoints": [
+                    {"location": list(COORDINATES[0]), "distance": 4},
+                    {
+                        "location": list(COORDINATES[1]),
+                        "distance": OSRM_MAX_SNAP_DISTANCE_METERS + 1,
+                    },
+                ],
+                "routes": [
+                    {
+                        "distance": 100,
+                        "duration": 60,
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [
+                                list(COORDINATES[0]),
+                                list(COORDINATES[1]),
+                            ],
+                        },
+                    }
+                ],
+            },
+        )
+    )
+    async with OsrmClient(transport=too_far) as client:
+        with pytest.raises(OsrmClientError, match="within 50 m"):
+            await client.get_route(COORDINATES)
+
+    skipped_stop_coordinates = [
+        (-77.2811, 1.2136),
+        (-77.2811, 1.2146),
+        (-77.28, 1.2146),
+    ]
+    skipped_stop = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            json={
