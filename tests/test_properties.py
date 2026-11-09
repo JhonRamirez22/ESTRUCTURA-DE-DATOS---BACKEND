@@ -38,3 +38,43 @@ def test_refinar_siempre_devuelve_una_permutacion_valida_y_no_peor(
     assert result.route[0] == 0
     assert sorted(result.route) == start
     assert result.cost <= route_cost(matrix, start) or math.isinf(route_cost(matrix, start))
+    if not math.isinf(route_cost(matrix, start)):
+        assert math.isfinite(result.cost)
+
+
+@given(st.text(max_size=400))
+def test_normalizar_direcciones_nunca_falla(text: str) -> None:
+    normalized = normalize_pasto_address(text)
+    assert isinstance(normalized, str)
+    assert isinstance(contains_foreign_city_reference(normalized), bool)
+
+
+@given(st.text(max_size=400))
+def test_texto_plano_acepta_o_rechaza_con_valueerror(text: str) -> None:
+    try:
+        value = plain_text(text, max_length=100, field="campo")
+    except ValueError:
+        return
+    assert len(value) <= 100
+    assert "\x00" not in value
+    assert "<" not in value or ">" not in value or "script" not in value.lower()
+
+
+@given(st.text(alphabet=st.characters(min_codepoint=32, max_codepoint=126), max_size=300))
+def test_identidad_de_cliente_es_acotada_y_nunca_falla(forwarded: str) -> None:
+    request = Request({
+        "type": "http", "method": "GET", "path": "/", "query_string": b"",
+        "headers": [(b"x-forwarded-for", forwarded.encode("ascii"))],
+        "client": ("127.0.0.1", 1234),
+    })
+    key = client_key(request)
+    assert isinstance(key, str) and 0 < len(key) <= 64
+
+
+@pytest.mark.parametrize("header", ["", "   ", ",,,", ", ,"])
+def test_cabecera_vacia_cae_en_la_conexion_directa(header: str) -> None:
+    request = Request({
+        "type": "http", "method": "GET", "path": "/", "query_string": b"",
+        "headers": [(b"x-forwarded-for", header.encode())], "client": ("10.1.2.3", 1),
+    })
+    assert client_key(request) == "10.1.2.3"
