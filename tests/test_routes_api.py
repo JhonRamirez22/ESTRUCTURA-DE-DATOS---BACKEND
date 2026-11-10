@@ -81,3 +81,86 @@ class FakeRouteProvider:
             "geometry_provider": "OSRM",
             "distance_meters": 2_100,
             "duration_minutes": 12.5,
+        }
+
+
+class FakeOrsMatrixProvider(FakeMatrixProvider):
+    async def get_duration_matrix(self, coordinates: Sequence[Coordinate]) -> dict[str, Any]:
+        result = await super().get_duration_matrix(coordinates)
+        result["source"] = "ors"
+        result.pop("distances_meters", None)
+        return result
+
+
+class FakeOrsRouteProvider(FakeRouteProvider):
+    async def get_route(self, coordinates: Sequence[Coordinate]) -> RouteResult:
+        result = await super().get_route(coordinates)
+        result["geometry_provider"] = "ORS"
+        return result
+
+
+class FakeRouteTrafficAdvisor:
+    def __init__(self) -> None:
+        self.requests = 0
+
+    async def get_route_advice(self, _request: object) -> RouteTrafficAdvice:
+        self.requests += 1
+        return RouteTrafficAdvice(
+            adjustments=(
+                RouteTrafficAdjustment("stop-0", "stop-1", traffic_multiplier=1.4),
+            ),
+            model="unit-test-model",
+        )
+
+
+class FakeTomTomTrafficProvider:
+    def __init__(self) -> None:
+        self.coordinates: list[Coordinate] = []
+
+    async def get_flow_segment(self, coordinate: Coordinate) -> TrafficData:
+        self.coordinates.append(coordinate)
+        return TrafficData(
+            current_speed_kmh=20,
+            free_flow_speed_kmh=40,
+            current_travel_time_seconds=120,
+            free_flow_travel_time_seconds=60,
+            confidence=0.9,
+            road_closure=False,
+            traffic_ratio=0.5,
+            traffic_level=TrafficLevel.ALTO,
+            travel_time_multiplier=2.0,
+            timestamp=datetime.now(UTC),
+        )
+
+
+@pytest_asyncio.fixture
+async def session_factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'routes.sqlite'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(connection: Connection, _record: object) -> None:
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        yield factory
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def client(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[httpx.AsyncClient]:
+    monkeypatch.setenv("AUTH_SECRET", _SESSION_SECRET)
+    monkeypatch.setenv("NODE_ENV", "test")
+    monkeypatch.setenv("AI_ALLOW_LOCATION_DATA_SHARING", "false")
+    get_settings.cache_clear()
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        async with session_factory() as session:
