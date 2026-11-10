@@ -73,3 +73,78 @@ def test_spatial_grid_matches_brute_force_nearest() -> None:
         assert all(math.isclose(a[1], b[0], rel_tol=1e-9) for a, b in pairs)
 
 
+def test_spatial_grid_radius_exclude_remove_and_empty() -> None:
+    grid: SpatialGrid[str] = SpatialGrid()
+    assert grid.nearest(point(1.2, -77.2), 3) == []
+    grid.insert("a", point(1.2000, -77.2000))
+    grid.insert("b", point(1.2001, -77.2000))
+    grid.insert("far", point(1.3000, -77.2000))
+    near = grid.nearest(point(1.2000, -77.2000), 5, max_metres=500, exclude="a")
+    assert [i for i, _ in near] == ["b"]
+    grid.remove("b")
+    assert "b" not in grid and len(grid) == 2
+    assert [i for i, _ in grid.nearest(point(1.2, -77.2), 5)] == ["a", "far"]
+    grid.insert("a", point(1.2500, -77.2))  # re-inserting moves it
+    assert len(grid) == 2
+
+
+# ---- domain and matrix -------------------------------------------------------------------
+
+
+def test_domain_validation_and_fleet_index() -> None:
+    courier = point(1.21, -77.28)
+    with pytest.raises(ValueError):
+        route("r", courier, [("s", 1.2, -77.2), ("s", 1.3, -77.3)])
+    with pytest.raises(ValueError):  # a locked stop after an unlocked one
+        Route(
+            "r", CourierState("c", courier), [Stop("a", courier), Stop("b", courier, locked=True)]
+        )
+    one = route("r1", courier, [("a", 1.2, -77.2)])
+    two = route("r2", courier, [("a", 1.3, -77.3)])
+    with pytest.raises(ValueError):
+        Fleet([one, two])  # the same stop in two routes
+    fleet = Fleet([one, route("r2", courier, [("b", 1.3, -77.3)])])
+    index = fleet.index()
+    assert index.courier_node == {"r1": 0, "r2": 1} and index.stop_node == {"a": 2, "b": 3}
+    assert len(index.points) == 4
+
+
+def test_cost_matrix_rejects_bad_input_and_treats_none_as_unreachable() -> None:
+    with pytest.raises(ValueError):
+        CostMatrix([[0, 1], [1]])
+    with pytest.raises(ValueError):
+        CostMatrix([[0, -1], [1, 0]])
+    matrix = CostMatrix([[0, None, 3], [2, 0, 1], [4, 5, 0]])
+    assert matrix.cost(0, 1) == math.inf and matrix.path_cost([0, 1, 2]) == math.inf
+    assert matrix.path_cost([0, 2, 1]) == 3 + 5
+    assert matrix.submatrix([2, 0]).rows == [[0.0, 4], [3, 0.0]]
+
+
+# ---- solvers -----------------------------------------------------------------------------
+
+
+def random_matrix(rng: random.Random, size: int) -> CostMatrix:
+    coords = [(rng.random(), rng.random()) for _ in range(size)]
+    return CostMatrix([[math.dist(a, b) * 10 for b in coords] for a in coords])
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_pipeline_never_worse_keeps_origin_and_nodes(seed: int) -> None:
+    rng = random.Random(seed)
+    size = rng.randint(3, 11)
+    matrix = random_matrix(rng, size)
+    order = [0, *rng.sample(range(1, size), size - 1)]
+    result = RoutePipeline.standard().improve(matrix, order)
+    assert result.order[0] == 0 and sorted(result.order) == sorted(order)
+    assert result.cost <= matrix.path_cost(order) + 1e-9
+    assert math.isclose(result.cost, matrix.path_cost(result.order))
+
+
+def test_pipeline_handles_tiny_and_disconnected_routes() -> None:
+    matrix = CostMatrix([[0, 1], [1, 0]])
+    assert RoutePipeline.standard().improve(matrix, [0, 1]).order == [0, 1]
+    broken = CostMatrix([[0, None, None], [None, 0, 1], [None, 2, 0]])
+    result = RoutePipeline.standard().improve(broken, [0, 1, 2])
+    assert result.order[0] == 0 and sorted(result.order) == [0, 1, 2]
+    with pytest.raises(ValueError):
+        RoutePipeline([])
