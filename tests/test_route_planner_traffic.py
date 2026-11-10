@@ -58,3 +58,63 @@ async def test_route_optimizer_scales_only_measured_osrm_legs() -> None:
         route,
         coordinates,
         geometry,
+    )
+
+    assert adjusted[0][1] == 6
+    assert adjusted[1][2] == 9
+    assert adjusted[0][2] == 8
+    assert len(provider.coordinates) == 2
+    assert summary["applied"] is True
+    assert summary["sampledSegments"] == 2
+    assert summary["coverageRatio"] == 1
+
+
+@pytest.mark.asyncio
+async def test_closed_road_is_excluded_from_matrix_for_reoptimization() -> None:
+    matrix: list[list[float | None]] = [[0, 4], [5, 0]]
+    coordinates: list[Coordinate] = [(-77.2811, 1.2136), (-77.2800, 1.2136)]
+    geometry: GeoJsonLineString = {"type": "LineString", "coordinates": coordinates}
+
+    adjusted, summary = await _apply_live_traffic_to_route(
+        FakeTrafficProvider(_traffic(closed=True)),
+        matrix,
+        [0, 1],
+        coordinates,
+        geometry,
+    )
+
+    assert adjusted[0][1] is None
+    assert summary["closedSegments"] == 1
+    assert summary["applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_preserves_the_road_matrix() -> None:
+    matrix: list[list[float | None]] = [[0, 4], [5, 0]]
+    coordinates: list[Coordinate] = [(-77.2811, 1.2136), (-77.2800, 1.2136)]
+    geometry: GeoJsonLineString = {"type": "LineString", "coordinates": coordinates}
+
+    adjusted, summary = await _apply_live_traffic_to_route(
+        FakeTrafficProvider(TimeoutError("simulated timeout")),
+        matrix,
+        [0, 1],
+        coordinates,
+        geometry,
+    )
+
+    assert adjusted == matrix
+    assert summary["applied"] is False
+    assert summary["errorSegments"] == 1
+    warning = summary["warning"]
+    assert isinstance(warning, str)
+    assert "costo base" in warning
+
+
+def test_traffic_history_hour_is_bogota_local_time_not_utc() -> None:
+    from datetime import datetime
+
+    from app.services.route_planner import _bogota_hour
+
+    assert _bogota_hour(datetime(2026, 11, 20, 22, 30)) == 17  # 22:30 UTC = 17:30 en Bogotá
+    assert _bogota_hour(datetime(2026, 11, 21, 3, 0)) == 22  # cruza la medianoche UTC
+    assert _bogota_hour(datetime(2026, 11, 20, 5, 0)) == 0
