@@ -60,3 +60,64 @@ class _RouteClient:
 def _route_result(provider: str = "OSRM") -> RouteResult:
     return {
         "geometry": {"type": "LineString", "coordinates": list(COORDINATES)},
+        "geometry_provider": provider,  # type: ignore[typeddict-item]
+        "distance_meters": 1_500,
+        "duration_minutes": 6,
+        "snap_distances_meters": [4, 4],
+    }
+
+
+@pytest.fixture(autouse=True)
+def _clear_module_caches() -> None:
+    clear_matrix_cache()
+    clear_route_cache()
+
+
+@pytest.mark.asyncio
+async def test_matrix_cache_hit_rounding_ttl_and_ordered_key() -> None:
+    current_time = 100.0
+    client = _MatrixClient(MATRIX)
+    provider = CachedMatrixProvider(client, ttl_seconds=5, now=lambda: current_time)
+    jittered = [(-77.2811009, 1.2136009), (-77.2800009, 1.2140009)]
+
+    first = await provider.get_duration_matrix(COORDINATES)
+    second = await provider.get_duration_matrix(jittered)
+    assert first["source"] == second["source"] == "osrm"
+    assert client.calls == 1
+    assert build_matrix_cache_key(COORDINATES) == build_matrix_cache_key(jittered)
+    reversed_coordinates = list(reversed(COORDINATES))
+    assert build_matrix_cache_key(COORDINATES) != build_matrix_cache_key(reversed_coordinates)
+
+    current_time = 106.0
+    await provider.get_duration_matrix(COORDINATES)
+    assert client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_matrix_cache_evicts_least_recently_used_with_doubly_linked_list() -> None:
+    client = _MatrixClient(MATRIX)
+    provider = CachedMatrixProvider(client, max_entries=2)
+    first = COORDINATES
+    second: list[Coordinate] = [(-77.27, 1.2136), (-77.269, 1.214)]
+    third: list[Coordinate] = [(-77.26, 1.2136), (-77.259, 1.214)]
+
+    await provider.get_duration_matrix(first)
+    await provider.get_duration_matrix(second)
+    await provider.get_duration_matrix(first)
+    await provider.get_duration_matrix(third)
+    await provider.get_duration_matrix(first)
+    await provider.get_duration_matrix(second)
+
+    assert client.calls == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [OsrmRateLimitError("limit"), OsrmTimeoutError(10)],
+)
+async def test_matrix_cache_uses_uncached_fallback_for_recoverable_errors(
+    error: Exception,
+) -> None:
+    client = _MatrixClient(error)
+    provider = CachedMatrixProvider(client)
