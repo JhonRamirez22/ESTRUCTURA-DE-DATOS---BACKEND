@@ -51,3 +51,56 @@ def test_tomtom_response_is_normalized_with_documented_units() -> None:
         (0.34, TrafficLevel.MUY_ALTO),
         (None, TrafficLevel.DESCONOCIDO),
     ],
+)
+def test_traffic_levels_follow_configured_speed_ratio_thresholds(
+    ratio: float | None,
+    expected: TrafficLevel,
+) -> None:
+    assert classify_traffic(ratio, False) == expected
+
+
+def test_road_closure_overrides_speed_classification() -> None:
+    data = parse_tomtom_flow_response(_payload(road_closure=True))
+
+    assert data.traffic_level == TrafficLevel.CERRADO
+    assert data.road_closure is True
+
+
+def test_zero_free_flow_speed_is_unknown_without_division_by_zero() -> None:
+    data = parse_tomtom_flow_response(_payload(free_flow_speed=0, free_flow_time=0))
+
+    assert data.traffic_ratio is None
+    assert data.travel_time_multiplier is None
+    assert data.traffic_level == TrafficLevel.DESCONOCIDO
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"flowSegmentData": {"currentSpeed": float("nan")}},
+        {
+            "flowSegmentData": {
+                "currentSpeed": 10,
+                "freeFlowSpeed": 20,
+                "currentTravelTime": 12,
+                "freeFlowTravelTime": 10,
+                "confidence": 1.1,
+                "roadClosure": False,
+            }
+        },
+        {
+            "flowSegmentData": {
+                "currentSpeed": 10,
+                "freeFlowSpeed": 20,
+                "currentTravelTime": 12,
+                "freeFlowTravelTime": 10,
+                "confidence": 0.9,
+                "roadClosure": "false",
+            }
+        },
+    ],
+)
+def test_invalid_tomtom_responses_are_rejected(payload: object) -> None:
+    with pytest.raises(ValueError):
+        parse_tomtom_flow_response(payload)
