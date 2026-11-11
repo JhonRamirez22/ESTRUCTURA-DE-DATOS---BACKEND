@@ -140,3 +140,73 @@ async def test_h2_x_forwarded_for_falsificado_no_evade_el_limite_por_cliente(
     codes = []
     for index in range(6):
         response = await client.post(
+            "/api/v1/solicitudes",
+            headers={"X-Forwarded-For": f"10.9.9.{index}, 198.51.100.20"},
+            json=_request_body(),
+        )
+        codes.append(response.status_code)
+    assert codes.count(201) == 3, codes
+    assert set(codes[3:]) == {429}
+
+
+@pytest.mark.asyncio
+async def test_h2_clientes_distintos_detras_de_la_infraestructura_no_se_estorban(
+    client: httpx.AsyncClient,
+) -> None:
+    for index in range(3):
+        first = await client.post(
+            "/api/v1/solicitudes",
+            headers={"X-Forwarded-For": f"203.0.113.{index}, 198.51.100.20"},
+            json=_request_body(),
+        )
+        assert first.status_code in {201, 429}
+    other = await client.post(
+        "/api/v1/solicitudes",
+        headers={"X-Forwarded-For": "198.51.100.99"},
+        json=_request_body(),
+    )
+    assert other.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_h3_con_candado_de_origen_solo_pasa_el_proxy_autorizado(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ORIGIN_AUTH_SECRET", "origen-compartido-con-el-proxy-de-vercel-32b")
+    get_settings.cache_clear()
+    direct = await client.get("/api/v1/seguimiento", params={"guia": "x"})
+    assert direct.status_code == 403
+    assert direct.json()["error"] == "Origen no autorizado."
+    wrong = await client.get(
+        "/api/v1/seguimiento", params={"guia": "x"}, headers={"X-Origin-Auth": "otro-valor"}
+    )
+    assert wrong.status_code == 403
+    allowed = await client.get(
+        "/api/v1/seguimiento",
+        params={"guia": "x"},
+        headers={"X-Origin-Auth": "origen-compartido-con-el-proxy-de-vercel-32b"},
+    )
+    assert allowed.status_code in {400, 404}
+    # El balanceador comprueba la salud sin conocer el secreto.
+    assert (await client.get("/api/v1/health")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_h3_con_candado_se_confia_en_el_primer_salto_que_escribe_vercel(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "origen-compartido-con-el-proxy-de-vercel-32b"
+    monkeypatch.setenv("ORIGIN_AUTH_SECRET", secret)
+    get_settings.cache_clear()
+    codes = []
+    for index in range(4):
+        response = await client.post(
+            "/api/v1/solicitudes",
+            headers={
+                "X-Origin-Auth": secret,
+                "X-Forwarded-For": f"203.0.113.{index}, 76.76.21.21",
+            },
+            json=_request_body(),
+        )
+        codes.append(response.status_code)
+    assert codes == [201, 201, 201, 201]  # cada cliente real tiene su propio contador
