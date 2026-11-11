@@ -60,3 +60,65 @@ function login(email) {
   loginTime.add(res.timings.duration);
   check(res, { 'login 200': (r) => r.status === 200 });
   return res.status === 200 ? res.headers['X-Csrf-Token'] : null;
+}
+
+let session = null; // por VU
+
+export default function () {
+  const role = __VU % 100;
+  if (role < 70) courier();
+  else if (role < 85) dispatcher();
+  else anonymous();
+}
+
+function courier() {
+  if (!session) {
+    const n = (__VU * 7) % COURIERS;
+    const csrf = login(`c${n}@carga.co`);
+    if (!csrf) { sleep(2); return; }
+    session = { csrf, n };
+  }
+  const now = Date.now();
+  if (now - (session.lastGps || 0) >= 5000) {
+  session.lastGps = now;
+  const gps = http.post(`${BASE}/api/v1/repartidores/me/ubicacion`,
+    JSON.stringify({ lat: 1.2136 + Math.random() * 1e-3, lng: -77.2811 + Math.random() * 1e-3 }),
+    { headers: jsonHeaders({ 'X-CSRF-Token': session.csrf }), tags: { kind: 'write' } });
+  track(gps);
+  check(gps, { 'gps ok o limitada': (r) => r.status === 201 || r.status === 429 });
+  }
+  const me = http.get(`${BASE}/api/v1/repartidores/me`, { tags: { kind: 'read' } });
+  track(me); readTime.add(me.timings.duration);
+  const routes = http.get(`${BASE}/api/v1/rutas`, { tags: { kind: 'read' } });
+  track(routes); readTime.add(routes.timings.duration);
+  check(routes, { 'rutas 200': (r) => r.status === 200 });
+  sleep(2 + Math.random() * 3);
+}
+
+function dispatcher() {
+  if (!session) {
+    const csrf = login(`d${__VU % DISPATCHERS}@carga.co`);
+    if (!csrf) { sleep(2); return; }
+    session = { csrf };
+  }
+  for (const path of ['/api/v1/pedidos', '/api/v1/rutas', '/api/v1/repartidores']) {
+    const res = http.get(`${BASE}${path}`, { tags: { kind: 'read' } });
+    track(res); readTime.add(res.timings.duration);
+    check(res, { 'lectura 200 o limitada': (r) => r.status === 200 || r.status === 429 });
+  }
+  sleep(3 + Math.random() * 4);
+}
+
+function anonymous() {
+  const n = Math.floor(Math.random() * COURIERS);
+  const res = http.get(`${BASE}/api/v1/seguimiento?guia=guia-carga-${n}-${Math.floor(Math.random() * 5)}`,
+    { headers: { 'X-Forwarded-For': `198.51.100.${(__VU % 250) + 1}` }, tags: { kind: 'read' } });
+  track(res); readTime.add(res.timings.duration);
+  check(res, { 'seguimiento 200 o limitado': (r) => r.status === 200 || r.status === 429 });
+  const req = http.post(`${BASE}/api/v1/solicitudes`,
+    JSON.stringify({ address: `Calle 18 # 22-${__VU}`, lat: 1.2136, lng: -77.2811 }),
+    { headers: jsonHeaders(), tags: { kind: 'write' } });
+  track(req);
+  check(req, { 'solicitud creada o limitada': (r) => [201, 429, 503].includes(r.status) });
+  sleep(2 + Math.random() * 3);
+}
