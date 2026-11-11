@@ -27,3 +27,31 @@ def _create(structure: str) -> Any:
     if structure == "min_heap":
         return MinHeap[dict[str, Any], str](
             compare=lambda left, right: left["priority"] - right["priority"],
+            get_id=lambda item: item["id"],
+        )
+    raise AssertionError(f"Estructura desconocida en vectores: {structure}")
+
+
+def _call(target: Any, call: str, args: list[Any]) -> Any:
+    if call == "size":
+        return len(target)
+    if call == "to_array":
+        return list(target)
+    return getattr(target, call)(*args)
+
+
+def _expects_error(expected: Any) -> bool:
+    return isinstance(expected, dict) and expected.get("throws") is True
+
+
+@pytest.mark.parametrize("case", CASES, ids=[case["name"] for case in CASES])
+def test_shared_vectors_match_typescript_behavior(case: dict[str, Any]) -> None:
+    target = _create(case["structure"])
+    for operation in case["ops"]:
+        args = operation.get("args", [])
+        expected = operation["expect"]
+        if _expects_error(expected):
+            with pytest.raises((ValueError, KeyError)):
+                _call(target, operation["call"], args)
+        else:
+            assert _call(target, operation["call"], args) == expected, operation["call"]
