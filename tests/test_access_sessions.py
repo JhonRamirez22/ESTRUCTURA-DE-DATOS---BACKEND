@@ -121,3 +121,64 @@ async def test_roles_and_courier_are_read_from_database_each_time(session: Async
     await session.flush()
     owner.role, owner.courier_id = "courier", courier.id
     await session.flush()
+    identity = await resolve_access_session(session, token, now=NOW)
+    assert identity is not None and identity.role == "courier"
+    assert identity.courier_id == courier.id
+
+
+@pytest.mark.asyncio
+async def test_logout_revokes_one_session_password_change_revokes_all(
+    session: AsyncSession,
+) -> None:
+    owner = await account(session)
+    first = await create_access_session(session, account_id=owner.id, now=NOW)
+    second = await create_access_session(session, account_id=owner.id, now=NOW)
+    await revoke_access_session(session, first)
+    assert await resolve_access_session(session, first, now=NOW) is None
+    assert await resolve_access_session(session, second, now=NOW) is not None
+    await revoke_account_sessions(session, owner.id)
+    assert await resolve_access_session(session, second, now=NOW) is None
+
+
+@pytest.mark.asyncio
+async def test_tracking_session_is_limited_to_one_order_and_not_staff(
+    session: AsyncSession,
+) -> None:
+    point = DeliveryPoint(address="Test", lat=1.21, lng=-77.28, order_id="test-order")
+    session.add(point)
+    await session.flush()
+    token = await create_access_session(session, delivery_point_id=point.id, now=NOW)
+    assert await resolve_access_session(session, token, now=NOW) is None
+    identity = await resolve_access_session(session, token, tracking=True, now=NOW)
+    assert identity is not None and identity.delivery_point_id == point.id
+    assert identity.role == "customer" and identity.account_id is None
+    assert await resolve_access_session(
+        session, token, tracking=True, now=NOW + timedelta(minutes=15)
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_staff_token_cannot_be_used_as_customer_capability(session: AsyncSession) -> None:
+    owner = await account(session)
+    token = await create_access_session(session, account_id=owner.id, now=NOW)
+    assert await resolve_access_session(session, token, tracking=True, now=NOW) is None
+
+
+@pytest.mark.asyncio
+async def test_session_requires_exactly_one_principal(session: AsyncSession) -> None:
+    with pytest.raises(ValueError, match="único pedido"):
+        await create_access_session(session)
+    with pytest.raises(ValueError, match="único pedido"):
+        await create_access_session(session, account_id=uuid4(), delivery_point_id=uuid4())
+    assert await session.scalar(select(AccessSession)) is None
+
+
+def test_csrf_is_bound_to_session_and_requires_strong_secret() -> None:
+    proof = csrf_token("session-a", SECRET)
+    assert csrf_matches("session-a", proof, SECRET)
+    assert not csrf_matches("session-b", proof, SECRET)
+    assert not csrf_matches("session-a", None, SECRET)
+    assert not csrf_matches("session-a", "x" * 64, SECRET)
+    assert not csrf_matches("session-a", "é" * 64, SECRET)
+    with pytest.raises(ValueError, match="32 bytes"):
+        csrf_token("session-a", "short")
