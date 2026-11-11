@@ -74,3 +74,79 @@ class FakeRouteProvider:
         }
 
 
+class FakeTrafficProvider:
+    async def get_flow_segment(self, coordinate: Coordinate) -> TrafficData:
+        del coordinate
+        return TrafficData(
+            current_speed_kmh=20,
+            free_flow_speed_kmh=40,
+            current_travel_time_seconds=90,
+            free_flow_travel_time_seconds=60,
+            confidence=0.9,
+            road_closure=False,
+            traffic_ratio=0.5,
+            traffic_level=TrafficLevel.ALTO,
+            travel_time_multiplier=1.5,
+            timestamp=datetime.now(UTC),
+            cache_status="LIVE",
+        )
+
+
+@pytest_asyncio.fixture
+async def session_factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'tracking.sqlite'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_foreign_keys(connection: Connection, _record: object) -> None:
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        yield factory
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def providers() -> AsyncIterator[tuple[FakeMatrixProvider, FakeRouteProvider]]:
+    matrix = FakeMatrixProvider()
+    route = FakeRouteProvider()
+    app.dependency_overrides[get_routing_providers] = lambda: (matrix, route)
+    app.dependency_overrides[get_traffic_service] = lambda: None
+    try:
+        yield matrix, route
+    finally:
+        app.dependency_overrides.pop(get_routing_providers, None)
+        app.dependency_overrides.pop(get_traffic_service, None)
+
+
+@pytest_asyncio.fixture
+async def client(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[httpx.AsyncClient]:
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_traffic_service] = lambda: None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(get_traffic_service, None)
+
+
+@pytest.mark.asyncio
+async def test_tracking_validates_missing_and_unknown_guides(
+    client: httpx.AsyncClient,
+    providers: tuple[FakeMatrixProvider, FakeRouteProvider],
+) -> None:
