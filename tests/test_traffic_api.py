@@ -69,3 +69,73 @@ async def test_traffic_api_is_authenticated_and_returns_units_and_cache_metadata
         get_settings.cache_clear()
 
     assert unauthorized.status_code == 401
+    assert response.status_code == 200
+    assert response.json() == {
+        "currentSpeedKmh": 18,
+        "freeFlowSpeedKmh": 40,
+        "currentTravelTimeSeconds": 120,
+        "freeFlowTravelTimeSeconds": 60,
+        "confidence": 0.9,
+        "roadClosure": False,
+        "trafficRatio": 0.45,
+        "travelTimeMultiplier": 2.0,
+        "trafficLevel": "ALTO",
+        "timestamp": "2026-10-03T00:00:00+00:00",
+        "cacheStatus": "LIVE",
+    }
+    assert response.headers["cache-control"] == "private, no-store, max-age=0"
+
+
+@pytest.mark.asyncio
+async def test_traffic_api_rejects_coordinates_outside_pasto_before_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTH_SECRET", _SESSION_SECRET)
+    get_settings.cache_clear()
+    application = FastAPI()
+    application.dependency_overrides[get_optional_session] = business_identity
+    application.include_router(router, prefix="/api")
+    fake_service = FakeTrafficService()
+    application.dependency_overrides[get_traffic_service] = lambda: fake_service
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                "/api/traffic?lat=4&lon=-70",
+                headers={"Cookie": _cookie("courier")},
+            )
+    finally:
+        application.dependency_overrides.clear()
+        get_settings.cache_clear()
+
+    assert response.status_code == 400
+    assert "solo está disponible dentro de Pasto" in response.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_traffic_api_explains_missing_key_without_provider_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTH_SECRET", _SESSION_SECRET)
+    get_settings.cache_clear()
+    application = FastAPI()
+    application.dependency_overrides[get_optional_session] = business_identity
+    application.include_router(router, prefix="/api")
+    application.dependency_overrides[get_traffic_service] = lambda: None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                "/api/traffic?lat=1.2136&lon=-77.2811",
+                headers={"Cookie": _cookie()},
+            )
+    finally:
+        application.dependency_overrides.clear()
+        get_settings.cache_clear()
+
+    assert response.status_code == 503
+    assert "no está configurado" in response.json()["error"]
