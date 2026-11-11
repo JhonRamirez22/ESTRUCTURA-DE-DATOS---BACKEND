@@ -61,3 +61,66 @@ async def test_png_cache_hit_miss_and_exact_ttl_boundary() -> None:
         clock[0] = 89.999
         cached = await service.get_flow_tile(*pasto_tile())
         assert first == cached and len(calls) == 1
+        clock[0] = 90
+        assert (await service.get_flow_tile(*pasto_tile())).content == PNG
+        assert len(calls) == 2
+    finally:
+        await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_new_refresh_bucket_does_not_reuse_previous_snapshot_within_ttl() -> None:
+    calls = 0
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=PNG, headers={"Content-Type": "image/png"})
+
+    service = TrafficService(api_key="test", transport=httpx.MockTransport(respond))
+    try:
+        await service.get_flow_tile(*pasto_tile(), refresh_bucket=1)
+        await service.get_flow_tile(*pasto_tile(), refresh_bucket=1)
+        await service.get_flow_tile(*pasto_tile(), refresh_bucket=2)
+        assert calls == 2
+    finally:
+        await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_lru_uses_linked_list_and_evicts_least_recent_tile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.services.traffic.TRAFFIC_TILE_CACHE_MAX_ENTRIES", 2)
+    calls: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, content=PNG, headers={"Content-Type": "image/png"})
+
+    service = TrafficService(api_key="test", transport=httpx.MockTransport(respond))
+    z, x, y = pasto_tile(18)
+    try:
+        await service.get_flow_tile(z, x, y)
+        await service.get_flow_tile(z, x + 1, y)
+        await service.get_flow_tile(z, x, y)
+        await service.get_flow_tile(z, x + 2, y)
+        await service.get_flow_tile(z, x + 1, y)
+        assert len(calls) == 4
+    finally:
+        await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_serves_marked_stale_data_only_for_bounded_time() -> None:
+    clock = [0.0]
+    calls = 0
+
+    def respond(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return (
+            httpx.Response(200, content=PNG, headers={"Content-Type": "image/png"})
+            if calls == 1
+            else httpx.Response(429)
+        )
