@@ -166,3 +166,86 @@ async def session_factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[As
     finally:
         await engine.dispose()
 
+
+@pytest_asyncio.fixture
+async def client(
+    session_factory: async_sessionmaker[AsyncSession],
+    routing_providers: tuple[_FakeMatrixProvider, _FakeRouteProvider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[httpx.AsyncClient]:
+    monkeypatch.setenv("AUTH_SECRET", "customer-chat-test-secret-with-at-least-32-bytes")
+    get_settings.cache_clear()
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_routing_providers] = lambda: routing_providers
+    app.dependency_overrides[get_traffic_service] = lambda: None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as test_client:
+            yield test_client
+    finally:
+        get_settings.cache_clear()
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(get_routing_providers, None)
+        app.dependency_overrides.pop(get_traffic_service, None)
+        app.dependency_overrides.pop(get_customer_order_chat, None)
+
+
+@pytest.fixture
+def routing_providers() -> tuple[_FakeMatrixProvider, _FakeRouteProvider]:
+    return _FakeMatrixProvider(), _FakeRouteProvider()
+
+
+async def _create_order(
+    session_factory: async_sessionmaker[AsyncSession], guide: str = "secret-guide-123"
+) -> None:
+    async with session_factory() as session:
+        session.add(
+            DeliveryPoint(
+                id=uuid4(),
+                address="Carrera 25 # 4 sur 65",
+                lat=1.2136,
+                lng=-77.2811,
+                status=DeliveryPointStatus.PENDING,
+                order_id="internal-order-id",
+                tracking_token=guide,
+            )
+        )
+        await session.commit()
+
+
+async def _create_active_order(
+    session_factory: async_sessionmaker[AsyncSession],
+    guide: str,
+    *,
+    location_at: datetime | None = None,
+) -> None:
+    now = location_at or datetime.now(UTC).replace(tzinfo=None)
+    courier = Courier(
+        id=uuid4(),
+        name="Repartidor privado",
+        phone="+573001234567",
+        status=CourierStatus.ON_ROUTE,
+        current_lat=1.213612,
+        current_lng=-77.281145,
+        last_location_at=now,
+    )
+    route = Route(
+        id=uuid4(),
+        courier_id=courier.id,
+        status=RouteStatus.IN_PROGRESS,
+        estimated_duration_minutes=25,
+        estimated_distance_meters=2_000,
+    )
+    point = DeliveryPoint(
+        id=uuid4(),
+        address="Dirección privada del cliente",
+        lat=1.215,
+        lng=-77.279,
+        status=DeliveryPointStatus.EN_ROUTE,
+        order_id=f"internal-{uuid4()}",
+        tracking_token=guide,
