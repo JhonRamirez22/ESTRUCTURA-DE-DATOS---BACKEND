@@ -98,3 +98,52 @@ async def test_sqlalchemy_schema_persists_existing_entities_and_constraints() ->
             courier.location_events.append(LocationEvent(lat=1.2136, lng=-77.2811))
             notification = Notification(
                 kind=NotificationKind.ROUTE_CREATED,
+                recipient_id="dispatcher",
+                title="Ruta creada",
+                message="La ruta de prueba está lista.",
+            )
+            session.add_all([courier, route, point, notification])
+            await session.commit()
+
+            stored_courier = await session.scalar(
+                select(Courier).where(Courier.phone == "3000000000")
+            )
+            stored_point = await session.scalar(
+                select(DeliveryPoint).where(DeliveryPoint.order_id == "TEST-ORDER-1")
+            )
+            assert stored_courier is not None
+            assert stored_courier.status is CourierStatus.AVAILABLE
+            credential = await session.get(CourierCredential, stored_courier.id)
+            event_count = await session.scalar(
+                select(func.count())
+                .select_from(LocationEvent)
+                .where(LocationEvent.courier_id == stored_courier.id)
+            )
+            assert credential is not None
+            assert event_count == 1
+            assert stored_point is not None
+            assert stored_point.route_id == route.id
+            assert stored_point.sequence_index == 0
+
+        async with engine.connect() as connection:
+            table_names = await connection.run_sync(
+                lambda sync_connection: set(inspect(sync_connection).get_table_names())
+            )
+        assert table_names == {
+            "accounts",
+            "access_sessions",
+            "security_audit_events",
+            "courier_credentials",
+            "couriers",
+            "customer_chat_rate_limit_windows",
+            "customer_notification_outbox",
+            "delivery_events",
+            "delivery_points",
+            "location_events",
+        "notifications",
+        "routes",
+        "route_revisions",
+        "traffic_observations",
+    }
+    finally:
+        await engine.dispose()
