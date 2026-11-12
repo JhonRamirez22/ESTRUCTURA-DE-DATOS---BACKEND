@@ -127,3 +127,67 @@ def _cookie(role: str, courier_id: UUID | None = None) -> dict[str, str]:
 async def _seed_route(
     factory: async_sessionmaker[AsyncSession],
     name: str,
+    position: tuple[float, float] | None,
+    stops: list[tuple[str, float, float]],
+    status: RouteStatus = RouteStatus.IN_PROGRESS,
+) -> UUID:
+    courier = Courier(
+        id=uuid4(), name=name, phone=f"+57300{uuid4().int % 10_000_000:07d}",
+        status=CourierStatus.ON_ROUTE,
+        current_lat=position[0] if position else None,
+        current_lng=position[1] if position else None,
+        last_location_at=datetime.now(UTC).replace(tzinfo=None),
+    )
+    route = Route(
+        id=uuid4(), courier_id=courier.id, status=status,
+        estimated_duration_minutes=30, estimated_distance_meters=5000,
+    )
+    async with factory() as session:
+        session.add_all([courier, route])
+        await session.flush()
+        for index, (label, lat, lng) in enumerate(stops):
+            session.add(DeliveryPoint(
+                id=uuid4(), address=label, lat=lat, lng=lng, order_id=f"{name}-{label}",
+                tracking_token=f"t-{uuid4()}", route_id=route.id, sequence_index=index,
+                status=DeliveryPointStatus.EN_ROUTE if index == 0 else DeliveryPointStatus.PENDING,
+            ))
+        await session.commit()
+    return route.id
+
+
+_URL = "/api/v1/optimizaciones/en-vivo"
+
+
+async def _live(client: httpx.AsyncClient) -> httpx.Response:
+    return await client.get(_URL, headers=_cookie("dispatcher"))
+
+
+A_STOPS = [("a1", 1.2005, -77.2990), ("a2", 1.2010, -77.2980), ("x", 1.2005, -77.2505)]
+B_STOPS = [("b1", 1.2000, -77.2490), ("b2", 1.2010, -77.2480)]
+
+
+@pytest.mark.asyncio
+async def test_only_dispatch_can_read_the_live_proposal(setup: Any) -> None:
+    client, _, _ = setup
+    assert (await client.get(_URL)).status_code == 401
+    courier = await client.get(_URL, headers=_cookie("courier", uuid4()))
+    assert courier.status_code in {401, 403}
+
+
+@pytest.mark.asyncio
+async def test_no_active_routes_returns_an_empty_proposal_without_calling_providers(
+    setup: Any,
+) -> None:
+    client, matrix, routes = setup
+    response = await _live(client)
+    body = response.json()
+    assert response.status_code == 200 and body["routes"] == [] and body["changed"] is False
+    assert body["tickSeconds"] == 10.0 and matrix.calls == 0 and routes.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_proposes_moving_a_stop_to_the_nearer_courier_with_geometry_and_scores(
+    setup: Any, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    client, matrix, routes = setup
+    a = await _seed_route(factory, "Ana", (1.2000, -77.3000), A_STOPS)
