@@ -170,3 +170,88 @@ async def client(
         app.dependency_overrides.pop(get_routing_providers, None)
         app.dependency_overrides.pop(get_route_traffic_advisor, None)
         app.dependency_overrides.pop(get_traffic_service, None)
+        get_settings.cache_clear()
+
+
+def _dispatcher_cookie() -> str:
+    token = create_session_token(
+        "dispatcher",
+        int(time()) + SESSION_MAX_AGE_SECONDS,
+        _SESSION_SECRET,
+    )
+    return f"{session_cookie_name('dispatcher')}={token}"
+
+
+@pytest.mark.asyncio
+async def test_proposal_assigns_fresh_available_couriers_without_writing_routes(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    first_courier = await _create_courier(session_factory, latitude=1.2136, longitude=-77.2811)
+    second_courier = await _create_courier(session_factory, latitude=1.22, longitude=-77.27)
+    offline_courier = await _create_courier(
+        session_factory,
+        latitude=1.215,
+        longitude=-77.28,
+        status=CourierStatus.OFFLINE,
+    )
+    first_point = await _create_point(session_factory, latitude=1.214, longitude=-77.28)
+    second_point = await _create_point(session_factory, latitude=1.221, longitude=-77.269)
+
+    response = await client.post(
+        "/api/asignaciones",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={
+            "courierIds": [str(first_courier.id), str(second_courier.id), str(offline_courier.id)],
+            "deliveryPointIds": [str(first_point.id), str(second_point.id)],
+        },
+    )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert {item["courierId"] for item in payload["assignments"]} == {
+        str(first_courier.id),
+        str(second_courier.id),
+    }
+    assert {
+        point_id
+        for assignment in payload["assignments"]
+        for point_id in assignment["deliveryPointIds"]
+    } == {str(first_point.id), str(second_point.id)}
+    assert payload["unassignedDeliveryPointIds"] == []
+    assert payload["ai"]["source"] == "deterministic"
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Route)) == 0
+
+
+@pytest.mark.asyncio
+async def test_proposal_is_dispatcher_only_and_reports_orders_when_no_courier_is_available(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier = await _create_courier(
+        session_factory,
+        latitude=1.2136,
+        longitude=-77.2811,
+        status=CourierStatus.OFFLINE,
+    )
+    point = await _create_point(session_factory, latitude=1.214, longitude=-77.28)
+
+    forbidden = await client.post("/api/asignaciones", json={})
+    response = await client.post(
+        "/api/asignaciones",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={"courierIds": [str(courier.id)], "deliveryPointIds": [str(point.id)]},
+    )
+
+    assert forbidden.status_code == 401
+    assert response.status_code == 200
+    assert response.json()["assignments"] == []
+    assert response.json()["unassignedDeliveryPointIds"] == [str(point.id)]
+
+
+@pytest.mark.asyncio
+async def test_proposal_does_not_call_ai_or_persist_routes_before_dispatch(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
