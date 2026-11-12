@@ -94,3 +94,50 @@ async def test_low_confidence_traffic_keeps_the_verified_road_time() -> None:
         route_id=uuid4(),
         next_stop_id=uuid4(),
         start=(-77.2811, 1.2136),
+        end=(-77.279, 1.215),
+        base_duration_minutes=11,
+        base_distance_meters=1_000,
+        route_provider=_RouteProvider(),
+        traffic_provider=_TrafficProvider(_traffic(confidence=0.2)),
+    )
+
+    assert estimate.duration_minutes == 8
+    assert not estimate.applied
+    assert "factor confiable" in (estimate.warning or "")
+
+
+@pytest.mark.asyncio
+async def test_reported_closure_removes_the_eta_for_the_next_leg() -> None:
+    estimate = await estimate_first_leg_with_traffic(
+        route_id=uuid4(),
+        next_stop_id=uuid4(),
+        start=(-77.2811, 1.2136),
+        end=(-77.279, 1.215),
+        base_duration_minutes=11,
+        base_distance_meters=1_000,
+        route_provider=_RouteProvider(),
+        traffic_provider=_TrafficProvider(_traffic(road_closure=True)),
+    )
+
+    assert estimate.duration_minutes is None
+    assert estimate.applied and estimate.closed
+    assert "posible cierre" in (estimate.warning or "")
+
+
+@pytest.mark.asyncio
+async def test_tomtom_error_keeps_the_base_time_and_explicit_warning() -> None:
+    estimate = await estimate_first_leg_with_traffic(
+        route_id=uuid4(),
+        next_stop_id=uuid4(),
+        start=(-77.2811, 1.2136),
+        end=(-77.279, 1.215),
+        base_duration_minutes=11,
+        base_distance_meters=1_000,
+        route_provider=_RouteProvider(),
+        traffic_provider=_TrafficProvider(TimeoutError("provider secret")),
+    )
+
+    assert estimate.duration_minutes == 8
+    assert not estimate.applied
+    assert "no respondió" in (estimate.warning or "")
+    assert "provider secret" not in (estimate.warning or "")
