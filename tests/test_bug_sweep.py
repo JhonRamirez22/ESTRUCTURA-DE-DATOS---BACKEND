@@ -108,3 +108,57 @@ async def test_h4_traffic_history_failure_does_not_break_the_dispatch_transactio
 ) -> None:
     from uuid import uuid4
 
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.db.base import Base
+    from app.models import TrafficObservation
+    from app.services import route_planner
+    from app.settings import get_settings
+
+    monkeypatch.setenv("TRAFFIC_HISTORY_ENABLED", "true")
+    get_settings.cache_clear()
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/h4.sqlite")
+    async with engine.begin() as connection:
+        tables = [t for t in Base.metadata.sorted_tables if t.name != "traffic_observations"]
+        await connection.run_sync(lambda c: Base.metadata.create_all(c, tables=tables))
+    observation = {
+        "fromStopId": "stop-0", "toStopId": "stop-1", "trafficMultiplier": 1.8,
+        "level": "ALTO", "roadClosure": False, "point": [-77.28, 1.21],
+        "observedAt": "2026-10-26T15:00:00+00:00",
+    }
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+            # La tabla no existe: antes de la corrección esto lanzaba y rompía la transacción.
+            await route_planner._persist_traffic_history(
+                session, uuid4(), {"observations": [observation]}
+            )
+            await session.commit()
+            await session.execute(
+                __import__("sqlalchemy").text("select 1")
+            )  # la sesión sigue utilizable
+    finally:
+        await engine.dispose()
+        get_settings.cache_clear()
+    assert TrafficObservation.__tablename__ == "traffic_observations"
+
+
+# --- H2b: una búsqueda de dirección sin candidatos no se queda en caché -----------------
+@pytest.mark.asyncio
+async def test_h2_empty_address_lookup_is_not_cached() -> None:
+    order_requests._LOOKUP_CACHE.clear()
+    assert order_requests.should_cache_lookup({"candidates": [], "warning": "x"}) is False
+    assert order_requests.should_cache_lookup({"candidates": [{"lat": 1}], "warning": None}) is True
+
+
+# --- H7: el agrupamiento compara todos los pares: acotar la entrada ---------------------
+def test_h7_group_input_is_capped_so_the_event_loop_is_not_blocked() -> None:
+    pending = [
+        li.PendingLocation(
+            ident=f"id-{i}", alias=f"p-{i}", lat=1.2136 + (i % 40) * 0.0002,
+            lng=-77.2811 + (i // 40) * 0.0002,
+        )
+        for i in range(1000)
+    ]
+    groups = li.build_groups(pending)
+    used = {member for group in groups for member in group["members"]}
+    assert len(used) <= li.MAX_GROUP_INPUT
