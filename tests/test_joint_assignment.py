@@ -106,3 +106,57 @@ def test_no_manda_un_pedido_a_quien_no_puede_llegar() -> None:
     )
     assert "p90" not in result.assignments["B"]
 
+
+def test_sin_repartidores_o_con_uno_no_cambia_nada() -> None:
+    matrix: list[list[float | None]] = [[0.0, 5.0], [5.0, 0.0]]
+    result = improve_assignment(matrix, {"A": 0}, {"p": 1}, {"A": ["p"]})
+    assert result.assignments == {"A": ["p"]} and result.moves == []
+    empty = improve_assignment(matrix, {"A": 0}, {"p": 1}, {})
+    assert empty.assignments == {}
+
+
+def test_never_piles_every_order_on_one_courier_even_if_that_minimises_total_minutes() -> None:
+    from app.core.optimization.joint_assignment import improve_assignment
+
+    # 4 repartidores lejos (14 min a cualquier pedido) y pedidos pegados entre sí (1 min):
+    # el costo total mínimo es un solo repartidor con todo, pero eso anula el reparto.
+    couriers, orders = 4, 12
+    size = couriers + orders
+    matrix: list[list[float | None]] = [[0.0] * size for _ in range(size)]
+    for a in range(size):
+        for b in range(size):
+            if a == b:
+                continue
+            courier_leg = a < couriers or b < couriers
+            matrix[a][b] = 14.0 if courier_leg else 1.0
+    courier_index = {f"c{i}": i for i in range(couriers)}
+    order_index = {f"o{i}": couriers + i for i in range(orders)}
+    start = {f"c{i}": [f"o{3 * i + k}" for k in range(3)] for i in range(couriers)}
+    result = improve_assignment(matrix, courier_index, order_index, start)
+    loads = sorted(len(v) for v in result.assignments.values())
+    assert max(loads) <= 4  # floor(12/4 · 1,5)
+    assert sum(loads) == orders
+    assert result.after.objective() <= result.before.objective() + 1e-9
+
+
+def test_real_collapse_case_keeps_the_load_shared_and_everyone_busy() -> None:
+    """Matriz real (4 repartidores, 14 pedidos) donde antes quedaba [0, 0, 0, 14]."""
+    import json
+    from pathlib import Path
+
+    from app.core.optimization.joint_assignment import improve_assignment
+
+    data = json.loads(
+        (Path(__file__).parent / "fixtures" / "joint_assignment_collapse.json").read_text()
+    )
+    couriers = data["couriers"]
+    courier_index = {f"c{i}": i for i in range(couriers)}
+    orders = sum(len(group) for group in data["start"])
+    order_index = {f"o{i}": couriers + i for i in range(orders)}
+    start = {f"c{i}": [f"o{o}" for o in group] for i, group in enumerate(data["start"])}
+    result = improve_assignment(data["matrix"], courier_index, order_index, start)
+    loads = [len(v) for v in result.assignments.values()]
+    assert sum(loads) == orders
+    assert max(loads) <= 5  # floor(14 / 4 · 1,5)
+    assert min(loads) >= 1  # nadie queda sin pedidos
+    assert result.after.objective() <= result.before.objective() + 1e-9
