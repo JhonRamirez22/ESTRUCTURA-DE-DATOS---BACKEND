@@ -97,3 +97,52 @@ async def test_ai_cannot_invent_numbers_or_drop_sur(proposed: str) -> None:
         api_key="test", transport=httpx.MockTransport(respond),
     ), FakeAdvisor(proposed))
     assert result["candidates"] == [] and len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_foreign_provider_results_are_discarded_and_foreign_input_not_sent() -> None:
+    calls: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"results": [
+            candidate(country="EC"), candidate(municipality="Quito"), candidate(lat=4.5),
+        ]})
+
+    geocoder = AddressGeocoder(api_key="test", transport=httpx.MockTransport(respond))
+    assert (await resolve_address("Carrera 25 num 3", geocoder, None))["candidates"] == []
+    assert (await resolve_address("Carrera 25 Quito Ecuador", geocoder, None))["candidates"] == []
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_ai_failure_keeps_manual_alternative_without_fabricating_a_pin() -> None:
+    geocoder = AddressGeocoder(api_key="test", transport=httpx.MockTransport(
+        lambda _: httpx.Response(200, json={"results": []}),
+    ))
+    result = await resolve_address("carera 25 num 3", geocoder, FakeAdvisor(fail=True))
+    assert result["candidates"] == []
+    assert "conserva el texto" in result["warning"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 500])
+async def test_provider_http_error_is_explicit_and_does_not_leak_key(status: int) -> None:
+    geocoder = AddressGeocoder(api_key="test-private-key", transport=httpx.MockTransport(
+        lambda _: httpx.Response(status, text="provider detail"),
+    ))
+    with pytest.raises(AddressGeocoderError) as caught:
+        await resolve_address("Carrera 25 # 3", geocoder, None)
+    assert caught.value.status_code == (429 if status == 429 else 502)
+    assert "test-private-key" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_is_distinct() -> None:
+    def timeout(_: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timeout")
+
+    geocoder = AddressGeocoder(api_key="test", transport=httpx.MockTransport(timeout))
+    with pytest.raises(AddressGeocoderError) as caught:
+        await resolve_address("Carrera 25 # 3", geocoder, None)
+    assert caught.value.status_code == 504
