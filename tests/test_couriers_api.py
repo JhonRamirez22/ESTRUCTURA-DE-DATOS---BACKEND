@@ -150,3 +150,79 @@ async def test_dispatcher_can_create_list_update_and_delete_courier_without_expo
         "/api/repartidores",
         headers=dispatcher,
         json={"name": "  Repartidor nuevo  ", "phone": " 3001234567 "},
+    )
+
+    assert created.status_code == 201
+    payload = created.json()
+    courier = payload["courier"]
+    courier_id = UUID(courier["id"])
+    access_code = payload["accessCode"]
+    assert courier["name"] == "Repartidor nuevo"
+    assert courier["status"] == CourierStatus.OFFLINE.value
+    assert "credential" not in courier
+    assert created.headers["cache-control"] == "no-store, private"
+
+    async with session_factory() as session:
+        credential = await session.get(CourierCredential, courier_id)
+        assert credential is not None
+        assert verify_courier_access_code(access_code, credential.access_code_hash)
+        assert access_code not in credential.access_code_hash
+
+    updated = await client.patch(
+        f"/api/repartidores/{courier_id}", headers=dispatcher, json={"name": "Actualizado"}
+    )
+    listed = await client.get("/api/repartidores?status=OFFLINE", headers=dispatcher)
+    assert updated.status_code == 200
+    assert updated.json()["courier"]["name"] == "Actualizado"
+    assert any(item["id"] == str(courier_id) for item in listed.json()["couriers"])
+
+    deleted = await client.delete(f"/api/repartidores/{courier_id}", headers=dispatcher)
+    assert deleted.status_code == 204
+    async with session_factory() as session:
+        assert await session.get(Courier, courier_id) is None
+        assert await session.get(CourierCredential, courier_id) is None
+
+
+@pytest.mark.asyncio
+async def test_courier_create_rejects_spoofed_gps_and_delete_preserves_route_history(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dispatcher = {"Cookie": _cookie("dispatcher")}
+    spoofed = await client.post(
+        "/api/repartidores",
+        headers=dispatcher,
+        json={"name": "No GPS", "phone": "3001111111", "currentLat": 1.21},
+    )
+    assert spoofed.status_code == 400
+    assert spoofed.json()["error"].startswith("La posición no se define")
+
+    courier_id = await _create_courier(session_factory)
+    async with session_factory() as session:
+        session.add(
+            Route(
+                courier_id=courier_id,
+                status=RouteStatus.PLANNED,
+                estimated_duration_minutes=5,
+                estimated_distance_meters=500,
+            )
+        )
+        await session.commit()
+    response = await client.delete(f"/api/repartidores/{courier_id}", headers=dispatcher)
+
+    assert response.status_code == 409
+    assert response.json() == {"error": "No se puede eliminar un repartidor con rutas asociadas."}
+
+
+@pytest.mark.asyncio
+async def test_authenticated_location_is_validated_persisted_and_updates_courier(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier_id = await _create_courier(session_factory)
+    recorded_at = datetime.now(UTC) - timedelta(seconds=2)
+    response = await client.post(
+        "/api/repartidores/me/ubicacion",
+        headers={"Cookie": _cookie("courier", str(courier_id))},
+        json={
+            "lat": 1.2136,
