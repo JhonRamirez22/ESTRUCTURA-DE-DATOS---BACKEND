@@ -146,3 +146,77 @@ async def _create(client: httpx.AsyncClient, ref: str, **extra: Any) -> dict[str
     assert response.status_code == 201, response.text
     return dict(response.json()["deliveryPoint"])
 
+
+def _kinds(events: list[DeliveryEvent]) -> list[str]:
+    return [e.event_type for e in events]
+
+
+# ---- history -----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_shipment_leaves_an_event_for_each_step_of_its_life(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    courier_id = await _courier(factory)
+    point = await _create(client, "H-1")
+    assert point["createdAt"] and point["deliveredAt"] is None
+    applied = await client.post(
+        "/api/asignaciones/aplicar", headers=_cookie("dispatcher"),
+        json={"assignments": [{"courierId": str(courier_id), "deliveryPointIds": [point["id"]]}]},
+    )
+    assert applied.status_code == 201, applied.text
+    route_id = applied.json()["routes"][0]["route"]["id"]
+    started = await client.patch(
+        f"/api/rutas/{route_id}", headers=_cookie("dispatcher"), json={"status": "IN_PROGRESS"}
+    )
+    assert started.status_code == 200, started.text
+    done = await client.patch(
+        f"/api/pedidos/{point['id']}", headers=_cookie("courier", courier_id),
+        json={"status": "DELIVERED"},
+    )
+    assert done.status_code == 200, done.text
+    assert done.json()["deliveryPoint"]["deliveredAt"] is not None
+
+    events = await _events(factory, "H-1")
+    assert set(_kinds(events)) == {"CREATED", "ASSIGNED", "STARTED", "DELIVERED"}
+    by_kind = {e.event_type: e for e in events}
+    assert by_kind["CREATED"].actor_role == "dispatcher"
+    assert by_kind["ASSIGNED"].route_id == UUID(route_id)
+    assert by_kind["ASSIGNED"].courier_id == courier_id
+    assert (by_kind["STARTED"].from_status, by_kind["STARTED"].to_status) == ("PENDING", "EN_ROUTE")
+    assert by_kind["DELIVERED"].actor_role == "courier"
+    assert by_kind["DELIVERED"].courier_id == courier_id
+    times = [e.occurred_at for e in events]
+    assert times == sorted(times)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_route_releases_its_shipments_and_failures_are_recorded(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    courier_id = await _courier(factory)
+    point = await _create(client, "H-2")
+    applied = await client.post(
+        "/api/asignaciones/aplicar", headers=_cookie("dispatcher"),
+        json={"assignments": [{"courierId": str(courier_id), "deliveryPointIds": [point["id"]]}]},
+    )
+    route_id = applied.json()["routes"][0]["route"]["id"]
+    cancelled = await client.patch(
+        f"/api/rutas/{route_id}", headers=_cookie("dispatcher"), json={"status": "CANCELLED"}
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    released = [e for e in await _events(factory, "H-2") if e.event_type == "RELEASED"]
+    assert len(released) == 1 and released[0].detail == "route cancelled"
+
+    failed = await _create(client, "H-3")
+    patched = await client.patch(
+        f"/api/pedidos/{failed['id']}", headers=_cookie("dispatcher"), json={"status": "FAILED"}
+    )
+    assert patched.status_code == 200
+    only = await _events(factory, "H-3")
+    assert "FAILED" in _kinds(only)
+    assert next(e for e in only if e.event_type == "FAILED").from_status == "PENDING"
+
+
+@pytest.mark.asyncio
