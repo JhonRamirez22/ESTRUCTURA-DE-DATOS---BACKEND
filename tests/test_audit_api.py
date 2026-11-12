@@ -162,3 +162,85 @@ async def test_subject_search_filters_and_masks_contacts(
     client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
 ) -> None:
     await _seed(factory)
+    head = _cookie("dispatcher")
+    found = await client.get("/api/v1/auditoria/sujetos?tipo=courier&q=ana", headers=head)
+    assert [item["label"] for item in found.json()["subjects"]] == ["Ana Repartidora"]
+    assert (await client.get("/api/v1/auditoria/sujetos?tipo=courier&q=zzz", headers=head)
+            ).json()["subjects"] == []
+    orders = await client.get("/api/v1/auditoria/sujetos?tipo=order&q=RP-10", headers=head)
+    detail = orders.json()["subjects"][0]["detail"]
+    assert "cliente.privado" not in detail and "c***@example.com" in detail
+    wildcard = await client.get("/api/v1/auditoria/sujetos?tipo=courier&q=%25", headers=head)
+    assert wildcard.json()["subjects"] == []  # el comodín se escapa
+
+
+@pytest.mark.asyncio
+async def test_courier_report_is_a_pdf_with_routes_gps_and_no_raw_coordinates(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    await _seed(factory)
+    response = await client.get("/api/v1/auditoria/informe", params=_query("courier", _COURIER_ID),
+                                headers=_cookie("dispatcher"))
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == "application/pdf"
+    assert "attachment" in response.headers["content-disposition"]
+    assert "Ana" not in response.headers["content-disposition"]  # sin datos personales
+    assert response.content.startswith(b"%PDF-1.4")
+    text = _pdf_text(response.content)
+    for expected in ("Auditoría de repartidor", "Ana Repartidora", "COMPLETED", "RP-1001",
+                     "Actividad GPS por día", "confidencial"):
+        assert expected in text, expected
+    assert "1.2136" not in text and "-77.2811" not in text
+
+
+@pytest.mark.asyncio
+async def test_order_report_masks_customer_contact(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    point_id = await _seed(factory)
+    response = await client.get("/api/v1/auditoria/informe", params=_query("order", point_id),
+                                headers=_cookie("dispatcher"))
+    assert response.status_code == 200
+    text = _pdf_text(response.content)
+    assert "RP-1001" in text and "Urgente" in text and "SENT" in text
+    assert "c***@example.com" in text and "***877" in text
+    assert "cliente.privado" not in text and "3109998877" not in text
+
+
+@pytest.mark.asyncio
+async def test_each_download_is_recorded_without_subject_data(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    await _seed(factory)
+    await client.get("/api/v1/auditoria/informe", params=_query("courier", _COURIER_ID),
+                     headers=_cookie("dispatcher"))
+    async with factory() as session:
+        events = (await session.scalars(select(SecurityAuditEvent))).all()
+    assert [e.action for e in events] == ["audit_report:courier"]
+    assert str(_COURIER_ID) not in events[0].action
+
+
+@pytest.mark.asyncio
+async def test_invalid_period_unknown_subject_and_rate_limit(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    from app.api import audit
+
+    audit._LIMITER._hits.clear()
+    head = _cookie("dispatcher")
+    backwards = await client.get("/api/v1/auditoria/informe", headers=head, params={
+        **_query("courier", _COURIER_ID), "desde": "2026-11-20", "hasta": "2026-11-01"})
+    assert backwards.status_code == 400
+    too_long = await client.get("/api/v1/auditoria/informe", headers=head, params={
+        **_query("courier", _COURIER_ID), "desde": "2024-01-01", "hasta": "2026-01-01"})
+    assert too_long.status_code == 400
+    missing = await client.get("/api/v1/auditoria/informe", headers=head,
+                               params=_query("courier", uuid4()))
+    assert missing.status_code == 404
+    bad = await client.get("/api/v1/auditoria/informe", headers=head,
+                           params={**_query("courier", _COURIER_ID), "tipo": "otro"})
+    assert bad.status_code == 422
+    codes = [
+        (await client.get("/api/v1/auditoria/informe", headers=head,
+                          params=_query("courier", uuid4()))).status_code
+        for _ in range(12)
