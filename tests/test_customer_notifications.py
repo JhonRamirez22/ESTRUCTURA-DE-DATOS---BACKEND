@@ -172,3 +172,89 @@ async def test_assignment_and_nearby_events_are_idempotent_and_distinct(
     point = await _create_point(session_factory)
     route_id = uuid4()
 
+    async with session_factory() as session:
+        persisted = await session.get(DeliveryPoint, point.id)
+        assert persisted is not None
+        assert await enqueue_order_assigned_notification(session, persisted, route_id) == (
+            CustomerNotificationChannel.EMAIL,
+        )
+        assert await enqueue_order_assigned_notification(session, persisted, route_id) == ()
+        assert await enqueue_courier_near_notification(session, persisted, route_id) == (
+            CustomerNotificationChannel.EMAIL,
+        )
+        assert await enqueue_courier_near_notification(session, persisted, route_id) == ()
+        await session.commit()
+
+    async with session_factory() as session:
+        rows = list(
+            (
+                await session.scalars(
+                    select(CustomerNotificationOutbox).order_by(
+                        CustomerNotificationOutbox.event_type
+                    )
+                )
+            ).all()
+        )
+        assert {row.event_type for row in rows} == {
+            CustomerNotificationEvent.ORDER_ASSIGNED,
+            CustomerNotificationEvent.COURIER_NEAR,
+        }
+        assert len({row.event_key for row in rows}) == 2
+        assert all("cliente@example.com" not in row.text_body for row in rows)
+        assert all("Carrera 25" not in row.text_body for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_customer_messages_never_include_internal_order_reference(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    point = await _create_point(session_factory, sms_opted_in=True)
+    route_id = uuid4()
+
+    async with session_factory() as session:
+        persisted = await session.get(DeliveryPoint, point.id)
+        assert persisted is not None
+        await enqueue_order_assigned_notification(session, persisted, route_id)
+        await enqueue_courier_near_notification(session, persisted, route_id)
+        await session.commit()
+
+    async with session_factory() as session:
+        rows = list((await session.scalars(select(CustomerNotificationOutbox))).all())
+
+    assert len(rows) == 4
+    for row in rows:
+        assert point.order_id not in row.text_body
+        assert "cliente@example.com" not in row.text_body
+        assert "+573001234567" not in row.text_body
+
+
+@pytest.mark.asyncio
+async def test_sms_is_queued_only_after_explicit_opt_in_and_is_idempotent(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    opted_out = await _create_point(session_factory, opted_in=False)
+    opted_in = await _create_point(session_factory, opted_in=False, sms_opted_in=True)
+    route_id = uuid4()
+
+    async with session_factory() as session:
+        first = await session.get(DeliveryPoint, opted_out.id)
+        second = await session.get(DeliveryPoint, opted_in.id)
+        assert first is not None and second is not None
+        assert await enqueue_order_assigned_notification(session, first, route_id) == ()
+        assert await enqueue_order_assigned_notification(session, second, route_id) == (
+            CustomerNotificationChannel.SMS,
+        )
+        assert await enqueue_order_assigned_notification(session, second, route_id) == ()
+        await session.commit()
+
+    async with session_factory() as session:
+        rows = list((await session.scalars(select(CustomerNotificationOutbox))).all())
+        assert len(rows) == 1
+        assert rows[0].channel is CustomerNotificationChannel.SMS
+        assert rows[0].recipient_email is None
+        assert rows[0].recipient_phone == "+573001234567"
+        assert "3001234567" not in rows[0].text_body
+
+
+def test_twilio_sender_posts_opted_in_phone_over_https_without_putting_credentials_in_url() -> None:
+    captured: dict[str, object] = {}
