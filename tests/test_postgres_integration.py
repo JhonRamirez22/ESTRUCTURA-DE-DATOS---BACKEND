@@ -154,3 +154,81 @@ async def test_route_revision_stack_persists_and_undoes_atomically_in_postgres()
                         address="Calle 18 # 20-30, Pasto",
                         lat=1.215,
                         lng=-77.279,
+                        status=DeliveryPointStatus.PENDING,
+                        order_id=f"REVISION-{appended_point_id}",
+                        tracking_token=f"TRACK-{appended_point_id}",
+                    ),
+                ]
+            )
+            await session.commit()
+            seeded = True
+
+        plan = OptimizedRoutePlan(
+            courier_id=courier_id,
+            planned_courier_location=(-77.2811, 1.2136),
+            ordered_delivery_point_ids=(appended_point_id, original_point_id),
+            planned_delivery_point_coordinates=(
+                (original_point_id, (-77.28, 1.214)),
+                (appended_point_id, (-77.279, 1.215)),
+            ),
+            estimated_duration_minutes=11.0,
+            estimated_distance_meters=1_250.0,
+            baseline_duration_minutes=12.0,
+            baseline_distance_meters=1_400.0,
+            geometry={
+                "type": "LineString",
+                "coordinates": [[-77.2811, 1.2136], [-77.279, 1.215], [-77.28, 1.214]],
+            },
+            geometry_provider=RouteGeometryProvider.OSRM,
+            matrix_source="osrm",
+            warning=None,
+            traffic_ai={"source": "deterministic", "applied": False},
+        )
+        async with session_factory() as session:
+            await recalculate_route(session, route_id, plan, [original_point_id])
+
+        async with session_factory() as session:
+            revisions = list(
+                (
+                    await session.scalars(
+                        select(RouteRevision).where(RouteRevision.route_id == route_id)
+                    )
+                ).all()
+            )
+            assert len(revisions) == 1
+            assert revisions[0].snapshot["estimatedDurationMinutes"] == 15.0
+
+        async with session_factory() as session:
+            result = await undo_route_recalculation(session, route_id)
+            assert result.can_undo is False
+            assert result.released_delivery_point_ids == (appended_point_id,)
+            assert result.route.estimated_duration_minutes == 15.0
+            assert result.route.geometry == original_geometry
+
+        async with session_factory() as session:
+            active = await session.get(DeliveryPoint, original_point_id)
+            released = await session.get(DeliveryPoint, appended_point_id)
+            remaining_revisions = list(
+                (
+                    await session.scalars(
+                        select(RouteRevision).where(RouteRevision.route_id == route_id)
+                    )
+                ).all()
+            )
+            assert active is not None and active.route_id == route_id
+            assert active.sequence_index == 0
+            assert released is not None
+            assert released.route_id is None
+            assert released.sequence_index is None
+            assert released.status is DeliveryPointStatus.PENDING
+            assert remaining_revisions == []
+    finally:
+        try:
+            if seeded:
+                async with session_factory() as session:
+                    await session.execute(delete(Route).where(Route.id == route_id))
+                    await session.execute(
+                        delete(DeliveryPoint).where(
+                            DeliveryPoint.id.in_({original_point_id, appended_point_id})
+                        )
+                    )
