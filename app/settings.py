@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     database_ssl_mode: Literal["disable", "require", "verify-ca", "verify-full"] = "disable"
     database_ssl_root_cert: str | None = None
     auth_secret: SecretStr | None = None
+    # Secreto compartido con el proxy de Vercel: si existe, solo ese proxy puede llamar a /api.
+    origin_auth_secret: SecretStr | None = None
     dispatcher_access_code: SecretStr | None = None
     # Los códigos anteriores solo se habilitan durante una transición explícita.
     auth_legacy_code_login_enabled: bool = False

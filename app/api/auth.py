@@ -55,6 +55,7 @@ from app.services.access_sessions import (
     revoke_account_sessions,
     utc_now,
 )
+from app.services.client_identity import client_key
 from app.services.customer_chat_rate_limiter import CustomerChatRateLimiter
 from app.services.request_limiter import SlidingWindowLimiter
 from app.settings import Settings, get_settings
@@ -66,8 +67,16 @@ DEVELOPMENT_SESSION_SECRET = "rutas-pasto-local-session-secret-not-for-productio
 _DUMMY_PASSWORD_HASH = hash_password("dummy-account-password-never-used")
 LOGIN_ATTEMPT_LIMIT = 10
 LOGIN_WINDOW_SECONDS = 60
+# Límite estricto por correo y cliente: el bloqueo de un atacante no alcanza a los demás.
 _LOGIN_LIMITER = CustomerChatRateLimiter(
     max_requests=LOGIN_ATTEMPT_LIMIT, window_seconds=LOGIN_WINDOW_SECONDS
+)
+# Tope amplio por correo: frena la fuerza bruta repartida entre muchos clientes sin que un solo
+# atacante pueda alcanzarlo (su propio límite lo detiene antes: 10 por minuto).
+LOGIN_EMAIL_ATTEMPT_LIMIT = 120
+LOGIN_EMAIL_WINDOW_SECONDS = 600
+_LOGIN_EMAIL_LIMITER = CustomerChatRateLimiter(
+    max_requests=LOGIN_EMAIL_ATTEMPT_LIMIT, window_seconds=LOGIN_EMAIL_WINDOW_SECONDS
 )
 _UUID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
@@ -197,8 +206,12 @@ async def _login_with_password(
     secret = _configured_secret(settings)
     if secret is None:
         return _error("El acceso no está configurado: falta AUTH_SECRET (mínimo 32 bytes).", 503)
-    rate_key = f"login:{credentials.email}"
+    rate_key = f"login:{credentials.email}:{client_key(request)}"
     retry_after = await _LOGIN_LIMITER.retry_after_shared(session, rate_key, hmac_secret=secret)
+    if retry_after is None:
+        retry_after = await _LOGIN_EMAIL_LIMITER.retry_after_shared(
+            session, f"login-email:{credentials.email}", hmac_secret=secret
+        )
     if retry_after is not None:
         return JSONResponse(
             {"error": "Demasiados intentos. Espera un minuto y vuelve a ingresar."},

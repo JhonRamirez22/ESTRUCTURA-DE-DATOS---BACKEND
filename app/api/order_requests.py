@@ -41,6 +41,7 @@ from app.services.address_geocoder import (
     get_address_geocoder,
 )
 from app.services.address_resolver import resolve_address
+from app.services.client_identity import client_key
 from app.services.customer_chat_rate_limiter import CustomerChatRateLimiter
 from app.settings import get_settings
 
@@ -290,16 +291,8 @@ async def _nearby_stop_notice(
 
 
 def _client_key(request: Request) -> str:
-    """Primer salto declarado por los proxies; si falta, la conexión directa.
-
-    Es falsificable por un cliente decidido, por eso el límite global y el tope de la
-    bandeja son los controles que acotan el abuso de verdad.
-    """
-    forwarded = request.headers.get("x-forwarded-for", "")
-    first = forwarded.split(",")[0].strip()[:64]
-    if first:
-        return first
-    return request.client.host if request.client else "desconocido"
+    """Cliente según la infraestructura, no según lo que declara (ver client_identity)."""
+    return client_key(request)
 
 
 def _parse_uuid(value: str) -> UUID | None:

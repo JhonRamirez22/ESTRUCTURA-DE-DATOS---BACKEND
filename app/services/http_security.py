@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 from time import perf_counter
 from uuid import UUID, uuid4
@@ -10,7 +11,11 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.settings import get_settings
+
 MAX_REQUEST_BYTES = 65_536
+# El balanceador comprueba la salud sin conocer el secreto de origen.
+_ORIGIN_EXEMPT_PATHS = {"/api/health", "/api/v1/health"}
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -65,6 +70,10 @@ class HttpSecurityMiddleware:
                 {"error": message, "requestId": request_id}, status_code=status,
             )(scope, receive, secure_send)
 
+        needs_origin = path.startswith("/api") and path not in _ORIGIN_EXEMPT_PATHS
+        if needs_origin and not _origin_allowed(headers):
+            await reject(403, "Origen no autorizado.")
+            return
         try:
             length = int(headers.get("Content-Length", "0"))
         except ValueError:
@@ -107,3 +116,12 @@ class HttpSecurityMiddleware:
         if legacy:
             # El retiro exige 30 días sin estos eventos; nunca registra URL, query ni cuerpo.
             _LOGGER.info("legacy_api_used method=%s request_id=%s", scope["method"], request_id)
+
+
+def _origin_allowed(headers: Headers) -> bool:
+    """Con ORIGIN_AUTH_SECRET configurado, solo el proxy que lo conoce llega a la API."""
+    secret = get_settings().origin_auth_secret
+    if secret is None:
+        return True
+    expected = secret.get_secret_value().encode()
+    return hmac.compare_digest(headers.get("X-Origin-Auth", "").encode(), expected)
