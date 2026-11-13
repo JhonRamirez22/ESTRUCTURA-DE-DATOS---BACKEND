@@ -148,3 +148,77 @@ async def test_osrm_rejects_unsnapped_or_skipped_waypoints() -> None:
         lambda _request: httpx.Response(
             200,
             json={
+                "code": "Ok",
+                "waypoints": [
+                    {"location": list(point), "distance": 0} for point in skipped_stop_coordinates
+                ],
+                "routes": [
+                    {
+                        "distance": 200,
+                        "duration": 60,
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [
+                                list(skipped_stop_coordinates[0]),
+                                list(skipped_stop_coordinates[2]),
+                            ],
+                        },
+                    }
+                ],
+            },
+        )
+    )
+    async with OsrmClient(transport=skipped_stop) as client:
+        with pytest.raises(OsrmClientError, match="does not pass through waypoint 2"):
+            await client.get_route(skipped_stop_coordinates)
+
+
+@pytest.mark.asyncio
+async def test_osrm_rejects_invalid_coordinates_without_network() -> None:
+    async with OsrmClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(500))
+    ) as client:
+        with pytest.raises(ValueError, match="al menos dos"):
+            await client.get_route([(-77.28, 1.21)])
+
+
+@pytest.mark.asyncio
+async def test_osrm_rejects_negative_routing_costs() -> None:
+    negative_matrix = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            json={
+                "code": "Ok",
+                "durations": [[0, -1], [60, 0]],
+                "distances": [[0, 10], [10, 0]],
+            },
+        )
+    )
+    async with OsrmClient(transport=negative_matrix) as client:
+        with pytest.raises(OsrmClientError, match="invalid durations value"):
+            await client.get_duration_matrix(COORDINATES)
+
+    negative_route = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            json={
+                "code": "Ok",
+                "waypoints": [
+                    {"location": list(location), "distance": 0} for location in COORDINATES
+                ],
+                "routes": [
+                    {
+                        "distance": 10,
+                        "duration": -1,
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [list(point) for point in ROAD_GEOMETRY],
+                        },
+                    }
+                ],
+            },
+        )
+    )
+    async with OsrmClient(transport=negative_route) as client:
+        with pytest.raises(OsrmClientError, match="invalid route duration"):
+            await client.get_route(COORDINATES)
