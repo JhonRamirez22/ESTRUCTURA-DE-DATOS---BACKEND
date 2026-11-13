@@ -121,3 +121,64 @@ async def test_matrix_cache_uses_uncached_fallback_for_recoverable_errors(
 ) -> None:
     client = _MatrixClient(error)
     provider = CachedMatrixProvider(client)
+    result = await provider.get_duration_matrix(COORDINATES)
+    assert result["source"] == "euclidean-fallback"
+    assert result["warning"]
+    assert result["durations_minutes"][0][0] == 0
+    assert FALLBACK_MAX_SPEED_KMH == 30
+
+    client.result = MATRIX
+    second = await provider.get_duration_matrix(COORDINATES)
+    assert second["source"] == "osrm"
+    assert client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_matrix_cache_propagates_nonrecoverable_provider_errors() -> None:
+    error = OsrmClientError("invalid request", status=400)
+    provider = CachedMatrixProvider(_MatrixClient(error))
+    with pytest.raises(OsrmClientError, match="invalid request"):
+        await provider.get_duration_matrix(COORDINATES)
+
+
+@pytest.mark.asyncio
+async def test_route_cache_hits_expires_and_preserves_provider_and_order() -> None:
+    current_time = 10.0
+    client = _RouteClient(_route_result())
+    provider = CachedRouteProvider(client, ttl_seconds=5, now=lambda: current_time)
+    await provider.get_route(COORDINATES)
+    await provider.get_route(COORDINATES)
+    assert client.calls == 1
+
+    current_time = 16.0
+    await provider.get_route(COORDINATES)
+    assert client.calls == 2
+    assert build_route_cache_key("OSRM", COORDINATES) != build_route_cache_key(
+        "OSRM", list(reversed(COORDINATES))
+    )
+    assert build_route_cache_key("ORS", COORDINATES) != build_route_cache_key("OSRM", COORDINATES)
+
+
+@pytest.mark.asyncio
+async def test_route_cache_deduplicates_concurrent_requests() -> None:
+    client = _RouteClient(_route_result())
+    client.started = asyncio.Event()
+    client.release = asyncio.Event()
+    provider = CachedRouteProvider(client)
+    first = asyncio.create_task(provider.get_route(COORDINATES))
+    await client.started.wait()
+    second = asyncio.create_task(provider.get_route(COORDINATES))
+    client.release.set()
+
+    assert await asyncio.gather(first, second) == [_route_result(), _route_result()]
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_route_cache_rejects_unexpected_provider_without_caching() -> None:
+    client = _RouteClient(_route_result(provider="ORS"))
+    provider = CachedRouteProvider(client, provider="OSRM")
+    with pytest.raises(ValueError, match="Se esperaba geometría OSRM"):
+        await provider.get_route(COORDINATES)
+    assert client.calls == 1
+    assert build_route_cache_key("OSRM", COORDINATES)
