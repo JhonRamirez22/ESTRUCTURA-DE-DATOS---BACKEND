@@ -133,3 +133,70 @@ async def test_dispatcher_lists_only_dispatcher_notifications(
 async def test_courier_sees_only_its_inbox_and_limit_is_clamped(
     client: httpx.AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        session.add_all(
+            [
+                Notification(
+                    kind=NotificationKind.DELIVERY_STATUS_CHANGED,
+                    recipient_id=_COURIER_ID,
+                    title=f"Aviso {index}",
+                    message="Actualización de entrega.",
+                )
+                for index in range(3)
+            ]
+        )
+        await session.commit()
+
+    response = await client.get(
+        "/api/notificaciones?limit=0",
+        headers={"Cookie": _cookie("courier", _COURIER_ID)},
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()["notifications"]) == 1
+    assert all(item["recipientId"] == _COURIER_ID for item in response.json()["notifications"])
+
+
+@pytest.mark.asyncio
+async def test_customer_notification_status_is_dispatcher_only(
+    client: httpx.AsyncClient,
+) -> None:
+    anonymous = await client.get("/api/notificaciones/clientes/estado")
+    courier = await client.get(
+        "/api/notificaciones/clientes/estado",
+        headers={"Cookie": _cookie("courier", _COURIER_ID)},
+    )
+
+    assert anonymous.status_code == 401
+    assert courier.status_code == 403
+    assert courier.json() == {"error": "Se requiere una sesión de despacho."}
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_gets_channel_and_outbox_counts_without_contact_data(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.api.notifications as notifications_api
+
+    email_point_id = uuid4()
+    sms_point_id = uuid4()
+    async with session_factory() as session:
+        session.add_all(
+            [
+                DeliveryPoint(
+                    id=email_point_id,
+                    address="Carrera 25 # 4 sur 65",
+                    lat=1.2136,
+                    lng=-77.2811,
+                    status=DeliveryPointStatus.PENDING,
+                    order_id=f"OUTBOX-{email_point_id}",
+                    tracking_token=f"OUTBOX-{email_point_id}",
+                ),
+                DeliveryPoint(
+                    id=sms_point_id,
+                    address="Calle 18 # 20-30",
+                    lat=1.214,
+                    lng=-77.28,
