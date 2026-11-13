@@ -22,6 +22,9 @@ def get_engine() -> AsyncEngine:
         settings.sqlalchemy_database_url,
         connect_args=settings.sqlalchemy_connect_args,
         pool_pre_ping=True,
+        pool_size=settings.database_pool_size,
+        max_overflow=settings.database_max_overflow,
+        pool_timeout=settings.database_pool_timeout_seconds,
     )
 
 

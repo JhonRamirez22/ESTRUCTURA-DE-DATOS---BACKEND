@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import JSONResponse
@@ -111,6 +112,7 @@ async def create_order_request(
     repository = DeliveryPointRepository(session)
     nearby = await _nearby_stop_notice(repository, data.lat, data.lng)
     try:
+        await _lock_inbox(session)
         if await repository.count_requested() >= MAX_WAITING_REQUESTS:
             await session.commit()
             return _error(
@@ -288,6 +290,19 @@ async def _nearby_stop_notice(
             "el despacho puede sumar esta entrega a esa ruta."
         ),
     }
+
+
+_INBOX_LOCK_KEY = 727_001
+
+
+async def _lock_inbox(session: AsyncSession) -> None:
+    """Serializa contar e insertar: sin esto, peticiones paralelas superaban el tope.
+
+    El bloqueo consultivo vive hasta el commit o rollback de esta transacción. Solo existe en
+    PostgreSQL; las pruebas con SQLite no tienen concurrencia real que proteger.
+    """
+    if session.get_bind().dialect.name == "postgresql":
+        await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _INBOX_LOCK_KEY})
 
 
 def _client_key(request: Request) -> str:

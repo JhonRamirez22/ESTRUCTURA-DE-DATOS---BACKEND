@@ -48,11 +48,16 @@ from app.services.customer_notifications import (
     enqueue_courier_near_notification,
     is_courier_near_delivery_point,
 )
-from app.services.location_event_queue import LocationEventQueue, LocationQueueFullError
+from app.services.location_event_queue import (
+    LocationEventQueue,
+    LocationQueueFullError,
+    ShardedLocationQueue,
+)
 
 router = APIRouter(prefix="/repartidores", tags=["repartidores"])
 _LOGGER = logging.getLogger(__name__)
-_location_queue = LocationEventQueue()
+LocationQueue = LocationEventQueue | ShardedLocationQueue
+_location_queue: LocationQueue = ShardedLocationQueue()
 
 
 class _LocationWriteResult(TypedDict):
@@ -61,7 +66,7 @@ class _LocationWriteResult(TypedDict):
     nearby_notification_queued: bool
 
 
-def get_location_event_queue() -> LocationEventQueue:
+def get_location_event_queue() -> LocationQueue:
     return _location_queue
 
 
@@ -97,7 +102,7 @@ async def post_my_location(
     session_factory: Annotated[
         async_sessionmaker[AsyncSession], Depends(get_write_session_factory)
     ],
-    queue: Annotated[LocationEventQueue, Depends(get_location_event_queue)],
+    queue: Annotated[LocationQueue, Depends(get_location_event_queue)],
 ) -> JSONResponse:
     courier_id = _parse_uuid(
         claims.get("courierId"), "El identificador del repartidor no es válido."
@@ -355,7 +360,7 @@ async def post_courier_location(
     session_factory: Annotated[
         async_sessionmaker[AsyncSession], Depends(get_write_session_factory)
     ],
-    queue: Annotated[LocationEventQueue, Depends(get_location_event_queue)],
+    queue: Annotated[LocationQueue, Depends(get_location_event_queue)],
 ) -> JSONResponse:
     parsed_id = _parse_uuid(courier_id)
     if str(parsed_id) != claims.get("courierId"):
@@ -367,7 +372,7 @@ async def _post_location(
     request: Request,
     courier_id: UUID,
     session_factory: async_sessionmaker[AsyncSession],
-    queue: LocationEventQueue,
+    queue: LocationQueue,
     background_tasks: BackgroundTasks,
 ) -> JSONResponse:
     body = await _read_json_object(request)
@@ -392,7 +397,8 @@ async def _post_location(
         result = await queue.enqueue(
             lambda: _write_location(
                 session_factory, courier_id, location.lat, location.lng, recorded_at
-            )
+            ),
+            key=str(courier_id),
         )
     except LocationQueueFullError as error:
         return JSONResponse(

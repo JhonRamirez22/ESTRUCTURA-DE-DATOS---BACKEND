@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     database_password: SecretStr | None = None
     database_admin_username: str | None = None
     database_admin_password: SecretStr | None = None
+    # Conexiones por proceso; el pool por defecto de SQLAlchemy (5 + 10) quedaba corto con carga.
+    database_pool_size: int = Field(default=10, ge=1, le=100)
+    database_max_overflow: int = Field(default=10, ge=0, le=100)
+    database_pool_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    # Peticiones en curso por proceso; por encima se responde 503 al instante, sin colas.
+    max_inflight_requests: int = Field(default=200, ge=1, le=10_000)
     database_ssl_mode: Literal["disable", "require", "verify-ca", "verify-full"] = "disable"
     database_ssl_root_cert: str | None = None
     auth_secret: SecretStr | None = None

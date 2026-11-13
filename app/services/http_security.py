@@ -7,6 +7,7 @@ import logging
 from time import perf_counter
 from uuid import UUID, uuid4
 
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -16,6 +17,7 @@ from app.settings import get_settings
 MAX_REQUEST_BYTES = 65_536
 # El balanceador comprueba la salud sin conocer el secreto de origen.
 _ORIGIN_EXEMPT_PATHS = {"/api/health", "/api/v1/health"}
+_inflight = 0  # peticiones en curso de este proceso
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -24,9 +26,27 @@ class HttpSecurityMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        global _inflight
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        exempt = scope["path"] in _ORIGIN_EXEMPT_PATHS
+        if not exempt and _inflight >= get_settings().max_inflight_requests:
+            # Carga por encima de la capacidad: se rechaza al instante para no acumular colas.
+            _LOGGER.warning("http_overload reason=inflight")
+            await JSONResponse(
+                {"error": "El servicio está saturado; reintenta en unos segundos."},
+                status_code=503,
+                headers={"Retry-After": "1", "Cache-Control": "no-store"},
+            )(scope, receive, send)
+            return
+        _inflight += 1
+        try:
+            await self._dispatch(scope, receive, send)
+        finally:
+            _inflight -= 1
+
+    async def _dispatch(self, scope: Scope, receive: Receive, send: Send) -> None:
         headers = Headers(scope=scope)
         try:
             request_id = str(UUID(headers.get("X-Request-ID", "")))
@@ -65,9 +85,10 @@ class HttpSecurityMiddleware:
                     )
             await send(message)
 
-        async def reject(status: int, message: str) -> None:
+        async def reject(status: int, message: str, retry_after: int | None = None) -> None:
             await JSONResponse(
                 {"error": message, "requestId": request_id}, status_code=status,
+                headers={"Retry-After": str(retry_after)} if retry_after is not None else None,
             )(scope, receive, secure_send)
 
         needs_origin = path.startswith("/api") and path not in _ORIGIN_EXEMPT_PATHS
@@ -105,6 +126,12 @@ class HttpSecurityMiddleware:
 
         try:
             await self.app(scope, replay, secure_send)
+        except PoolTimeoutError:
+            # Sin conexiones libres: es sobrecarga, no un fallo; el cliente reintenta enseguida.
+            _LOGGER.warning("http_overload request_id=%s reason=db_pool", request_id)
+            if response_started:
+                raise
+            await reject(503, "El servicio está saturado; reintenta en unos segundos.", 2)
         except Exception as error:
             # El traceback de drivers/proveedores puede contener parámetros privados.
             _LOGGER.error(
