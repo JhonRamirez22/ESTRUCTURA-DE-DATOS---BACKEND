@@ -147,3 +147,77 @@ def test_initial_migration_rejects_existing_schema_missing_required_index(
         engine.dispose()
 
     with pytest.raises(RuntimeError, match="routes.index:routes_courier_id_idx"):
+        _upgrade_to_head(database_path, monkeypatch)
+
+
+def test_customer_notification_migration_upgrades_an_adopted_old_schema_without_data_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "adopted.sqlite3"
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        Base.metadata.create_all(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP TABLE customer_notification_outbox")
+            connection.exec_driver_sql(
+                "ALTER TABLE delivery_points DROP COLUMN email_notifications_enabled"
+            )
+            connection.exec_driver_sql("ALTER TABLE delivery_points DROP COLUMN customer_email")
+    finally:
+        engine.dispose()
+
+    _stamp_baseline_and_upgrade(database_path, monkeypatch)
+
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        inspector = inspect(engine)
+        delivery_columns = {column["name"] for column in inspector.get_columns("delivery_points")}
+        assert {"customer_email", "email_notifications_enabled"} <= delivery_columns
+        assert "customer_notification_outbox" in inspector.get_table_names()
+        assert {
+            "customer_notification_outbox_status_available_idx",
+            "customer_notification_outbox_delivery_point_idx",
+        } <= {index["name"] for index in inspector.get_indexes("customer_notification_outbox")}
+        assert (
+            "customer_notification_outbox_event_key_key",
+            ("event_key",),
+        ) in actual_unique_signatures(inspector, "customer_notification_outbox")
+    finally:
+        engine.dispose()
+
+
+def test_sms_migration_preserves_existing_email_outbox_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "sms-outbox-upgrade.sqlite3"
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        Base.metadata.create_all(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP TABLE customer_notification_outbox")
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE customer_notification_outbox (
+                    id TEXT PRIMARY KEY,
+                    delivery_point_id TEXT NOT NULL,
+                    event_key VARCHAR(220) NOT NULL UNIQUE,
+                    event_type VARCHAR(20) NOT NULL,
+                    recipient_email VARCHAR(320) NOT NULL,
+                    subject VARCHAR(180) NOT NULL,
+                    text_body TEXT NOT NULL,
+                    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    available_at DATETIME NOT NULL,
+                    lease_expires_at DATETIME,
+                    created_at DATETIME NOT NULL,
+                    sent_at DATETIME,
+                    last_error_code VARCHAR(100)
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                INSERT INTO customer_notification_outbox (
+                    id, delivery_point_id, event_key, event_type, recipient_email,
