@@ -114,3 +114,61 @@ def test_refinar_rutas_cortas_da_el_optimo_demostrable() -> None:
 
 def test_refinar_nunca_devuelve_algo_peor_y_conserva_el_origen() -> None:
     rng = random.Random(33)
+    for size in (4, 12, 13, 24, 50):
+        matrix = random_matrix(size, rng, holes=0.02)
+        start = nearest_neighbor(matrix, 0)
+        result = refine_route(matrix, start)
+        assert is_valid(result.route, size)
+        assert result.cost <= route_cost(matrix, start) + 1e-9
+
+
+def test_refinar_cierra_la_brecha_de_la_heuristica_en_rutas_de_10_paradas() -> None:
+    rng = random.Random(77)
+    worse_before = 0
+    for _ in range(60):
+        matrix = random_matrix(10, rng)
+        heuristic = or_opt(matrix, two_opt(matrix, nearest_neighbor(matrix, 0)))
+        refined = refine_route(matrix, heuristic)
+        assert refined.cost <= route_cost(matrix, heuristic) + 1e-9
+        worse_before += route_cost(matrix, heuristic) > refined.cost + 1e-6
+    assert worse_before >= 10  # la heurística sola deja mejoras reales sobre la mesa
+
+
+def test_refinar_rutas_sin_conexion_no_inventa_un_camino() -> None:
+    matrix: list[list[float | None]] = [
+        [0, None, None, None],
+        [None, 0, 1, 1],
+        [None, 1, 0, 1],
+        [None, 1, 1, 0],
+    ]
+    result = refine_route(matrix, [0, 1, 2, 3])
+    assert result.route == [0, 1, 2, 3] or is_valid(result.route, 4)
+    assert not math.isfinite(result.cost)
+
+
+def test_cota_inferior_nunca_supera_al_optimo_y_usa_aristas_de_ambos_sentidos() -> None:
+    from app.core.optimization.lower_bound import spanning_tree_lower_bound
+
+    rng = random.Random(9)
+    for size in (3, 5, 7):
+        for _ in range(20):
+            matrix = random_matrix(size, rng)
+            bound = spanning_tree_lower_bound(matrix)
+            assert bound is not None and bound <= brute_force(matrix) + 1e-9
+    # Con una sola dirección disponible entre dos paradas, esa arista sí cuenta.
+    one_way: list[list[float | None]] = [[0, 4, None], [None, 0, 2], [None, None, 0]]
+    assert spanning_tree_lower_bound(one_way) == pytest.approx(6.0)
+
+
+def test_cota_inferior_detecta_paradas_sin_conexion() -> None:
+    from app.core.optimization.lower_bound import spanning_tree_lower_bound
+
+    disconnected: list[list[float | None]] = [[0, 1, None], [1, 0, None], [None, None, 0]]
+    assert spanning_tree_lower_bound(disconnected) is None
+
+
+def test_refinar_largo_informa_su_cota_inferior() -> None:
+    matrix = random_matrix(24, random.Random(2))
+    result = refine_route(matrix, nearest_neighbor(matrix, 0))
+    assert result.kind == "ils" and result.lower_bound is not None
+    assert result.lower_bound <= result.cost
