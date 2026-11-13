@@ -144,3 +144,76 @@ class _FakeGeocoder:
     async def search(self, address: str) -> list[object]:
         from app.services.address_geocoder import AddressSuggestion
 
+        self.queries.append(address)
+        return [AddressSuggestion(address="Calle 18 # 22-14, Pasto", lat=1.2136, lng=-77.2811,
+                                  precision="address")]
+
+
+@pytest.mark.asyncio
+async def test_public_address_lookup_requires_origin_and_caches_results(
+    client: httpx.AsyncClient,  # noqa: F811
+) -> None:
+    from app.main import app
+    from app.services.address_advisor import get_address_ai_advisor
+    from app.services.address_geocoder import get_address_geocoder
+
+    order_requests._LOOKUP_CACHE.clear()
+    geocoder = _FakeGeocoder()
+    app.dependency_overrides[get_address_geocoder] = lambda: geocoder
+    app.dependency_overrides[get_address_ai_advisor] = lambda: None
+    try:
+        no_origin = await client.post(
+            "/api/v1/solicitudes/direccion", json={"address": "calle 18 22 14"}
+        )
+        assert no_origin.status_code == 403
+        first = await client.post(
+            "/api/v1/solicitudes/direccion", headers=_ORIGIN, json={"address": "calle 18 # 22-14"}
+        )
+        assert first.status_code == 200
+        assert first.json()["candidates"][0]["lat"] == 1.2136
+        assert first.json()["cached"] is False
+        again = await client.post(
+            "/api/v1/solicitudes/direccion", headers=_ORIGIN, json={"address": "Calle 18 # 22-14"}
+        )
+        assert again.json()["cached"] is True
+        assert len(geocoder.queries) == 1
+        foreign = await client.post(
+            "/api/v1/solicitudes/direccion", headers=_ORIGIN, json={"address": "calle 5 bogota"}
+        )
+        assert foreign.json()["candidates"] == []
+        markup = await client.post(
+            "/api/v1/solicitudes/direccion", headers=_ORIGIN, json={"address": "<b>calle 5</b>"}
+        )
+        assert markup.status_code == 400
+    finally:
+        app.dependency_overrides.pop(get_address_geocoder, None)
+        app.dependency_overrides.pop(get_address_ai_advisor, None)
+
+
+@pytest.mark.asyncio
+async def test_request_near_a_scheduled_stop_gets_a_private_notice(
+    client: httpx.AsyncClient,  # noqa: F811
+    session_factory: async_sessionmaker[AsyncSession],  # noqa: F811
+) -> None:
+    async with session_factory() as session:
+        session.add(
+            DeliveryPoint(
+                id=uuid4(), address="Calle 18 # 22-14", lat=1.2136, lng=-77.2811,
+                status=DeliveryPointStatus.PENDING, order_id="DEMO-1",
+                tracking_token=str(uuid4()),
+            )
+        )
+        await session.commit()
+    near = await client.post(
+        "/api/v1/solicitudes", headers=_ORIGIN,
+        json={"address": "Calle 18 # 22-20 Centro", "lat": 1.21365, "lng": -77.2811},
+    )
+    assert near.status_code == 201
+    notice = near.json()["nearbyStop"]
+    assert notice["status"] == "PENDING" and notice["distanceMeters"] < 150
+    assert "DEMO-1" not in near.text and "Calle 18" not in near.text
+    far = await client.post(
+        "/api/v1/solicitudes", headers={**_ORIGIN, "X-Forwarded-For": "198.51.100.44"},
+        json={"address": "Carrera 40 # 19-02 Anganoy", "lat": 1.2300, "lng": -77.2900},
+    )
+    assert far.json()["nearbyStop"] is None
