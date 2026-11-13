@@ -164,3 +164,86 @@ async def client(
 
     async def override_session() -> AsyncIterator[AsyncSession]:
         async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_routing_providers] = lambda: (
+        FakeMatrixProvider(),
+        FakeRouteProvider(),
+    )
+    app.dependency_overrides[get_route_traffic_advisor] = lambda: None
+    app.dependency_overrides[get_traffic_service] = lambda: None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(get_routing_providers, None)
+        app.dependency_overrides.pop(get_route_traffic_advisor, None)
+        app.dependency_overrides.pop(get_traffic_service, None)
+        get_settings.cache_clear()
+
+
+def _cookie(role: str, courier_id: UUID | None = None) -> str:
+    token = create_session_token(
+        role,  # type: ignore[arg-type]
+        int(time()) + SESSION_MAX_AGE_SECONDS,
+        _SESSION_SECRET,
+        str(courier_id) if courier_id else None,
+    )
+    return f"{session_cookie_name(role)}={token}"
+
+
+async def _create_courier(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    courier_id: UUID = _COURIER_ID,
+    status: CourierStatus = CourierStatus.AVAILABLE,
+) -> UUID:
+    async with session_factory() as session:
+        session.add(
+            Courier(
+                id=courier_id,
+                name="Courier Privado",
+                phone="3001112233",
+                status=status,
+                current_lat=1.2136,
+                current_lng=-77.2811,
+                last_location_at=datetime.now(UTC).replace(tzinfo=None),
+            )
+        )
+        await session.commit()
+    return courier_id
+
+
+async def _create_point(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    address: str = "Carrera 25 # 4 sur 65",
+) -> UUID:
+    point_id = uuid4()
+    async with session_factory() as session:
+        session.add(
+            DeliveryPoint(
+                id=point_id,
+                address=address,
+                lat=1.214,
+                lng=-77.28,
+                status=DeliveryPointStatus.PENDING,
+                order_id=f"ORDER-{point_id}",
+                tracking_token=f"TRACK-{point_id}",
+            )
+        )
+        await session.commit()
+    return point_id
+
+
+@pytest.mark.asyncio
+async def test_route_creation_optimizes_and_commits_route_and_ordered_points(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
