@@ -104,3 +104,55 @@ async def test_ors_converts_http_timeout_to_typed_error() -> None:
 @pytest.mark.asyncio
 async def test_ors_rejects_malformed_matrix_geometry_and_metrics() -> None:
     async with OrsClient(
+        api_key="test-key",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"durations": [[0, 60]]})
+        ),
+    ) as client:
+        with pytest.raises(OrsClientError, match="incorrect dimensions"):
+            await client.get_duration_matrix(COORDINATES)
+
+    malformed_route = {
+        "features": [
+            {
+                "geometry": {"type": "LineString", "coordinates": [[-77.28, 1.21]]},
+                "properties": {"summary": {"distance": 10, "duration": 10}},
+            }
+        ]
+    }
+    async with OrsClient(
+        api_key="test-key",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=malformed_route)),
+    ) as client:
+        with pytest.raises(OrsClientError, match="invalid geometry"):
+            await client.get_route(COORDINATES)
+
+
+@pytest.mark.asyncio
+async def test_ors_rejects_negative_routing_costs() -> None:
+    async with OrsClient(
+        api_key="test-key",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"durations": [[0, -1], [60, 0]]})
+        ),
+    ) as client:
+        with pytest.raises(OrsClientError, match="invalid duration"):
+            await client.get_duration_matrix(COORDINATES)
+
+    negative_route = {
+        "features": [
+            {
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [list(point) for point in COORDINATES],
+                },
+                "properties": {"summary": {"distance": 10, "duration": -1}},
+            }
+        ]
+    }
+    async with OrsClient(
+        api_key="test-key",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=negative_route)),
+    ) as client:
+        with pytest.raises(OrsClientError, match="invalid duration"):
+            await client.get_route(COORDINATES)
