@@ -154,3 +154,81 @@ async def test_order_collection_requires_dispatcher_and_creates_normalized_point
         "/api/pedidos",
         headers={"Cookie": _cookie("dispatcher")},
         json={
+            "address": "  cra 25 num 4 sur 65 ",
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "orderId": "P-1",
+        },
+    )
+    payload = created.json()
+    assert created.status_code == 201
+    assert payload["deliveryPoint"]["address"] == "Carrera 25 # 4 sur 65"
+    assert payload["deliveryPoint"]["status"] == "PENDING"
+    assert payload["trackingGuide"] == payload["deliveryPoint"]["trackingToken"]
+    assert payload["addressNormalization"]["source"] == "deterministic"
+    assert created.headers["cache-control"] == "no-store, private, max-age=0"
+
+    async with session_factory() as session:
+        persisted = await session.scalar(
+            select(DeliveryPoint).where(DeliveryPoint.order_id == "P-1")
+        )
+        assert persisted is not None
+        assert persisted.lat == 1.2136
+        assert persisted.lng == -77.2811
+
+    listed = await client.get(
+        "/api/pedidos?status=PENDING", headers={"Cookie": _cookie("dispatcher")}
+    )
+    assert listed.status_code == 200
+    assert [item["orderId"] for item in listed.json()["deliveryPoints"]] == ["P-1"]
+
+
+@pytest.mark.asyncio
+async def test_order_input_rejects_bad_json_outside_pasto_and_foreign_city(
+    client: httpx.AsyncClient,
+) -> None:
+    headers = {"Cookie": _cookie("dispatcher")}
+    malformed = await client.post(
+        "/api/pedidos", headers={**headers, "Content-Type": "application/json"}, content="{"
+    )
+    outside = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={"address": "Calle 1", "lat": 40.7128, "lng": -74.006, "orderId": "P-2"},
+    )
+    foreign = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            "address": "Carrera 25, Bogotá",
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "orderId": "P-3",
+        },
+    )
+    assert malformed.status_code == 400
+    assert malformed.json() == {"error": "El body debe ser JSON válido."}
+    assert outside.status_code == 400
+    assert "dentro de la zona de servicio de Pasto" in outside.json()["error"]
+    assert foreign.status_code == 400
+    assert "ciudad fuera de Pasto" in foreign.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_customer_email_requires_consent_and_is_never_returned_in_order_json(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    headers = {"Cookie": _cookie("dispatcher")}
+    missing_contact = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            "address": "Calle 10",
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "orderId": "CONSENT-MISSING",
+            "emailNotificationsEnabled": True,
+        },
+    )
+    invalid_email = await client.post(
