@@ -109,3 +109,58 @@ class _PriorityItem:
     id: str
     priority: int
 
+
+def _heap() -> MinHeap[_PriorityItem, str]:
+    return MinHeap(
+        compare=lambda left, right: left.priority - right.priority,
+        get_id=lambda item: item.id,
+    )
+
+
+def test_min_heap_extracts_in_priority_order_and_handles_empty_and_single() -> None:
+    heap = _heap()
+    assert heap.extract_min() is None
+    assert heap.is_empty()
+
+    heap.insert(_PriorityItem("only", 8))
+    assert heap.extract_min() == _PriorityItem("only", 8)
+    assert heap.extract_min() is None
+
+    heap.insert(_PriorityItem("three", 3))
+    heap.insert(_PriorityItem("one", 1))
+    heap.insert(_PriorityItem("two", 2))
+    assert [heap.extract_min().priority for _ in range(3)] == [1, 2, 3]
+
+
+def test_min_heap_tracks_ids_after_swaps_and_extracts() -> None:
+    heap = _heap()
+    for item in (
+        _PriorityItem("a", 10),
+        _PriorityItem("b", 4),
+        _PriorityItem("c", 8),
+        _PriorityItem("d", 2),
+        _PriorityItem("e", 6),
+    ):
+        heap.insert(item)
+
+    assert heap.extract_min() == _PriorityItem("d", 2)
+    assert heap.extract_min() == _PriorityItem("b", 4)
+    heap.decrease_key("a", _PriorityItem("a", 1))
+    assert heap.extract_min() == _PriorityItem("a", 1)
+    assert heap.extract_min() == _PriorityItem("e", 6)
+    assert heap.extract_min() == _PriorityItem("c", 8)
+    assert heap.is_empty()
+
+
+def test_min_heap_rejects_invalid_decrease_and_duplicate_ids() -> None:
+    heap = _heap()
+    heap.insert(_PriorityItem("known", 3))
+
+    with pytest.raises(KeyError, match="no existe"):
+        heap.decrease_key("missing", _PriorityItem("missing", 1))
+    with pytest.raises(ValueError, match="aumentar"):
+        heap.decrease_key("known", _PriorityItem("known", 5))
+    with pytest.raises(ValueError, match="ID duplicado"):
+        heap.insert(_PriorityItem("known", 1))
+    with pytest.raises(ValueError, match="otro ID"):
+        heap.decrease_key("known", _PriorityItem("other", 1))
