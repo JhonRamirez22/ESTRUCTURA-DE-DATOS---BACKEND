@@ -148,3 +148,78 @@ def test_pipeline_handles_tiny_and_disconnected_routes() -> None:
     assert result.order[0] == 0 and sorted(result.order) == [0, 1, 2]
     with pytest.raises(ValueError):
         RoutePipeline([])
+    assert NearestNeighborSolver().improve(matrix, [0, 1]) == [0, 1]
+
+
+# ---- scoreboard --------------------------------------------------------------------------
+
+
+def test_crossing_counter_finds_an_x_and_ignores_touching_segments() -> None:
+    counter = SegmentCrossingCounter()
+    x_shape = [[point(0, 0), point(1, 1)], [point(0, 1), point(1, 0)]]
+    assert counter.count(x_shape) == 1
+    parallel = [[point(0, 0), point(0, 1)], [point(1, 0), point(1, 1)]]
+    assert counter.count(parallel) == 0
+    bow_tie = [[point(0, 0), point(1, 1), point(1, 0), point(0, 1)]]
+    assert counter.count(bow_tie) == 1  # segments 0 and 2 cross; neighbours are skipped
+
+
+def test_scoreboard_reports_balance_total_and_gap() -> None:
+    fleet = Fleet([
+        route("a", point(1.2000, -77.3000), [("a1", 1.2005, -77.2990), ("a2", 1.2010, -77.2980)]),
+        route("b", point(1.2000, -77.2500), [("b1", 1.2005, -77.2490)]),
+    ])
+    scoreboard = PlanScoreboard(fleet, matrix_for(fleet))
+    score = scoreboard.score(scoreboard.current_orders())
+    assert score.total_minutes > 0 and score.longest_minutes >= score.total_minutes / 2
+    assert score.balance >= 1.0 and score.crossings == 0
+    assert score.lower_bound_gap is not None and score.lower_bound_gap >= 0
+    assert set(score.as_dict()) == {
+        "totalMinutes", "longestMinutes", "balance", "crossings", "lowerBoundGap"
+    }
+
+
+# ---- re-optimiser ------------------------------------------------------------------------
+
+
+def test_reorders_a_zigzag_route_and_reports_the_saving() -> None:
+    fleet = Fleet([route("a", point(1.2000, -77.3000), [
+        ("s3", 1.2000, -77.2940), ("s1", 1.2000, -77.2990), ("s2", 1.2000, -77.2970),
+    ])])
+    proposal = LiveFleetReoptimizer(fleet, matrix_for(fleet)).propose()
+    only = proposal.routes[0]
+    assert only.changed and only.proposed_order == ("s1", "s2", "s3")
+    assert only.saved_minutes > 1 and proposal.saved_minutes > 1 and not proposal.moves
+
+
+def test_keeps_an_optimal_fleet_untouched() -> None:
+    fleet = Fleet([
+        route("a", point(1.2000, -77.3000), [("a1", 1.2000, -77.2990), ("a2", 1.2000, -77.2980)]),
+        route("b", point(1.2000, -77.2500), [("b1", 1.2000, -77.2490), ("b2", 1.2000, -77.2480)]),
+    ])
+    proposal = LiveFleetReoptimizer(fleet, matrix_for(fleet)).propose()
+    assert not proposal.changed and not proposal.moves
+
+
+def test_moves_a_stop_to_the_courier_that_is_next_to_it() -> None:
+    fleet = Fleet([
+        route("a", point(1.2000, -77.3000), [
+            ("a1", 1.2005, -77.2990), ("a2", 1.2010, -77.2980), ("x", 1.2005, -77.2505),
+        ]),
+        route("b", point(1.2000, -77.2500), [("b1", 1.2000, -77.2490), ("b2", 1.2010, -77.2480)]),
+    ])
+    proposal = LiveFleetReoptimizer(fleet, matrix_for(fleet)).propose()
+    assert [(m.stop_id, m.from_route, m.to_route) for m in proposal.moves] == [("x", "a", "b")]
+    by_id = {p.route_id: p for p in proposal.routes}
+    assert "x" in by_id["b"].proposed_order and "x" not in by_id["a"].proposed_order
+    assert by_id["b"].moved_in == ("x",) and by_id["a"].moved_out == ("x",)
+    assert proposal.score_after.objective() < proposal.score_before.objective()
+
+
+def test_locked_stop_stays_first_and_never_moves() -> None:
+    fleet = Fleet([
+        route("a", point(1.2000, -77.3000), [
+            ("x", 1.2005, -77.2505), ("a1", 1.2005, -77.2990), ("a2", 1.2010, -77.2980),
+        ], locked=1),
+        route("b", point(1.2000, -77.2500), [("b1", 1.2000, -77.2490), ("b2", 1.2010, -77.2480)]),
+    ])
