@@ -124,3 +124,65 @@ def _keys_in_different_lanes(queue: object, lanes: int) -> tuple[str, str]:
     first = "courier-0"
     for index in range(1, 500):
         other = f"courier-{index}"
+        if queue.lane_of(other) != queue.lane_of(first):
+            return first, other
+    raise AssertionError("no hay dos claves en carriles distintos")
+
+
+@pytest.mark.asyncio
+async def test_sharded_queue_does_not_let_one_courier_block_another() -> None:
+    """H: una sola cola global serializaba a todos los repartidores (503 desde ~250 GPS/s)."""
+    from app.services.location_event_queue import ShardedLocationQueue
+
+    queue = ShardedLocationQueue(lanes=4, max_pending_per_lane=10)
+    slow_key, fast_key = _keys_in_different_lanes(queue, 4)
+    release_slow = asyncio.Event()
+    started_slow = asyncio.Event()
+
+    async def slow() -> str:
+        started_slow.set()
+        await release_slow.wait()
+        return "lento"
+
+    async def fast() -> str:
+        return "rápido"
+
+    slow_task = asyncio.create_task(queue.enqueue(slow, key=slow_key))
+    await started_slow.wait()
+    # Con una cola global esto esperaría a que termine el trabajo lento.
+    assert await asyncio.wait_for(queue.enqueue(fast, key=fast_key), timeout=1) == "rápido"
+    release_slow.set()
+    assert await slow_task == "lento"
+
+
+@pytest.mark.asyncio
+async def test_sharded_queue_keeps_fifo_per_courier_and_backpressure_per_lane() -> None:
+    from app.services.location_event_queue import ShardedLocationQueue
+
+    queue = ShardedLocationQueue(lanes=4, max_pending_per_lane=2)
+    release = asyncio.Event()
+    started = asyncio.Event()
+    order: list[int] = []
+
+    async def first() -> int:
+        started.set()
+        await release.wait()
+        order.append(1)
+        return 1
+
+    async def second() -> int:
+        order.append(2)
+        return 2
+
+    one = asyncio.create_task(queue.enqueue(first, key="courier-a"))
+    await started.wait()
+    two = asyncio.create_task(queue.enqueue(second, key="courier-a"))
+    await asyncio.sleep(0)
+    assert queue.pending_count == 2
+    with pytest.raises(LocationQueueFullError):
+        await queue.enqueue(second, key="courier-a")
+    release.set()
+    assert await asyncio.gather(one, two) == [1, 2]
+    assert order == [1, 2]
+    assert queue.pending_count == 0
+    await queue.wait_until_idle()
