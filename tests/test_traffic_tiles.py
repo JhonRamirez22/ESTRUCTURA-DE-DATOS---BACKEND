@@ -124,3 +124,66 @@ async def test_rate_limit_serves_marked_stale_data_only_for_bounded_time() -> No
             if calls == 1
             else httpx.Response(429)
         )
+
+    service = TrafficService(
+        api_key="test", transport=httpx.MockTransport(respond), monotonic=lambda: clock[0]
+    )
+    try:
+        first = await service.get_flow_tile(*pasto_tile(), refresh_bucket=1)
+        clock[0] = 90
+        stale = await service.get_flow_tile(*pasto_tile(), refresh_bucket=2)
+        assert stale.cache_status == "STALE" and stale.observed_at == first.observed_at
+        z, x, y = pasto_tile(18)
+        with pytest.raises(TrafficRateLimitError):
+            await service.get_flow_tile(z, x, y)
+        assert calls == 2
+        clock[0] = 601
+        with pytest.raises(TrafficRateLimitError):
+            await service.get_flow_tile(*pasto_tile())
+    finally:
+        await service.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,expected",
+    [
+        (429, TrafficRateLimitError),
+        (500, TrafficProviderError),
+        (404, TrafficNoCoverageError),
+        (204, TrafficNoCoverageError),
+    ],
+)
+async def test_http_failures_are_typed_without_exposing_key(
+    status: int,
+    expected: type[Exception],
+) -> None:
+    service = TrafficService(
+        api_key="private-test-key",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(status),
+        ),
+    )
+    try:
+        with pytest.raises(expected) as caught:
+            await service.get_flow_tile(*pasto_tile())
+        assert "private-test-key" not in str(caught.value)
+    finally:
+        await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_timeout_and_invalid_png_are_not_reported_as_clear_traffic() -> None:
+    def timeout(_: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("network")
+
+    for transport, expected in (
+        (httpx.MockTransport(timeout), TrafficTimeoutError),
+        (httpx.MockTransport(lambda _: httpx.Response(200, text="not PNG")), TrafficProviderError),
+    ):
+        service = TrafficService(api_key="test", transport=transport)
+        try:
+            with pytest.raises(expected):
+                await service.get_flow_tile(*pasto_tile())
+        finally:
+            await service.aclose()
