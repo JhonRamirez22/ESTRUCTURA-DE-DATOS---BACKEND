@@ -220,3 +220,76 @@ async def test_cancelling_a_route_releases_its_shipments_and_failures_are_record
 
 
 @pytest.mark.asyncio
+async def test_deleting_a_shipment_keeps_its_history_without_the_link(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    point = await _create(client, "H-4")
+    gone = await client.delete(f"/api/pedidos/{point['id']}", headers=_cookie("dispatcher"))
+    assert gone.status_code == 204
+    events = await _events(factory, "H-4")
+    assert set(_kinds(events)) == {"CREATED", "DELETED"}
+    deleted = next(e for e in events if e.event_type == "DELETED")
+    assert deleted.delivery_point_id is None and deleted.from_status == "PENDING"
+    async with factory() as session:
+        assert await session.get(DeliveryPoint, UUID(point["id"])) is None
+
+
+@pytest.mark.asyncio
+async def test_customer_requests_record_request_acceptance_and_rejection(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    async with factory() as session:
+        accepted = DeliveryPoint(
+            id=uuid4(), address="Calle 1", lat=1.2136, lng=-77.2811, status="REQUESTED",
+            order_id="SOL-A", tracking_token=f"t-{uuid4()}",
+        )
+        rejected = DeliveryPoint(
+            id=uuid4(), address="Calle 2", lat=1.2136, lng=-77.2811, status="REQUESTED",
+            order_id="SOL-B", tracking_token=f"t-{uuid4()}",
+        )
+        session.add_all([accepted, rejected])
+        await session.commit()
+    head = _cookie("dispatcher")
+    ok = await client.post(f"/api/solicitudes/{accepted.id}/aceptar", headers=head)
+    no = await client.post(f"/api/solicitudes/{rejected.id}/rechazar", headers=head)
+    assert ok.status_code == 200 and no.status_code == 200
+    accepted_events = await _events(factory, "SOL-A")
+    assert _kinds(accepted_events) == ["ACCEPTED"]
+    moved = (accepted_events[0].from_status, accepted_events[0].to_status)
+    assert moved == ("REQUESTED", "PENDING")
+    rejected_events = await _events(factory, "SOL-B")
+    assert _kinds(rejected_events) == ["REJECTED"]
+    assert rejected_events[0].delivery_point_id is None
+
+
+# ---- scheduling --------------------------------------------------------------------------
+
+
+def _bogota(moment_utc: datetime) -> str:
+    return (moment_utc + BOGOTA_OFFSET).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+@pytest.mark.asyncio
+async def test_scheduled_delivery_is_stored_in_utc_labelled_and_recorded(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    soon = datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=30)
+    later = datetime.now(UTC).replace(tzinfo=None) + timedelta(days=3)
+    near = await _create(client, "S-1", scheduledFor=_bogota(soon))  # a naive value is Bogotá time
+    far = await _create(client, "S-2", scheduledFor=later.replace(tzinfo=UTC).isoformat())
+    plain = await _create(client, "S-3")
+    assert near["scheduleState"] == "due-soon" and far["scheduleState"] == "scheduled"
+    assert plain["scheduleState"] is None and plain["scheduledFor"] is None
+    stored = datetime.fromisoformat(near["scheduledFor"].replace("Z", "+00:00"))
+    assert abs((stored.replace(tzinfo=None) - soon).total_seconds()) < 2
+    assert set(_kinds(await _events(factory, "S-1"))) == {"CREATED", "SCHEDULED"}
+
+
+@pytest.mark.asyncio
+async def test_rejects_past_and_too_distant_schedules(client: httpx.AsyncClient) -> None:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    for value in (now - timedelta(hours=2), now + timedelta(days=MAX_DAYS_AHEAD + 2)):
+        response = await client.post(
+            "/api/pedidos", headers=_cookie("dispatcher"),
+            json={**_ORDER, "orderId": f"X-{uuid4().hex[:6]}",
+                  "scheduledFor": value.replace(tzinfo=UTC).isoformat()},
