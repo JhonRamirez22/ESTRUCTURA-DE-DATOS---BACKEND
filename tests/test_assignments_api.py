@@ -255,3 +255,88 @@ async def test_proposal_does_not_call_ai_or_persist_routes_before_dispatch(
     client: httpx.AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    courier = await _create_courier(session_factory, latitude=1.2136, longitude=-77.2811)
+    point = await _create_point(session_factory, latitude=1.214, longitude=-77.28)
+    advisor = FakeTrafficAdvisor()
+    traffic_calls: list[Coordinate] = []
+
+    class Traffic:
+        async def get_flow_segment(self, coordinate: Coordinate) -> TrafficData:
+            traffic_calls.append(coordinate)
+            return TrafficData(
+                current_speed_kmh=20, free_flow_speed_kmh=40,
+                current_travel_time_seconds=120, free_flow_travel_time_seconds=60,
+                confidence=0.9, road_closure=False, traffic_ratio=0.5,
+                traffic_level=TrafficLevel.ALTO, travel_time_multiplier=2.0,
+                timestamp=datetime.now(UTC),
+            )
+
+    app.dependency_overrides[get_route_traffic_advisor] = lambda: advisor
+    app.dependency_overrides[get_traffic_service] = Traffic
+    try:
+        response = await client.post(
+            "/api/asignaciones",
+            headers={"Cookie": _dispatcher_cookie()},
+            json={"courierIds": [str(courier.id)], "deliveryPointIds": [str(point.id)]},
+        )
+        assert advisor.route_requests == 0
+        assert traffic_calls == []
+        async with session_factory() as session:
+            assert await session.scalar(select(func.count()).select_from(Route)) == 0
+        dispatched = await client.post(
+            "/api/asignaciones/aplicar",
+            headers={"Cookie": _dispatcher_cookie()},
+            json={"assignments": response.json()["assignments"]},
+        )
+        assert dispatched.status_code == 201, dispatched.text
+        assert advisor.route_requests == 1
+        assert traffic_calls
+        assert dispatched.json()["routes"][0]["liveTraffic"]["applied"] is True
+        route_id = dispatched.json()["routes"][0]["route"]["id"]
+        calls_after_dispatch = len(traffic_calls)
+        for _ in range(2):
+            listed = await client.get("/api/rutas", headers={"Cookie": _dispatcher_cookie()})
+            navigation = await client.get(
+                f"/api/rutas/{route_id}/navegacion", headers={"Cookie": _dispatcher_cookie()}
+            )
+            assert listed.status_code == navigation.status_code == 200
+        assert advisor.route_requests == 1
+        assert len(traffic_calls) == calls_after_dispatch
+    finally:
+        app.dependency_overrides.pop(get_route_traffic_advisor, None)
+        app.dependency_overrides.pop(get_traffic_service, None)
+
+    assert response.status_code == 200
+    assert advisor.assignment_request is None
+    assert response.json()["ai"]["source"] == "deterministic"
+    assert response.json()["ai"]["applied"] is False
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Route)) == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_persists_optimized_routes_and_point_order(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier = await _create_courier(session_factory, latitude=1.2136, longitude=-77.2811)
+    points = [
+        await _create_point(session_factory, latitude=1.214, longitude=-77.28),
+        await _create_point(session_factory, latitude=1.216, longitude=-77.278),
+    ]
+
+    response = await client.post(
+        "/api/asignaciones/aplicar",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={
+            "assignments": [
+                {
+                    "courierId": str(courier.id),
+                    "deliveryPointIds": [str(point.id) for point in points],
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["customerNotifications"]["queued"] == 0
