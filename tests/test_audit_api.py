@@ -244,3 +244,85 @@ async def test_invalid_period_unknown_subject_and_rate_limit(
         (await client.get("/api/v1/auditoria/informe", headers=head,
                           params=_query("courier", uuid4()))).status_code
         for _ in range(12)
+    ]
+    assert 429 in codes
+    audit._LIMITER._hits.clear()
+
+
+def _period() -> dict[str, str]:
+    return {"desde": _TODAY, "hasta": _TODAY}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("summary", ("Resumen de operación", "Envíos creados", "Tasa de éxito")),
+        ("couriers", ("Rendimiento por repartidor", "Ana Repartidora", "Km GPS")),
+        ("shipments", ("Historial de envíos", "RP-1001")),
+        ("scheduled", ("Programados frente a cumplidos", "Cumplimiento")),
+    ],
+)
+async def test_fleet_reports_render_pdfs(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession],
+    kind: str, expected: tuple[str, ...],
+) -> None:
+    from app.api import audit
+
+    audit._LIMITER._hits.clear()
+    await _seed(factory)
+    response = await client.get("/api/v1/auditoria/informe-general", headers=_cookie("dispatcher"),
+                                params={"tipo": kind, **_period()})
+    assert response.status_code == 200, response.text
+    assert response.content.startswith(b"%PDF-1.4")
+    text = _pdf_text(response.content)
+    for item in expected:
+        assert item in text, item
+    assert "cliente.privado" not in text and "3109998877" not in text
+
+
+@pytest.mark.asyncio
+async def test_fleet_report_permissions_and_download_log(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    from app.api import audit
+
+    audit._LIMITER._hits.clear()
+    await _seed(factory)
+    params = {"tipo": "summary", **_period()}
+    denied = await client.get("/api/v1/auditoria/informe-general", params=params,
+                              headers=_cookie("courier", _COURIER_ID))
+    assert denied.status_code in {401, 403}
+    assert (await client.get("/api/v1/auditoria/informe-general", params={
+        **params, "tipo": "otro"}, headers=_cookie("dispatcher"))).status_code == 422
+    await client.get("/api/v1/auditoria/informe-general", params=params,
+                     headers=_cookie("dispatcher"))
+    downloads = await client.get("/api/v1/auditoria/descargas", headers=_cookie("dispatcher"))
+    assert [d["action"] for d in downloads.json()["downloads"]] == ["fleet_summary"]
+    assert (await client.get("/api/v1/auditoria/descargas",
+                             headers=_cookie("courier", _COURIER_ID))).status_code in {401, 403}
+
+
+@pytest.mark.asyncio
+async def test_event_log_filters_and_paginates(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    from app.models import DeliveryEvent
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with factory() as session:
+        for index in range(55):
+            session.add(DeliveryEvent(
+                order_ref=f"RP-{index}", event_type="DELIVERED" if index % 2 else "ASSIGNED",
+                actor_role="dispatcher", occurred_at=now - timedelta(seconds=index),
+            ))
+        await session.commit()
+    head = _cookie("dispatcher")
+    first = (await client.get("/api/v1/auditoria/eventos", headers=head)).json()
+    assert len(first["events"]) == 50 and first["hasMore"] is True
+    second = (await client.get("/api/v1/auditoria/eventos?pagina=2", headers=head)).json()
+    assert len(second["events"]) == 5 and second["hasMore"] is False
+    only = (await client.get("/api/v1/auditoria/eventos?tipo=delivered", headers=head)).json()
+    assert {e["type"] for e in only["events"]} == {"DELIVERED"}
+    assert (await client.get("/api/v1/auditoria/eventos",
+                             headers=_cookie("courier", _COURIER_ID))).status_code in {401, 403}
