@@ -200,3 +200,70 @@ async def test_dispatcher_gets_channel_and_outbox_counts_without_contact_data(
                     address="Calle 18 # 20-30",
                     lat=1.214,
                     lng=-77.28,
+                    status=DeliveryPointStatus.PENDING,
+                    order_id=f"OUTBOX-{sms_point_id}",
+                    tracking_token=f"OUTBOX-{sms_point_id}",
+                ),
+            ]
+        )
+        await session.flush()
+        session.add_all(
+            [
+                CustomerNotificationOutbox(
+                    id=uuid4(),
+                    delivery_point_id=email_point_id,
+                    event_key=f"email-retry-{email_point_id}",
+                    event_type=CustomerNotificationEvent.ORDER_ASSIGNED,
+                    channel=CustomerNotificationChannel.EMAIL,
+                    recipient_email="private@example.com",
+                    subject="Private subject",
+                    text_body="Private notification content",
+                    status=CustomerNotificationStatus.PENDING,
+                    attempt_count=2,
+                    last_error_code="TimeoutError",
+                ),
+                CustomerNotificationOutbox(
+                    id=uuid4(),
+                    delivery_point_id=sms_point_id,
+                    event_key=f"sms-pending-{sms_point_id}",
+                    event_type=CustomerNotificationEvent.COURIER_NEAR,
+                    channel=CustomerNotificationChannel.SMS,
+                    recipient_phone="+573001234567",
+                    subject="Private SMS subject",
+                    text_body="Private SMS content",
+                    status=CustomerNotificationStatus.PENDING,
+                    attempt_count=0,
+                ),
+                CustomerNotificationOutbox(
+                    id=uuid4(),
+                    delivery_point_id=sms_point_id,
+                    event_key=f"sms-processing-{sms_point_id}",
+                    event_type=CustomerNotificationEvent.COURIER_NEAR,
+                    channel=CustomerNotificationChannel.SMS,
+                    recipient_phone="+573009876543",
+                    subject="Another private SMS subject",
+                    text_body="Another private SMS content",
+                    status=CustomerNotificationStatus.PROCESSING,
+                    attempt_count=1,
+                ),
+                CustomerNotificationOutbox(
+                    id=uuid4(),
+                    delivery_point_id=email_point_id,
+                    event_key=f"email-failed-{email_point_id}",
+                    event_type=CustomerNotificationEvent.ORDER_ASSIGNED,
+                    channel=CustomerNotificationChannel.EMAIL,
+                    recipient_email=None,
+                    subject="",
+                    text_body="",
+                    status=CustomerNotificationStatus.FAILED,
+                    attempt_count=8,
+                    last_error_code="TimeoutError",
+                ),
+            ]
+        )
+        await session.commit()
+
+    monkeypatch.setattr(
+        notifications_api,
+        "customer_notification_channels_configured",
+        lambda _settings: {
