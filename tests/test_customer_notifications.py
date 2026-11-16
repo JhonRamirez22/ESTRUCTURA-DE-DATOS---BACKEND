@@ -258,3 +258,89 @@ async def test_sms_is_queued_only_after_explicit_opt_in_and_is_idempotent(
 
 def test_twilio_sender_posts_opted_in_phone_over_https_without_putting_credentials_in_url() -> None:
     captured: dict[str, object] = {}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers.get("authorization")
+        captured["body"] = request.content.decode()
+        return httpx.Response(201, json={"sid": "SM-test"})
+
+    settings = Settings(
+        notification_sms_twilio_account_sid="AC" + "a" * 32,
+        notification_sms_twilio_auth_token=SecretStr("private-token"),
+        notification_sms_twilio_from_phone="+15005550006",
+    )
+    TwilioSmsSender(settings, transport=httpx.MockTransport(respond)).send(
+        CustomerSms(recipient="+573001234567", text_body="Tu pedido fue asignado.")
+    )
+
+    assert captured["url"] == (
+        "https://api.twilio.com/2010-04-01/Accounts/AC" + "a" * 32 + "/Messages.json"
+    )
+    assert "private-token" not in str(captured["url"])
+    assert str(captured["authorization"]).startswith("Basic ")
+    assert "To=%2B573001234567" in str(captured["body"])
+    assert "Body=Tu+pedido+fue+asignado." in str(captured["body"])
+
+
+def test_proximity_is_a_bounded_distance_estimate_not_an_eta() -> None:
+    assert is_courier_near_delivery_point(1.2136, -77.2811, 1.214, -77.2811)
+    assert not is_courier_near_delivery_point(1.2136, -77.2811, 1.22, -77.2811)
+    assert not is_courier_near_delivery_point(1.2136, -77.2811, math.nan, -77.2811)
+
+
+@pytest.mark.asyncio
+async def test_successful_delivery_redacts_email_payload_and_keeps_idempotency_key(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    point = await _create_point(session_factory)
+    route_id = uuid4()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    sender = _FakeSender()
+    async with session_factory() as session:
+        persisted = await session.get(DeliveryPoint, point.id)
+        assert persisted is not None
+        await enqueue_order_assigned_notification(session, persisted, route_id, now=now)
+        await session.commit()
+
+    summary = await dispatch_pending_customer_notifications(
+        session_factory,
+        settings=_smtp_settings(),
+        sender=sender,
+        now=now,
+    )
+
+    assert summary.configured is True
+    assert summary.attempted == 1 and summary.sent == 1 and summary.deferred == 0
+    assert len(sender.messages) == 1
+    assert sender.messages[0].recipient == "cliente@example.com"
+    assert "Tu pedido fue asignado" in sender.messages[0].text_body
+    assert point.order_id not in sender.messages[0].text_body
+    async with session_factory() as session:
+        event_row = await session.scalar(select(CustomerNotificationOutbox))
+        assert event_row is not None
+        assert event_row.status is CustomerNotificationStatus.SENT
+        assert event_row.recipient_email is None
+        assert event_row.text_body == ""
+        persisted = await session.get(DeliveryPoint, point.id)
+        assert persisted is not None
+        assert (
+            await enqueue_order_assigned_notification(session, persisted, route_id, now=now)
+            == ()
+        )
+
+    repeated = await dispatch_pending_customer_notifications(
+        session_factory,
+        settings=_smtp_settings(),
+        sender=sender,
+        now=now + timedelta(minutes=5),
+    )
+    assert repeated.attempted == 0
+    assert len(sender.messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_is_retried_later_without_storing_exception_text(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    point = await _create_point(session_factory)
