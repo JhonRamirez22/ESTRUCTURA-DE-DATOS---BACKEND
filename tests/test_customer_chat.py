@@ -249,3 +249,86 @@ async def _create_active_order(
         status=DeliveryPointStatus.EN_ROUTE,
         order_id=f"internal-{uuid4()}",
         tracking_token=guide,
+        route_id=route.id,
+        sequence_index=0,
+    )
+    async with session_factory() as session:
+        session.add_all([courier, route, point])
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_http_assistant_sends_only_minimal_order_context_to_openai_compatible_api() -> None:
+    captured: dict[str, object] = {}
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        captured["authorization"] = request.headers.get("authorization")
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "Tu pedido está registrado."}}]},
+        )
+
+    assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
+        api_key="private-test-key",
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(respond),
+    )
+    reply = await assistant.answer(
+        delivery_status="PENDING",
+        route_status=None,
+        messages=[CustomerChatTurn(role="user", content="¿Qué pasa con mi pedido?")],
+        estimated_minutes_from_now=12.5,
+    )
+
+    captured_body = captured["body"]
+    assert isinstance(captured_body, dict)
+    sent_messages = captured_body["messages"]
+    assert isinstance(sent_messages, list)
+    system_content = sent_messages[0]["content"]
+    order_context = system_content.split("Contexto del pedido (JSON): ", maxsplit=1)[1]
+    context_payload = json.loads(order_context)
+    serialized_body = json.dumps(captured_body, ensure_ascii=False)
+    assert "texto plano" in system_content
+    assert reply == "Tu pedido está registrado."
+    assert captured["authorization"] == "Bearer private-test-key"
+    assert sent_messages[1] == {
+        "role": "user",
+        "content": "¿Cuál es el estado actual de mi pedido?",
+    }
+    assert context_payload == {
+        "deliveryStatus": "PENDING",
+        "routeStatus": None,
+        "statusDefinitions": {
+            "PENDING": "recibido y aún sin asignar a una ruta",
+            "EN_ROUTE": "asignado y en camino",
+            "DELIVERED": "entregado",
+            "FAILED": "entrega con incidencia",
+            "PLANNED": "ruta planeada, aún no iniciada",
+            "IN_PROGRESS": "ruta en curso",
+            "COMPLETED": "ruta finalizada",
+            "CANCELLED": "ruta cancelada",
+        },
+    }
+    assert "secret-guide" not in serialized_body
+    assert "Carrera 25" not in serialized_body
+    assert "internal-order-id" not in serialized_body
+    assert "-77.2811" not in serialized_body
+    assert "1.2136" not in serialized_body
+
+
+@pytest.mark.asyncio
+async def test_http_assistant_scopes_private_text_and_returns_plain_text_statuses() -> None:
+    captured: dict[str, object] = {}
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
