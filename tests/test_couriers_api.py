@@ -226,3 +226,79 @@ async def test_authenticated_location_is_validated_persisted_and_updates_courier
         headers={"Cookie": _cookie("courier", str(courier_id))},
         json={
             "lat": 1.2136,
+            "lng": -77.2811,
+            "recordedAt": recorded_at.isoformat().replace("+00:00", "Z"),
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["accepted"] is True
+    assert response.json()["locationEvent"]["courierId"] == str(courier_id)
+    assert response.json()["locationEvent"]["recordedAt"].endswith("Z")
+    async with session_factory() as session:
+        courier = await session.get(Courier, courier_id)
+        events = await session.scalars(
+            select(LocationEvent).where(LocationEvent.courier_id == courier_id)
+        )
+        assert courier is not None
+        assert courier.status is CourierStatus.AVAILABLE
+        assert courier.current_lat == 1.2136
+        assert len(events.all()) == 1
+
+    me = await client.get(
+        "/api/repartidores/me", headers={"Cookie": _cookie("courier", str(courier_id))}
+    )
+    assert me.status_code == 200
+    assert me.json()["courier"]["currentLat"] == 1.2136
+    assert "phone" not in me.json()["courier"]
+
+
+@pytest.mark.asyncio
+async def test_location_rejects_other_courier_and_coordinates_outside_pasto(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier_id = await _create_courier(session_factory)
+    other_id = uuid4()
+    other_courier = await client.post(
+        f"/api/repartidores/{courier_id}/ubicacion",
+        headers={"Cookie": _cookie("courier", str(other_id))},
+        json={"lat": 1.2136, "lng": -77.2811},
+    )
+    outside = await client.post(
+        "/api/repartidores/me/ubicacion",
+        headers={"Cookie": _cookie("courier", str(courier_id))},
+        json={"lat": 40.7128, "lng": -74.006},
+    )
+
+    assert other_courier.status_code == 403
+    assert outside.status_code == 400
+    async with session_factory() as session:
+        assert await session.scalar(select(LocationEvent.id)) is None
+
+
+@pytest.mark.asyncio
+async def test_old_location_is_recorded_but_cannot_replace_newer_fix_and_stop_goes_offline(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier_id = await _create_courier(session_factory)
+    latest = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=5)
+    async with session_factory() as session:
+        courier = await session.get(Courier, courier_id)
+        assert courier is not None
+        courier.current_lat = 1.22
+        courier.current_lng = -77.27
+        courier.last_location_at = latest
+        await session.commit()
+
+    older = await client.post(
+        "/api/repartidores/me/ubicacion",
+        headers={"Cookie": _cookie("courier", str(courier_id))},
+        json={
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "recordedAt": (latest - timedelta(seconds=2)).isoformat() + "Z",
+        },
+    )
+    stopped = await client.delete(
