@@ -241,3 +241,83 @@ async def test_dispatcher_login_sets_private_cookie_and_does_not_disclose_claims
     assert "rutas-pasto-dispatch-session=" in response.headers["set-cookie"]
     assert "HttpOnly" in response.headers["set-cookie"]
     assert "SameSite=Strict" in response.headers["set-cookie"]
+    assert response.headers["cache-control"] == "no-store, private"
+    assert "role" not in response.json()
+    assert "courierId" not in response.json()
+    session_response = await client.get("/api/auth/session")
+    assert session_response.json() == {"authenticated": True}
+
+
+@pytest.mark.asyncio
+async def test_email_login_uses_account_role_and_private_session(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTH_LEGACY_CODE_LOGIN_ENABLED", "false")
+    get_settings.cache_clear()
+    async with session_factory() as session:
+        session.add(
+            Account(
+                email="despacho@example.com",
+                password_hash=hash_password("Una contraseña privada 2026"),
+                role="dispatcher",
+            )
+        )
+        await session.commit()
+    rejected = await client.post("/api/auth/login", json={"accessCode": DISPATCHER_CODE})
+    assert rejected.status_code == 400
+    response = await client.post(
+        "/api/auth/login",
+        json={
+            "email": " DESPACHO@EXAMPLE.COM ",
+            "password": "Una contraseña privada 2026",
+            "role": "courier",
+            "returnTo": "//evil.example",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    expected = {"authenticated": True, "redirectTo": "/dashboard"}
+    assert body == {**expected, "accessToken": body["accessToken"]}
+    assert "HttpOnly" in response.headers["set-cookie"]
+    assert "password" not in response.text
+    for _ in range(12):
+        successful = await client.post(
+            "/api/auth/login",
+            json={
+                "email": "despacho@example.com",
+                "password": "Una contraseña privada 2026",
+            },
+        )
+        assert successful.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_email_login_invalid_unknown_disabled_and_rate_limit(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # El tiempo restante no debe variar con la carga del equipo durante la prueba.
+    clock = Mock(wraps=datetime)
+    clock.now.return_value = datetime.now(UTC)
+    monkeypatch.setattr("app.services.customer_chat_rate_limiter.datetime", clock)
+    async with session_factory() as session:
+        session.add(
+            Account(
+                email="disabled@example.com",
+                password_hash=hash_password("Una contraseña privada 2026"),
+                role="dispatcher",
+                enabled=False,
+            )
+        )
+        await session.commit()
+    malformed = await client.post("/api/auth/login", json={"email": "invalid", "password": "x"})
+    assert malformed.status_code == 400
+    for email in ("disabled@example.com", "unknown@example.com"):
+        response = await client.post(
+            "/api/auth/login",
+            json={
+                "email": email,
+                "password": "Una contraseña privada 2026",
