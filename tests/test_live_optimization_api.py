@@ -191,3 +191,67 @@ async def test_proposes_moving_a_stop_to_the_nearer_courier_with_geometry_and_sc
 ) -> None:
     client, matrix, routes = setup
     a = await _seed_route(factory, "Ana", (1.2000, -77.3000), A_STOPS)
+    b = await _seed_route(factory, "Beto", (1.2000, -77.2500), B_STOPS)
+    response = await _live(client)
+    body = response.json()
+    assert response.status_code == 200, response.text
+    assert body["changed"] is True and body["matrixSource"] == "osrm"
+    assert len(body["moves"]) == 1
+    move = body["moves"][0]
+    assert move["fromRouteId"] == str(a) and move["toRouteId"] == str(b)
+    by_route = {item["routeId"]: item for item in body["routes"]}
+    assert move["stopId"] in by_route[str(b)]["movedIn"]
+    assert move["stopId"] in by_route[str(a)]["movedOut"]
+    assert by_route[str(b)]["geometry"]["type"] == "LineString"
+    assert body["scoreAfter"]["totalMinutes"] < body["scoreBefore"]["totalMinutes"]
+    assert body["savedMinutes"] > 0
+    # The first stop of a route in progress is locked: it is still first in the proposal.
+    assert by_route[str(a)]["proposedOrder"][0] == by_route[str(a)]["currentOrder"][0]
+    assert matrix.calls == 1 and routes.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_unchanged_state_is_served_from_the_ten_second_cache(
+    setup: Any, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    client, matrix, _ = setup
+    await _seed_route(factory, "Ana", (1.2000, -77.3000), A_STOPS)
+    await _seed_route(factory, "Beto", (1.2000, -77.2500), B_STOPS)
+    first = (await _live(client)).json()
+    second = (await _live(client)).json()
+    assert first["cached"] is False and second["cached"] is True
+    assert matrix.calls == 1 and second["routes"] == first["routes"]
+
+
+@pytest.mark.asyncio
+async def test_courier_without_position_is_skipped_and_reported(
+    setup: Any, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    client, _, _ = setup
+    lost = await _seed_route(factory, "Sin GPS", None, B_STOPS)
+    await _seed_route(factory, "Ana", (1.2000, -77.3000), A_STOPS)
+    body = (await _live(client)).json()
+    assert body["skippedRoutes"] == [{"routeId": str(lost), "reason": "no-courier-position"}]
+    assert len(body["routes"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_is_a_clean_502_and_flag_off_disables(
+    setup: Any, factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, matrix, _ = setup
+    await _seed_route(factory, "Ana", (1.2000, -77.3000), A_STOPS)
+    matrix.fail = True
+    down = await _live(client)
+    assert down.status_code == 502 and "osrm" not in down.text.lower()
+    monkeypatch.setenv("LIVE_OPTIMIZATION_ENABLED", "false")
+    get_settings.cache_clear()
+    off = await _live(client)
+    assert off.json() == {"enabled": False, "routes": []}
+
+
+@pytest.mark.asyncio
+async def test_polling_is_rate_limited(setup: Any) -> None:
+    client, _, _ = setup
+    codes = [(await _live(client)).status_code for _ in range(23)]
+    assert codes[:20] == [200] * 20 and 429 in codes[20:]
