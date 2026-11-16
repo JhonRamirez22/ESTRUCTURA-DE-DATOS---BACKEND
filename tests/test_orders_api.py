@@ -232,3 +232,80 @@ async def test_customer_email_requires_consent_and_is_never_returned_in_order_js
         },
     )
     invalid_email = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            "address": "Calle 10",
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "orderId": "EMAIL-INVALID",
+            "customerEmail": "no-es-correo",
+            "emailNotificationsEnabled": True,
+        },
+    )
+    unconsented_email = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            "address": "Calle 10",
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "orderId": "EMAIL-NO-CONSENT",
+            "customerEmail": "no-retener@example.com",
+            "emailNotificationsEnabled": False,
+        },
+    )
+    created = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            "address": "Calle 10",
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "orderId": "EMAIL-CONSENT",
+            "customerEmail": "cliente@example.com",
+            "emailNotificationsEnabled": True,
+        },
+    )
+
+    assert missing_contact.status_code == 400
+    assert invalid_email.status_code == 400
+    assert unconsented_email.status_code == 201
+    assert created.status_code == 201
+    assert "no-retener@example.com" not in unconsented_email.text
+    assert "cliente@example.com" not in created.text
+    point_id = UUID(created.json()["deliveryPoint"]["id"])
+    unconsented_id = UUID(unconsented_email.json()["deliveryPoint"]["id"])
+    async with session_factory() as session:
+        saved = await session.get(DeliveryPoint, point_id)
+        assert saved is not None
+        assert saved.customer_email == "cliente@example.com"
+        assert saved.email_notifications_enabled is True
+        unconsented = await session.get(DeliveryPoint, unconsented_id)
+        assert unconsented is not None
+        assert unconsented.customer_email is None
+        assert unconsented.email_notifications_enabled is False
+
+    async with session_factory() as session:
+        saved = await session.get(DeliveryPoint, point_id)
+        assert saved is not None
+        await enqueue_order_assigned_notification(session, saved, uuid4())
+        await session.commit()
+
+    revoked = await client.patch(
+        f"/api/pedidos/{point_id}",
+        headers=headers,
+        json={"emailNotificationsEnabled": False},
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert "cliente@example.com" not in revoked.text
+    async with session_factory() as session:
+        saved = await session.get(DeliveryPoint, point_id)
+        assert saved is not None
+        assert saved.customer_email is None
+        assert saved.email_notifications_enabled is False
+        notification = await session.scalar(
+            select(CustomerNotificationOutbox).where(
+                CustomerNotificationOutbox.delivery_point_id == point_id
+            )
+        )
