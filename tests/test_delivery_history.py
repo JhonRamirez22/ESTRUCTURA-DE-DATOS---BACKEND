@@ -293,3 +293,76 @@ async def test_rejects_past_and_too_distant_schedules(client: httpx.AsyncClient)
             "/api/pedidos", headers=_cookie("dispatcher"),
             json={**_ORDER, "orderId": f"X-{uuid4().hex[:6]}",
                   "scheduledFor": value.replace(tzinfo=UTC).isoformat()},
+        )
+        assert response.status_code == 400 and "scheduledFor" in response.text
+
+
+@pytest.mark.asyncio
+async def test_rescheduling_and_clearing_are_recorded_with_before_and_after(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    point = await _create(client, "S-4")
+    later = datetime.now(UTC) + timedelta(days=2)
+    first = await client.patch(
+        f"/api/pedidos/{point['id']}", headers=_cookie("dispatcher"),
+        json={"scheduledFor": later.isoformat()},
+    )
+    assert first.status_code == 200
+    assert first.json()["deliveryPoint"]["scheduleState"] == "scheduled"
+    cleared = await client.patch(
+        f"/api/pedidos/{point['id']}", headers=_cookie("dispatcher"), json={"scheduledFor": None}
+    )
+    assert cleared.status_code == 200 and cleared.json()["deliveryPoint"]["scheduledFor"] is None
+    events = [e for e in await _events(factory, "S-4") if "SCHEDULED" in e.event_type]
+    assert [e.event_type for e in events] == ["SCHEDULED", "RESCHEDULED"]
+    assert events[1].detail is not None and events[1].detail.endswith("→ —")
+
+
+# ---- DeliverySchedule --------------------------------------------------------------------
+
+
+def test_schedule_states_and_queue_order() -> None:
+    now = datetime(2026, 11, 23, 12, 0)
+    schedule = DeliverySchedule(lead_minutes=60, clock=lambda: now)
+    assert schedule.state(None) is None
+    assert schedule.state(now - timedelta(minutes=1)) is ScheduleState.OVERDUE
+    assert schedule.state(now + timedelta(minutes=59)) is ScheduleState.DUE_SOON
+    assert schedule.state(now + timedelta(minutes=61)) is ScheduleState.SCHEDULED
+    overdue = DeliverySchedule.sort_key(ScheduleState.OVERDUE, 1, now - timedelta(hours=1))
+    soon = DeliverySchedule.sort_key(ScheduleState.DUE_SOON, 3, now + timedelta(minutes=10))
+    urgent = DeliverySchedule.sort_key(None, 3, None)
+    normal = DeliverySchedule.sort_key(None, 1, None)
+    assert sorted([normal, urgent, soon, overdue]) == [overdue, soon, urgent, normal]
+
+
+def test_schedule_parse_boundaries() -> None:
+    now = datetime(2026, 11, 23, 12, 0)
+    schedule = DeliverySchedule(clock=lambda: now)
+    assert schedule.parse(None) is None
+    assert schedule.parse(datetime(2026, 11, 23, 9, 0)) == datetime(2026, 11, 23, 14, 0)
+    assert schedule.parse(now - timedelta(minutes=4)) is not None  # inside the tolerance
+    with pytest.raises(ValueError):
+        schedule.parse(now.replace(tzinfo=UTC) - timedelta(minutes=10))
+    with pytest.raises(ValueError):
+        schedule.parse(now.replace(tzinfo=UTC) + timedelta(days=MAX_DAYS_AHEAD + 1))
+
+
+# ---- history API and customer milestones ---------------------------------------------------
+
+
+async def _lifecycle(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession], ref: str
+) -> tuple[dict[str, Any], UUID]:
+    courier_id = await _courier(factory)
+    point = await _create(client, ref)
+    applied = await client.post(
+        "/api/asignaciones/aplicar", headers=_cookie("dispatcher"),
+        json={"assignments": [{"courierId": str(courier_id), "deliveryPointIds": [point["id"]]}]},
+    )
+    route_id = applied.json()["routes"][0]["route"]["id"]
+    await client.patch(
+        f"/api/rutas/{route_id}", headers=_cookie("dispatcher"), json={"status": "IN_PROGRESS"}
+    )
+    await client.patch(
+        f"/api/pedidos/{point['id']}", headers=_cookie("courier", courier_id),
+        json={"status": "DELIVERED"},
