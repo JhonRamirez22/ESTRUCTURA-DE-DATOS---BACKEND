@@ -223,3 +223,77 @@ def test_locked_stop_stays_first_and_never_moves() -> None:
         ], locked=1),
         route("b", point(1.2000, -77.2500), [("b1", 1.2000, -77.2490), ("b2", 1.2010, -77.2480)]),
     ])
+    proposal = LiveFleetReoptimizer(fleet, matrix_for(fleet)).propose()
+    by_id = {p.route_id: p for p in proposal.routes}
+    assert by_id["a"].proposed_order[0] == "x"
+    assert all(m.stop_id != "x" for m in proposal.moves)
+
+
+def test_never_empties_a_route_and_respects_the_load_cap() -> None:
+    fleet = Fleet([
+        route("a", point(1.2000, -77.3000), [("x", 1.2000, -77.2501)]),
+        route("b", point(1.2000, -77.2500), [("b1", 1.2000, -77.2490), ("b2", 1.2000, -77.2480)]),
+    ])
+    proposal = LiveFleetReoptimizer(fleet, matrix_for(fleet)).propose()
+    assert not proposal.moves
+    assert all(len(p.proposed_order) >= 1 for p in proposal.routes)
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_property_proposal_preserves_stops_and_never_worsens_the_objective(seed: int) -> None:
+    rng = random.Random(seed)
+    couriers = rng.randint(2, 4)
+    routes: list[Route] = []
+    counter = 0
+    for r in range(couriers):
+        stops = []
+        for _ in range(rng.randint(2, 6)):
+            counter += 1
+            stops.append((f"s{counter}", 1.20 + rng.random() * 0.03, -77.30 + rng.random() * 0.05))
+        courier = point(1.20 + rng.random() * 0.03, -77.30 + rng.random() * 0.05)
+        routes.append(route(f"r{r}", courier, stops, locked=rng.randint(0, 1)))
+    fleet = Fleet(routes)
+    proposal = LiveFleetReoptimizer(fleet, matrix_for(fleet)).propose()
+    before_ids = sorted(s for r in fleet.routes for s in r.stop_ids)
+    after_ids = sorted(s for p in proposal.routes for s in p.proposed_order)
+    assert before_ids == after_ids
+    assert proposal.score_after.objective() <= proposal.score_before.objective() + 1e-6
+    originals = {r.route_id: r for r in fleet.routes}
+    for p in proposal.routes:
+        locked = [s.stop_id for s in originals[p.route_id].stops if s.locked]
+        assert list(p.proposed_order[: len(locked)]) == locked
+        assert len(p.proposed_order) >= 1
+
+
+# ---- benchmark ---------------------------------------------------------------------------
+
+
+def test_benchmark_battery_has_thirty_deterministic_scenarios() -> None:
+    from app.routing.benchmark import ScenarioGenerator
+
+    first = ScenarioGenerator().battery()
+    second = ScenarioGenerator().battery()
+    assert len(first) == 30 and [s.name for s in first] == [s.name for s in second]
+    assert first[0].couriers == second[0].couriers and first[7].stops == second[7].stops
+    assert len({s.name for s in first}) == 30
+    different = ScenarioGenerator(seed=1).scenario(4, 14, "uniform")
+    assert different.stops != ScenarioGenerator().scenario(4, 14, "uniform").stops
+    for scenario in first:
+        assert all(1.19 <= p.lat <= 1.24 and -77.31 <= p.lng <= -77.25 for p in scenario.stops)
+
+
+def test_benchmark_runner_never_worsens_the_baseline_and_assigns_every_stop() -> None:
+    from app.routing.benchmark import BaselinePlanner, BenchmarkRunner, ScenarioGenerator
+
+    generator = ScenarioGenerator()
+    scenarios = [generator.scenario(4, 25, "uniform"), generator.scenario(6, 14, "clustered")]
+    for scenario in scenarios:
+        fleet, matrix = BaselinePlanner().plan(scenario)
+        assigned = sorted(stop for route in fleet.routes for stop in route.stop_ids)
+        assert assigned == sorted(f"s{i}" for i in range(len(scenario.stops)))
+        assert matrix.size == len(fleet.index().points)
+    rows = BenchmarkRunner().run(scenarios)
+    assert all(row.objective_gain >= -1e-6 for row in rows)
+    summary = BenchmarkRunner.summarize(rows)
+    assert summary["scenarios"] == 2 and summary["neverWorse"] == 1.0
+    assert BenchmarkRunner.summarize([])["scenarios"] == 0
