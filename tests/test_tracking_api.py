@@ -226,3 +226,78 @@ async def test_active_tracking_shares_rounded_location_and_only_target_leg(
 
 @pytest.mark.asyncio
 async def test_tracking_applies_partial_tomtom_factor_only_to_the_first_road_leg(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    providers: tuple[FakeMatrixProvider, FakeRouteProvider],
+) -> None:
+    _courier, _route, target, _private_point = await _create_active_route(session_factory)
+    traffic = FakeTrafficProvider()
+    app.dependency_overrides[get_traffic_service] = lambda: traffic
+
+    response = await client.get(f"/api/seguimiento?guia={target.tracking_token}")
+    payload = response.json()["tracking"]["route"]
+
+    assert response.status_code == 200
+    assert payload["estimatedMinutesFromNow"] == 13.5
+    assert payload["liveTraffic"]["source"] == "TOMTOM"
+    assert payload["liveTraffic"]["applied"] is True
+    assert payload["liveTraffic"]["status"] == "LIVE"
+    assert "solo el siguiente tramo" in payload["liveTraffic"]["warning"]
+    assert providers[1].calls == [[(-77.2811, 1.2136), (target.lng, target.lat)]]
+
+
+@pytest.mark.asyncio
+async def test_stale_location_and_delivered_point_never_expose_courier_or_route(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    providers: tuple[FakeMatrixProvider, FakeRouteProvider],
+) -> None:
+    courier, _route, target, _private_point = await _create_active_route(
+        session_factory,
+        location_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=10),
+    )
+
+    stale = await client.get(f"/api/seguimiento?guia={target.tracking_token}")
+    stale_route = stale.json()["tracking"]["route"]
+    assert stale_route["courier"]["currentLat"] is None
+    assert stale_route["geometry"] is None
+    assert "ubicación reciente" in stale_route["navigationWarning"]
+    assert providers[0].calls == 0
+    assert providers[1].calls == []
+
+    async with session_factory() as session:
+        point = await session.get(DeliveryPoint, target.id)
+        assert point is not None
+        point.status = DeliveryPointStatus.DELIVERED
+        await session.commit()
+
+    delivered = await client.get(f"/api/seguimiento?guia={target.tracking_token}")
+    delivered_route = delivered.json()["tracking"]["route"]
+    assert delivered_route["courier"]["currentLat"] is None
+    assert delivered_route["geometry"] is None
+    assert delivered_route["estimatedMinutesFromNow"] is None
+    assert str(courier.id) not in delivered.text
+    assert providers[0].calls == 0
+    assert providers[1].calls == []
+
+
+@pytest.mark.asyncio
+async def test_routing_failures_return_warnings_without_straight_line_geometry(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier, route, target, _private_point = await _create_active_route(session_factory)
+    del courier, route
+    matrix = FakeMatrixProvider(fails=True)
+    road_route = FakeRouteProvider(fails=True)
+    app.dependency_overrides[get_routing_providers] = lambda: (matrix, road_route)
+    try:
+        response = await client.get(f"/api/seguimiento?guia={target.tracking_token}")
+    finally:
+        app.dependency_overrides.pop(get_routing_providers, None)
+
+    tracking_route = response.json()["tracking"]["route"]
+    assert response.status_code == 200
+    assert tracking_route["geometry"] is None
+    assert "no se muestra una línea recta" in tracking_route["navigationWarning"].lower()
+    assert "no se estimó con distancias en línea recta" in tracking_route["estimateWarning"]
