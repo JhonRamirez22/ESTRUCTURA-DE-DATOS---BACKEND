@@ -321,3 +321,83 @@ async def test_email_login_invalid_unknown_disabled_and_rate_limit(
             json={
                 "email": email,
                 "password": "Una contraseña privada 2026",
+            },
+        )
+        assert response.status_code == 401
+        assert response.json() == {"error": "Correo o contraseña incorrectos."}
+    for _ in range(9):
+        await client.post("/api/auth/login", json={"email": "unknown@example.com", "password": "x"})
+    limited = await client.post(
+        "/api/auth/login", json={"email": "unknown@example.com", "password": "x"}
+    )
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == "60"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_provisions_courier_account_and_courier_cannot_escalate(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await client.post("/api/auth/login", json={"accessCode": DISPATCHER_CODE})
+    invalid = await client.put(
+        "/api/auth/courier-account",
+        json={
+            "courierId": "invalid",
+            "email": "courier@example.com",
+            "password": "LEAK-ME",
+        },
+    )
+    assert invalid.status_code == 400
+    assert "LEAK-ME" not in invalid.text
+    created = await client.post(
+        "/api/repartidores",
+        json={
+            "name": "Repartidor",
+            "phone": "3000000000",
+            "account": {
+                "email": "courier@example.com",
+                "password": "Contraseña privada para reparto",
+            },
+        },
+    )
+    assert created.status_code == 201
+    assert "accessCode" not in created.json()
+    duplicate = await client.post(
+        "/api/repartidores",
+        json={
+            "name": "Duplicado",
+            "phone": "3000000001",
+            "account": {
+                "email": "courier@example.com",
+                "password": "Contraseña privada para reparto",
+            },
+        },
+    )
+    assert duplicate.status_code == 409
+    await client.post("/api/auth/logout")
+    login = await client.post(
+        "/api/auth/login",
+        json={
+            "email": "courier@example.com",
+            "password": "Contraseña privada para reparto",
+            "role": "dispatcher",
+            "returnTo": "/dashboard",
+        },
+    )
+    assert login.json()["redirectTo"] == "/repartidor"
+    forbidden = await client.put(
+        "/api/auth/courier-account",
+        json={
+            "courierId": created.json()["courier"]["id"],
+            "email": "other@example.com",
+            "password": "Otra contraseña privada 2026",
+        },
+    )
+    assert forbidden.status_code == 403
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Courier)) == 1
+
+
+@pytest.mark.asyncio
+async def test_page_access_is_decided_by_backend_without_exposing_role(
