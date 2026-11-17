@@ -247,3 +247,86 @@ async def test_route_creation_optimizes_and_commits_route_and_ordered_points(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     await _create_courier(session_factory)
+    first_id = await _create_point(session_factory, address="Carrera 25 # 4 sur 65")
+    second_id = await _create_point(session_factory, address="Calle 18 # 20-30")
+
+    response = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(first_id), str(second_id)]},
+    )
+
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert payload["orderedDeliveryPointIds"] == [str(second_id), str(first_id)]
+    assert payload["matrixSource"] == "osrm"
+    assert payload["route"]["geometryProvider"] == "OSRM"
+    assert payload["route"]["estimatedDurationMinutes"] == 12.5
+    async with session_factory() as session:
+        route = await session.scalar(select(Route).options(selectinload(Route.delivery_points)))
+        assert route is not None
+        assert route.status == RouteStatus.PLANNED
+        ordered = sorted(route.delivery_points, key=lambda point: point.sequence_index or 0)
+        assert [point.id for point in ordered] == [second_id, first_id]
+        assert [point.sequence_index for point in ordered] == [0, 1]
+    # Si el orden óptimo difiere del orden base, se devuelve su trazado para compararlo.
+    optimization = payload["optimization"]
+    assert optimization["optimizedOrder"] == [str(second_id), str(first_id)]
+    if optimization["baselineOrder"] != optimization["optimizedOrder"]:
+        assert optimization["baselineGeometry"]["type"] == "LineString"
+    assert optimization["savedMinutes"] is None or optimization["savedMinutes"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_route_creation_applies_tomtom_factor_and_returns_coverage(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    traffic = FakeTomTomTrafficProvider()
+    app.dependency_overrides[get_traffic_service] = lambda: traffic
+
+    response = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(point_id)]},
+    )
+
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert payload["route"]["estimatedDurationMinutes"] == 12.0
+    # Una sola parada no ahorra ni pierde tiempo por reordenación: ambas usan el mismo tráfico.
+    assert payload["route"]["baselineDurationMinutes"] == 12.0
+    assert payload["trafficAi"]["source"] == "tomtom-live"
+    assert payload["liveTraffic"]["source"] == "tomtom"
+    assert payload["liveTraffic"]["adjustedSegments"] == 1
+    assert payload["liveTraffic"]["coverageRatio"] == 1.0
+    assert len(traffic.coordinates) == 1
+    # El resumen explica la ruta: escalera de mejoras y el punto medido por TomTom en la calle.
+    optimization = payload["optimization"]
+    assert [step["step"] for step in optimization["ladder"]] == [
+        "nearestNeighbor", "twoOpt", "orOpt", "refine", "aiOrder",
+    ]
+    assert optimization["tomtom"]["adjusted"] == 1
+    assert len(optimization["trafficPoints"]) == 1
+    point = optimization["trafficPoints"][0]
+    assert len(point["point"]) == 2 and point["level"] in {
+        "FLUIDO", "MODERADO", "ALTO", "MUY_ALTO", "CERRADO",
+    }
+    listed = await client.get("/api/rutas", headers={"Cookie": _cookie("dispatcher")})
+    assert listed.json()["routes"][0]["optimization"]["optimizedMinutes"] == 12.0
+
+
+@pytest.mark.asyncio
+async def test_closed_baseline_can_be_replaced_without_infinite_savings(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from dataclasses import replace
+
+    class ClosedTrafficProvider(FakeTomTomTrafficProvider):
+        async def get_flow_segment(self, coordinate: Coordinate) -> TrafficData:
+            return replace(
+                await super().get_flow_segment(coordinate),
+                road_closure=True, traffic_level=TrafficLevel.CERRADO,
