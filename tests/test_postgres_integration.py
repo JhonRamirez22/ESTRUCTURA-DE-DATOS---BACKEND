@@ -232,3 +232,81 @@ async def test_route_revision_stack_persists_and_undoes_atomically_in_postgres()
                             DeliveryPoint.id.in_({original_point_id, appended_point_id})
                         )
                     )
+                    await session.execute(
+                        delete(Notification).where(Notification.recipient_id == str(courier_id))
+                    )
+                    await session.execute(delete(Courier).where(Courier.id == courier_id))
+                    await session.commit()
+        finally:
+            await engine.dispose()
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_POSTGRES_INTEGRATION") != "1",
+    reason="Activa RUN_POSTGRES_INTEGRATION=1 para usar la base PostgreSQL configurada.",
+)
+@pytest.mark.asyncio
+async def test_route_creation_persists_atomically_in_postgres() -> None:
+    settings = get_settings()
+    engine = create_async_engine(settings.sqlalchemy_database_url, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        async with session_factory() as session:
+            yield session
+
+    monkeypatch_values = {
+        "AUTH_SECRET": _INTEGRATION_SECRET,
+        "NODE_ENV": "test",
+        "AI_ALLOW_LOCATION_DATA_SHARING": "false",
+    }
+    original_values = {name: os.environ.get(name) for name in monkeypatch_values}
+    os.environ.update(monkeypatch_values)
+    get_settings.cache_clear()
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_routing_providers] = lambda: (
+        _MatrixProvider(),
+        _RouteProvider(),
+    )
+    app.dependency_overrides[get_route_traffic_advisor] = lambda: None
+    app.dependency_overrides[get_traffic_service] = lambda: None
+    seeded = False
+
+    try:
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+
+        async with session_factory() as session:
+            session.add(
+                Courier(
+                    id=_COURIER_ID,
+                    name="Integración automatizada",
+                    phone=f"test-{_COURIER_ID.hex[:20]}",
+                    status=CourierStatus.AVAILABLE,
+                    current_lat=1.2136,
+                    current_lng=-77.2811,
+                    last_location_at=datetime.now(UTC).replace(tzinfo=None),
+                )
+            )
+            session.add(
+                DeliveryPoint(
+                    id=_POINT_ID,
+                    address="Carrera 25 # 4 Sur-65, Pasto",
+                    lat=1.214,
+                    lng=-77.28,
+                    status=DeliveryPointStatus.PENDING,
+                    order_id=f"INTEGRATION-{_POINT_ID}",
+                    tracking_token=f"INTEGRATION-{_POINT_ID}",
+                )
+            )
+            await session.commit()
+            seeded = True
+
+        expires_at = int(datetime.now(UTC).timestamp()) + SESSION_MAX_AGE_SECONDS
+        token = create_session_token("dispatcher", expires_at, _INTEGRATION_SECRET)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://postgres-integration",
+        ) as client:
+            response = await client.post(
+                "/api/rutas",
