@@ -344,3 +344,89 @@ async def test_failed_delivery_is_retried_later_without_storing_exception_text(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     point = await _create_point(session_factory)
+    route_id = uuid4()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with session_factory() as session:
+        persisted = await session.get(DeliveryPoint, point.id)
+        assert persisted is not None
+        await enqueue_courier_near_notification(session, persisted, route_id, now=now)
+        await session.commit()
+
+    summary = await dispatch_pending_customer_notifications(
+        session_factory,
+        settings=_smtp_settings(),
+        sender=_FakeSender(RuntimeError("private@example.com Carrera 25")),
+        now=now,
+    )
+
+    assert summary.deferred == 1 and summary.sent == 0
+    async with session_factory() as session:
+        event_row = await session.scalar(select(CustomerNotificationOutbox))
+        assert event_row is not None
+        assert event_row.status is CustomerNotificationStatus.PENDING
+        assert event_row.available_at > now
+        assert event_row.last_error_code == "RuntimeError"
+        assert "private@example.com" not in event_row.last_error_code
+        assert "Carrera 25" not in event_row.last_error_code
+        retry_at = event_row.available_at
+
+    retry = await dispatch_pending_customer_notifications(
+        session_factory,
+        settings=_smtp_settings(),
+        sender=_FakeSender(),
+        now=retry_at,
+    )
+
+    assert retry.attempted == 1 and retry.sent == 1 and retry.deferred == 0
+    async with session_factory() as session:
+        event_row = await session.scalar(select(CustomerNotificationOutbox))
+        assert event_row is not None
+        assert event_row.status is CustomerNotificationStatus.SENT
+        assert event_row.recipient_email is None
+        assert event_row.text_body == ""
+
+
+@pytest.mark.asyncio
+async def test_notification_at_attempt_limit_is_terminal_and_redacts_pii(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    point = await _create_point(session_factory)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with session_factory() as session:
+        persisted = await session.get(DeliveryPoint, point.id)
+        assert persisted is not None
+        await enqueue_courier_near_notification(session, persisted, uuid4(), now=now)
+        await session.flush()
+        event_row = await session.scalar(select(CustomerNotificationOutbox))
+        assert event_row is not None
+        event_row.attempt_count = MAX_NOTIFICATION_ATTEMPTS - 1
+        await session.commit()
+
+    failed_sender = _FakeSender(RuntimeError("private@example.com"))
+    summary = await dispatch_pending_customer_notifications(
+        session_factory,
+        settings=_smtp_settings(),
+        sender=failed_sender,
+        now=now,
+    )
+
+    assert summary.attempted == 1 and summary.deferred == 1
+    async with session_factory() as session:
+        event_row = await session.scalar(select(CustomerNotificationOutbox))
+        assert event_row is not None
+        assert event_row.status is CustomerNotificationStatus.FAILED
+        assert event_row.attempt_count == MAX_NOTIFICATION_ATTEMPTS
+        assert event_row.recipient_email is None
+        assert event_row.recipient_phone is None
+        assert event_row.subject == ""
+        assert event_row.text_body == ""
+        assert event_row.lease_expires_at is None
+        assert event_row.last_error_code == "RuntimeError"
+
+    subsequent = await dispatch_pending_customer_notifications(
+        session_factory,
+        settings=_smtp_settings(),
+        sender=_FakeSender(),
+        now=now + timedelta(days=1),
+    )
+    assert subsequent.attempted == 0
