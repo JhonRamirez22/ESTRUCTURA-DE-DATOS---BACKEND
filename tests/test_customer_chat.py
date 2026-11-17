@@ -332,3 +332,86 @@ async def test_http_assistant_scopes_private_text_and_returns_plain_text_statuse
                     {
                         "message": {
                             "content": (
+                                "## Estado\n\n- Tu pedido está **PENDING**.\n"
+                                "- La ruta está en `IN_PROGRESS`.\n"
+                                "- _Consulta_ tu pedido.\n\n"
+                                "[Seguimiento](https://example.com/pedido)"
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
+        api_key="test-key",
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(respond),
+    )
+    answer = await assistant.answer(
+        delivery_status="PENDING",
+        route_status=None,
+        messages=[
+            CustomerChatTurn(
+                role="user",
+                content=(
+                    "¿Dónde va mi pedido? Soy Diana Ramirez. Mi guía es PRIVATE-GUIDE-445566, "
+                    "el ID es internal-order-id-98231 y mi coordenada es 1.2136, -77.2811. "
+                    "Correo diana@example.com, celular +573001234567, "
+                    "dirección Carrera 25 #4 sur 65."
+                ),
+            )
+        ],
+    )
+
+    assert answer == (
+        "Estado\n\nTu pedido está pendiente de asignación.\n"
+        "La ruta está en curso.\nConsulta tu pedido.\n\nSeguimiento"
+    )
+
+    serialized = json.dumps(captured["body"], ensure_ascii=False)
+    for private_value in (
+        "Diana",
+        "PRIVATE-GUIDE-445566",
+        "internal-order-id-98231",
+        "1.2136",
+        "-77.2811",
+        "diana@example.com",
+        "+573001234567",
+        "Carrera 25",
+    ):
+        assert private_value not in serialized
+    sent_messages = captured["body"]["messages"]
+    assert sent_messages[1] == {
+        "role": "user",
+        "content": "¿Cuál es el avance del recorrido de mi pedido?",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("question", "canonical_question", "expected_eta_context"),
+    [
+        ("¿Qué pasa con mi pedido?", "¿Cuál es el estado actual de mi pedido?", False),
+        ("¿Ya fue asignado?", "¿Mi pedido ya fue asignado?", False),
+        ("¿Dónde va mi paquete?", "¿Cuál es el avance del recorrido de mi pedido?", False),
+        ("¿Cuánto falta?", "¿Cuánto falta para que llegue mi pedido?", True),
+    ],
+)
+async def test_http_assistant_sends_only_canonical_order_intents(
+    question: str,
+    canonical_question: str,
+    expected_eta_context: bool,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "Tu pedido sigue en proceso."}}]},
+        )
+
+    assistant = HttpOrderChatAssistant(
