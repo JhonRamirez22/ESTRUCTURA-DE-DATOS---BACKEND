@@ -388,3 +388,80 @@ async def test_route_batch_failure_rolls_back_partial_assignments_in_postgres() 
                         name="Courier con reserva",
                         phone=f"test-{_COMPETING_COURIER_ID.hex[:20]}",
                         status=CourierStatus.AVAILABLE,
+                        current_lat=1.2136,
+                        current_lng=-77.2811,
+                        last_location_at=datetime.now(UTC).replace(tzinfo=None),
+                    ),
+                ]
+            )
+            await session.flush()
+            session.add(
+                Route(
+                    id=_EXISTING_ROUTE_ID,
+                    courier_id=_COMPETING_COURIER_ID,
+                    status=RouteStatus.PLANNED,
+                    estimated_duration_minutes=8.0,
+                    estimated_distance_meters=900.0,
+                )
+            )
+            await session.flush()
+            session.add_all(
+                [
+                    DeliveryPoint(
+                        id=_FIRST_POINT_ID,
+                        address="Carrera 25 # 4 Sur-65, Pasto",
+                        lat=1.214,
+                        lng=-77.28,
+                        status=DeliveryPointStatus.PENDING,
+                        order_id=f"INTEGRATION-{_FIRST_POINT_ID}",
+                        tracking_token=f"INTEGRATION-{_FIRST_POINT_ID}",
+                    ),
+                    DeliveryPoint(
+                        id=_CONFLICTING_POINT_ID,
+                        address="Calle 18 # 20-30, Pasto",
+                        lat=1.215,
+                        lng=-77.279,
+                        status=DeliveryPointStatus.PENDING,
+                        order_id=f"INTEGRATION-{_CONFLICTING_POINT_ID}",
+                        tracking_token=f"INTEGRATION-{_CONFLICTING_POINT_ID}",
+                        route_id=_EXISTING_ROUTE_ID,
+                        sequence_index=0,
+                    ),
+                ]
+            )
+            await session.commit()
+            seeded = True
+
+        plan = OptimizedRoutePlan(
+            courier_id=_COURIER_ID,
+            planned_courier_location=(-77.2811, 1.2136),
+            ordered_delivery_point_ids=(_FIRST_POINT_ID, _CONFLICTING_POINT_ID),
+            planned_delivery_point_coordinates=(
+                (_FIRST_POINT_ID, (-77.28, 1.214)),
+                (_CONFLICTING_POINT_ID, (-77.279, 1.215)),
+            ),
+            estimated_duration_minutes=12.0,
+            estimated_distance_meters=1_200.0,
+            baseline_duration_minutes=12.0,
+            baseline_distance_meters=1_200.0,
+            geometry={
+                "type": "LineString",
+                "coordinates": [(-77.2811, 1.2136), (-77.28, 1.214), (-77.279, 1.215)],
+            },
+            geometry_provider=RouteGeometryProvider.OSRM,
+            matrix_source="osrm",
+            warning=None,
+            traffic_ai={"source": "deterministic", "applied": False},
+        )
+
+        async with session_factory() as session:
+            with pytest.raises(RouteConflictError, match="cambió mientras se guardaba"):
+                await create_optimized_routes_batch(session, [plan])
+
+        async with session_factory() as session:
+            created_routes = await session.scalars(
+                select(Route).where(Route.courier_id == _COURIER_ID)
+            )
+            first_point = await session.get(DeliveryPoint, _FIRST_POINT_ID)
+            conflicting_point = await session.get(DeliveryPoint, _CONFLICTING_POINT_ID)
+            assert list(created_routes) == []
