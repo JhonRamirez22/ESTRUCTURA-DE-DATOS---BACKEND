@@ -301,3 +301,78 @@ async def test_routing_failures_return_warnings_without_straight_line_geometry(
     assert tracking_route["geometry"] is None
     assert "no se muestra una línea recta" in tracking_route["navigationWarning"].lower()
     assert "no se estimó con distancias en línea recta" in tracking_route["estimateWarning"]
+    assert tracking_route["estimatedMinutesFromNow"] is None
+
+
+async def _create_delivery_point(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    address: str = "Carrera 25 #18-20",
+) -> DeliveryPoint:
+    point = DeliveryPoint(
+        id=uuid4(),
+        address=address,
+        lat=1.215,
+        lng=-77.279,
+        status=DeliveryPointStatus.PENDING,
+        order_id=f"ORDER-{uuid4()}",
+        tracking_token=f"TRACK-{uuid4()}",
+    )
+    async with session_factory() as session:
+        session.add(point)
+        await session.commit()
+        await session.refresh(point)
+    return point
+
+
+async def _create_active_route(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    location_at: datetime | None = None,
+) -> tuple[Courier, Route, DeliveryPoint, DeliveryPoint]:
+    courier = Courier(
+        id=_COURIER_ID,
+        name="Nombre de repartidor privado",
+        phone="+573001234567",
+        status=CourierStatus.ON_ROUTE,
+        current_lat=1.213612,
+        current_lng=-77.281145,
+        last_location_at=location_at or datetime.now(UTC).replace(tzinfo=None),
+    )
+    route = Route(
+        id=uuid4(),
+        courier_id=courier.id,
+        status=RouteStatus.IN_PROGRESS,
+        estimated_duration_minutes=16,
+        estimated_distance_meters=2_000,
+    )
+    target = DeliveryPoint(
+        id=uuid4(),
+        address="Destino que corresponde a la guía",
+        lat=1.215,
+        lng=-77.279,
+        status=DeliveryPointStatus.EN_ROUTE,
+        order_id=f"ORDER-{uuid4()}",
+        tracking_token=f"TRACK-{uuid4()}",
+        customer_email="cliente-privado@example.com",
+        email_notifications_enabled=True,
+        customer_phone="+573009876543",
+        sms_notifications_enabled=True,
+        route_id=route.id,
+        sequence_index=0,
+    )
+    private_point = DeliveryPoint(
+        id=uuid4(),
+        address="Otra dirección privada que no se debe revelar",
+        lat=1.216,
+        lng=-77.276,
+        status=DeliveryPointStatus.PENDING,
+        order_id=f"ORDER-{uuid4()}",
+        tracking_token=f"TRACK-{uuid4()}",
+        route_id=route.id,
+        sequence_index=1,
+    )
+    async with session_factory() as session:
+        session.add_all([courier, route, target, private_point])
+        await session.commit()
+    return courier, route, target, private_point
