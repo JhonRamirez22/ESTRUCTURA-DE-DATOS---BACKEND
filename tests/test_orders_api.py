@@ -386,3 +386,80 @@ async def test_customer_sms_requires_explicit_consent_and_normalizes_colombian_m
         assert saved is not None
         await enqueue_order_assigned_notification(session, saved, uuid4())
         await session.commit()
+
+    revoked = await client.patch(
+        f"/api/pedidos/{point_id}",
+        headers=headers,
+        json={"smsNotificationsEnabled": False},
+    )
+    assert revoked.status_code == 200, revoked.text
+    async with session_factory() as session:
+        saved = await session.get(DeliveryPoint, point_id)
+        assert saved is not None
+        assert saved.customer_phone is None
+        assert saved.sms_notifications_enabled is False
+        notification = await session.scalar(
+            select(CustomerNotificationOutbox).where(
+                CustomerNotificationOutbox.delivery_point_id == point_id
+            )
+        )
+        assert notification is not None
+        assert notification.channel is CustomerNotificationChannel.SMS
+        assert notification.status is CustomerNotificationStatus.CANCELLED
+        assert notification.recipient_phone is None
+        assert notification.subject == ""
+        assert notification.text_body == ""
+
+
+@pytest.mark.asyncio
+async def test_duplicate_order_id_returns_conflict_and_get_is_private(
+    client: httpx.AsyncClient,
+) -> None:
+    headers = {"Cookie": _cookie("dispatcher")}
+    body = {
+        "address": "Calle 10",
+        "lat": 1.2136,
+        "lng": -77.2811,
+        "orderId": "DUPLICATE",
+    }
+    created = await client.post("/api/pedidos", headers=headers, json=body)
+    duplicate = await client.post("/api/pedidos", headers=headers, json=body)
+    point_id = created.json()["deliveryPoint"]["id"]
+    anonymous_read = await client.get(f"/api/pedidos/{point_id}")
+    dispatcher_read = await client.get(f"/api/pedidos/{point_id}", headers=headers)
+
+    assert created.status_code == 201
+    assert duplicate.status_code == 409
+    assert anonymous_read.status_code == 401
+    assert dispatcher_read.status_code == 200
+    assert (
+        dispatcher_read.json()["deliveryPoint"]["trackingToken"]
+        == created.json()["trackingGuide"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_courier_can_only_close_own_active_route_delivery_and_token_is_hidden(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier_id = await _create_courier(session_factory)
+    route_id = uuid4()
+    async with session_factory() as session:
+        session.add(
+            Route(
+                id=route_id,
+                courier_id=courier_id,
+                status=RouteStatus.IN_PROGRESS,
+                estimated_duration_minutes=10,
+                estimated_distance_meters=1_000,
+            )
+        )
+        await session.commit()
+    point_id = await _create_delivery_point(session_factory, route_id=route_id)
+    own_cookie = {"Cookie": _cookie("courier", str(courier_id))}
+    other_cookie = {"Cookie": _cookie("courier", str(uuid4()))}
+
+    forbidden = await client.patch(
+        f"/api/pedidos/{point_id}", headers=other_cookie, json={"status": "DELIVERED"}
+    )
