@@ -401,3 +401,83 @@ async def test_dispatcher_provisions_courier_account_and_courier_cannot_escalate
 
 @pytest.mark.asyncio
 async def test_page_access_is_decided_by_backend_without_exposing_role(
+    client: httpx.AsyncClient,
+) -> None:
+    anonymous_access = await client.get("/api/auth/access", params={"path": "/dashboard"})
+    anonymous_login = await client.get("/api/auth/access", params={"path": "/acceso"})
+    anonymous_staff = await client.get("/api/auth/access", params={"path": "/personal"})
+    anonymous_audit = await client.get("/api/auth/access", params={"path": "/auditoria"})
+    assert anonymous_audit.json() == {"allowed": False, "redirectTo": "/acceso"}
+    assert anonymous_access.json() == {"allowed": False, "redirectTo": "/acceso"}
+    assert anonymous_staff.json() == {"allowed": False, "redirectTo": "/acceso"}
+    assert anonymous_login.json() == {"allowed": True, "redirectTo": None}
+
+    await client.post("/api/auth/login", json={"accessCode": DISPATCHER_CODE})
+    dispatcher_access = await client.get("/api/auth/access", params={"path": "/dashboard"})
+    courier_access = await client.get("/api/auth/access", params={"path": "/repartidor"})
+    access_page = await client.get("/api/auth/access", params={"path": "/acceso"})
+    staff_page = await client.get("/api/auth/access", params={"path": "/personal"})
+    audit_page = await client.get("/api/auth/access", params={"path": "/auditoria"})
+    assert audit_page.json() == {"allowed": True, "redirectTo": None}
+    history_page = await client.get("/api/auth/access", params={"path": "/historial"})
+    assert history_page.json() == {"allowed": True, "redirectTo": None}
+
+    assert dispatcher_access.json() == {"allowed": True, "redirectTo": None}
+    assert staff_page.json() == {"allowed": True, "redirectTo": None}
+    assert courier_access.json() == {"allowed": False, "redirectTo": "/dashboard"}
+    assert access_page.json() == {"allowed": False, "redirectTo": "/dashboard"}
+    assert "role" not in courier_access.json()
+    assert "courierId" not in courier_access.json()
+
+
+@pytest.mark.asyncio
+async def test_page_access_rejects_unmanaged_paths(client: httpx.AsyncClient) -> None:
+    response = await client.get("/api/auth/access", params={"path": "/api/pedidos"})
+
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_courier_login_verifies_database_hash_and_limits_redirect_scope(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier_id = "f8fbc95f-643e-4fb3-9b82-8c42e0707311"
+    access_code = create_courier_access_code(courier_id)
+    async with session_factory() as session:
+        courier = Courier(
+            id=UUID(courier_id),
+            name="Repartidor de prueba",
+            phone="3000000000",
+            status=CourierStatus.AVAILABLE,
+            credential=CourierCredential(access_code_hash=hash_courier_access_code(access_code)),
+        )
+        session.add(courier)
+        await session.commit()
+
+    response = await client.post(
+        "/api/auth/login",
+        json={"accessCode": access_code, "returnTo": "/dashboard"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    expected = {"authenticated": True, "redirectTo": "/repartidor"}
+    assert body == {**expected, "accessToken": body["accessToken"]}
+    assert "courierId" not in response.json()
+    assert "role" not in response.json()
+    assert (await client.get("/api/auth/session")).json() == {"authenticated": True}
+
+
+@pytest.mark.asyncio
+async def test_invalid_code_and_logout_preserve_existing_http_contract(
+    client: httpx.AsyncClient,
+) -> None:
+    invalid = await client.post("/api/auth/login", json={"accessCode": "incorrecto"})
+    logout = await client.post("/api/auth/logout")
+
+    assert invalid.status_code == 401
+    assert invalid.json() == {"error": "Código de acceso inválido."}
+    assert logout.status_code == 200
+    assert logout.json() == {"ok": True}
+    assert "Max-Age=0" in logout.headers["set-cookie"]
