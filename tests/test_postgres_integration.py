@@ -310,3 +310,81 @@ async def test_route_creation_persists_atomically_in_postgres() -> None:
         ) as client:
             response = await client.post(
                 "/api/rutas",
+                headers={"Cookie": f"{session_cookie_name('dispatcher')}={token}"},
+                json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(_POINT_ID)]},
+            )
+
+        assert response.status_code == 201, response.text
+        route_id = UUID(response.json()["route"]["id"])
+        assert response.json()["orderedDeliveryPointIds"] == [str(_POINT_ID)]
+
+        async with session_factory() as session:
+            route = await session.scalar(select(Route).where(Route.id == route_id))
+            point = await session.get(DeliveryPoint, _POINT_ID)
+            assert route is not None
+            assert route.courier_id == _COURIER_ID
+            assert point is not None
+            assert point.route_id == route_id
+            assert point.sequence_index == 0
+            assert point.status is DeliveryPointStatus.PENDING
+    finally:
+        try:
+            if seeded:
+                async with session_factory() as session:
+                    await session.execute(
+                        delete(Route).where(Route.courier_id == _COURIER_ID)
+                    )
+                    await session.execute(
+                        delete(DeliveryPoint).where(DeliveryPoint.id == _POINT_ID)
+                    )
+                    await session.execute(
+                        delete(Notification).where(Notification.recipient_id == str(_COURIER_ID))
+                    )
+                    await session.execute(delete(Courier).where(Courier.id == _COURIER_ID))
+                    await session.commit()
+        finally:
+            app.dependency_overrides.pop(get_session, None)
+            app.dependency_overrides.pop(get_routing_providers, None)
+            app.dependency_overrides.pop(get_route_traffic_advisor, None)
+            app.dependency_overrides.pop(get_traffic_service, None)
+            for name, value in original_values.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            get_settings.cache_clear()
+            await engine.dispose()
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_POSTGRES_INTEGRATION") != "1",
+    reason="Activa RUN_POSTGRES_INTEGRATION=1 para usar la base PostgreSQL configurada.",
+)
+@pytest.mark.asyncio
+async def test_route_batch_failure_rolls_back_partial_assignments_in_postgres() -> None:
+    settings = get_settings()
+    engine = create_async_engine(settings.sqlalchemy_database_url, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    seeded = False
+
+    try:
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+
+        async with session_factory() as session:
+            session.add_all(
+                [
+                    Courier(
+                        id=_COURIER_ID,
+                        name="Courier transaccional",
+                        phone=f"test-{_COURIER_ID.hex[:20]}",
+                        status=CourierStatus.AVAILABLE,
+                        current_lat=1.2136,
+                        current_lng=-77.2811,
+                        last_location_at=datetime.now(UTC).replace(tzinfo=None),
+                    ),
+                    Courier(
+                        id=_COMPETING_COURIER_ID,
+                        name="Courier con reserva",
+                        phone=f"test-{_COMPETING_COURIER_ID.hex[:20]}",
+                        status=CourierStatus.AVAILABLE,
