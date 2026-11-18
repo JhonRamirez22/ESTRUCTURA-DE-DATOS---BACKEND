@@ -430,3 +430,89 @@ async def test_notification_at_attempt_limit_is_terminal_and_redacts_pii(
         now=now + timedelta(days=1),
     )
     assert subsequent.attempted == 0
+
+
+@pytest.mark.asyncio
+async def test_expired_final_attempt_is_redacted_without_an_extra_send(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    point = await _create_point(session_factory)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with session_factory() as session:
+        session.add(
+            CustomerNotificationOutbox(
+                id=uuid4(),
+                delivery_point_id=point.id,
+                event_key=f"expired-final-attempt-{point.id}",
+                event_type=CustomerNotificationEvent.COURIER_NEAR,
+                channel=CustomerNotificationChannel.EMAIL,
+                recipient_email="private@example.com",
+                subject="Private subject",
+                text_body="Private body",
+                status=CustomerNotificationStatus.PROCESSING,
+                attempt_count=MAX_NOTIFICATION_ATTEMPTS,
+                available_at=now - timedelta(hours=1),
+                lease_expires_at=now - timedelta(seconds=1),
+            )
+        )
+        await session.commit()
+
+    summary = await dispatch_pending_customer_notifications(
+        session_factory,
+        settings=_smtp_settings(),
+        sender=_FakeSender(),
+        now=now,
+    )
+
+    assert summary.attempted == 0
+    async with session_factory() as session:
+        row = await session.scalar(select(CustomerNotificationOutbox))
+        assert row is not None
+        assert row.status is CustomerNotificationStatus.FAILED
+        assert row.attempt_count == MAX_NOTIFICATION_ATTEMPTS
+        assert row.recipient_email is None
+        assert row.subject == "" and row.text_body == ""
+        assert row.last_error_code == "MaxAttemptsExceeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [CustomerNotificationStatus.PENDING, CustomerNotificationStatus.PROCESSING],
+)
+async def test_revoking_email_consent_cancels_unsent_messages_and_redacts_contact(
+    session_factory: async_sessionmaker[AsyncSession],
+    status: CustomerNotificationStatus,
+) -> None:
+    point = await _create_point(session_factory)
+    async with session_factory() as session:
+        persisted = await session.get(DeliveryPoint, point.id)
+        assert persisted is not None
+        await enqueue_order_assigned_notification(session, persisted, uuid4())
+        event_row = await session.scalar(select(CustomerNotificationOutbox))
+        assert event_row is not None
+        event_row.status = status
+        cancelled = await cancel_pending_customer_notifications(session, point.id)
+        await session.commit()
+
+    assert cancelled == 1
+    async with session_factory() as session:
+        event_row = await session.scalar(select(CustomerNotificationOutbox))
+        assert event_row is not None
+        assert event_row.status is CustomerNotificationStatus.CANCELLED
+        assert event_row.recipient_email is None
+        assert event_row.text_body == ""
+
+
+@pytest.mark.asyncio
+async def test_worker_rechecks_opt_in_after_claim_before_sending(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.customer_notifications as notifications
+
+    point = await _create_point(session_factory)
+    route_id = uuid4()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with session_factory() as session:
+        persisted = await session.get(DeliveryPoint, point.id)
