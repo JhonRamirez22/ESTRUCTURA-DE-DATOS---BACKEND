@@ -425,3 +425,88 @@ async def test_apply_rolls_back_all_routes_if_a_later_insert_fails(
         await _create_point(session_factory, latitude=1.221, longitude=-77.269),
     ]
     async with session_factory() as session:
+        await session.execute(
+            text(
+                "CREATE TRIGGER reject_second_route BEFORE INSERT ON routes "
+                "WHEN (SELECT COUNT(*) FROM routes) >= 1 "
+                "BEGIN SELECT RAISE(ABORT, 'simulated insert failure'); END"
+            )
+        )
+        await session.commit()
+
+    response = await client.post(
+        "/api/asignaciones/aplicar",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={
+            "assignments": [
+                {"courierId": str(couriers[0].id), "deliveryPointIds": [str(points[0].id)]},
+                {"courierId": str(couriers[1].id), "deliveryPointIds": [str(points[1].id)]},
+            ]
+        },
+    )
+
+    assert response.status_code == 409
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Route)) == 0
+        assert await session.scalar(select(func.count()).select_from(Notification)) == 0
+        saved_points = list((await session.scalars(select(DeliveryPoint))).all())
+        assert len(saved_points) == 2
+        assert all(point.route_id is None for point in saved_points)
+        assert all(point.sequence_index is None for point in saved_points)
+
+
+@pytest.mark.asyncio
+async def test_proposal_reports_the_joint_assignment_improvement(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    couriers = [
+        await _create_courier(session_factory, latitude=1.2136, longitude=-77.2811),
+        await _create_courier(session_factory, latitude=1.22, longitude=-77.27),
+    ]
+    points = [
+        await _create_point(session_factory, latitude=1.214 + index * 0.001, longitude=-77.28)
+        for index in range(6)
+    ]
+    response = await client.post(
+        "/api/asignaciones",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={
+            "courierIds": [str(courier.id) for courier in couriers],
+            "deliveryPointIds": [str(point.id) for point in points],
+        },
+    )
+    payload = response.json()
+    assert response.status_code == 200
+    improvement = payload["improvement"]
+    assert improvement["enabled"] is True
+    # El objetivo es el total más la mitad de la ruta más larga: puede subir un poco el total si
+    # eso reparte mejor la carga, pero el objetivo conjunto nunca empeora.
+    before = improvement["beforeMinutes"] + 0.5 * improvement["longestBeforeMinutes"]
+    after = improvement["afterMinutes"] + 0.5 * improvement["longestAfterMinutes"]
+    assert after <= before + 0.11
+    assert improvement["savedMinutes"] == pytest.approx(
+        improvement["beforeMinutes"] - improvement["afterMinutes"], abs=0.11
+    )
+    assert improvement["applied"] == bool(improvement["moves"])
+    assigned = sorted(
+        point_id for item in payload["assignments"] for point_id in item["deliveryPointIds"]
+    )
+    assert assigned == sorted(str(point.id) for point in points)  # no se pierde ningún pedido
+
+
+@pytest.mark.asyncio
+async def test_joint_assignment_can_be_turned_off_with_a_setting(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("JOINT_ASSIGNMENT_ENABLED", "false")
+    get_settings.cache_clear()
+    courier = await _create_courier(session_factory, latitude=1.2136, longitude=-77.2811)
+    other = await _create_courier(session_factory, latitude=1.22, longitude=-77.27)
+    point = await _create_point(session_factory, latitude=1.214, longitude=-77.28)
+    response = await client.post(
+        "/api/asignaciones",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={"courierIds": [str(courier.id), str(other.id)], "deliveryPointIds": [str(point.id)]},
