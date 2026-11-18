@@ -413,3 +413,86 @@ async def test_groq_receives_tomtom_evidence_without_overwriting_observed_travel
     assert result.json()["route"]["estimatedDurationMinutes"] == 12
     assert result.json()["trafficAi"]["source"] == "external-ai"
 
+
+@pytest.mark.asyncio
+async def test_courier_can_optimize_only_own_route_without_adding_orders_or_leaking_secrets(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    created = await client.post(
+        "/api/v1/rutas", headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(point_id)]},
+    )
+    endpoint = f"/api/v1/rutas/{created.json()['route']['id']}/recalcular"
+    foreign = await client.post(endpoint, headers={"Cookie": _cookie("courier", uuid4())}, json={})
+    assert foreign.status_code == 404
+    added = await client.post(
+        endpoint, headers={"Cookie": _cookie("courier", _COURIER_ID)},
+        json={"deliveryPointIds": [str(uuid4())]},
+    )
+    assert added.status_code == 403
+    own = await client.post(
+        endpoint, headers={"Cookie": _cookie("courier", _COURIER_ID)}, json={},
+    )
+    assert own.status_code == 200, own.text
+    assert own.json()["route"]["geometryProvider"] == "OSRM"
+    assert own.json()["route"]["optimizedAt"]
+    assert "TRACK-" not in own.text and "3001112233" not in own.text
+    assert "trackingToken" not in own.json()["route"]["deliveryPoints"][0]
+
+
+@pytest.mark.asyncio
+async def test_courier_route_response_is_scoped_and_redacts_dispatcher_and_customer_secrets(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    created = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(point_id)]},
+    )
+    route_id = created.json()["route"]["id"]
+
+    own_route = await client.get(
+        f"/api/rutas/{route_id}",
+        headers={"Cookie": _cookie("courier", _COURIER_ID)},
+    )
+    assert own_route.status_code == 200
+    serialized = own_route.text
+    assert "Courier Privado" not in serialized
+    assert "3001112233" not in serialized
+    assert "ORDER-" not in serialized
+    assert "TRACK-" not in serialized
+
+    other_courier_id = UUID("9df3a049-262e-4c14-a185-46a210cbb5ee")
+    other_route = await client.get(
+        f"/api/rutas/{route_id}",
+        headers={"Cookie": _cookie("courier", other_courier_id)},
+    )
+    assert other_route.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_route_lifecycle_updates_points_and_courier_atomically(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    created = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(point_id)]},
+    )
+    route_id = created.json()["route"]["id"]
+
+    started = await client.patch(
+        f"/api/rutas/{route_id}",
+        headers={"Cookie": _cookie("courier", _COURIER_ID)},
+        json={"status": "IN_PROGRESS"},
+    )
+    assert started.status_code == 200, started.text
