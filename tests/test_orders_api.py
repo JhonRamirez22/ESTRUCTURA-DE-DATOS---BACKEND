@@ -309,3 +309,80 @@ async def test_customer_email_requires_consent_and_is_never_returned_in_order_js
                 CustomerNotificationOutbox.delivery_point_id == point_id
             )
         )
+        assert notification is not None
+        assert notification.channel is CustomerNotificationChannel.EMAIL
+        assert notification.event_type is CustomerNotificationEvent.ORDER_ASSIGNED
+        assert notification.status is CustomerNotificationStatus.CANCELLED
+        assert notification.recipient_email is None
+        assert notification.subject == ""
+        assert notification.text_body == ""
+
+
+@pytest.mark.asyncio
+async def test_customer_sms_requires_explicit_consent_and_normalizes_colombian_mobile(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    headers = {"Cookie": _cookie("dispatcher")}
+    base_order = {
+        "address": "Calle 10",
+        "lat": 1.2136,
+        "lng": -77.2811,
+    }
+    missing_phone = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={**base_order, "orderId": "SMS-MISSING", "smsNotificationsEnabled": True},
+    )
+    invalid_phone = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            **base_order,
+            "orderId": "SMS-INVALID",
+            "customerPhone": "+12025550100",
+            "smsNotificationsEnabled": True,
+        },
+    )
+    unconsented_phone = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            **base_order,
+            "orderId": "SMS-NO-CONSENT",
+            "customerPhone": "3001234567",
+        },
+    )
+    opted_in = await client.post(
+        "/api/pedidos",
+        headers=headers,
+        json={
+            **base_order,
+            "orderId": "SMS-CONSENT",
+            "customerPhone": "300 123 4567",
+            "smsNotificationsEnabled": True,
+        },
+    )
+
+    assert missing_phone.status_code == 400
+    assert invalid_phone.status_code == 400
+    assert unconsented_phone.status_code == 201
+    assert opted_in.status_code == 201
+    assert "3001234567" not in opted_in.text
+    point_id = UUID(opted_in.json()["deliveryPoint"]["id"])
+    async with session_factory() as session:
+        saved = await session.get(DeliveryPoint, point_id)
+        assert saved is not None
+        assert saved.customer_phone == "+573001234567"
+        assert saved.sms_notifications_enabled is True
+        unconsented_id = UUID(unconsented_phone.json()["deliveryPoint"]["id"])
+        unconsented = await session.get(DeliveryPoint, unconsented_id)
+        assert unconsented is not None
+        assert unconsented.customer_phone is None
+        assert unconsented.sms_notifications_enabled is False
+
+    async with session_factory() as session:
+        saved = await session.get(DeliveryPoint, point_id)
+        assert saved is not None
+        await enqueue_order_assigned_notification(session, saved, uuid4())
+        await session.commit()
