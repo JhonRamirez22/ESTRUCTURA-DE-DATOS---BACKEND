@@ -267,3 +267,70 @@ async def test_dispatcher_gets_channel_and_outbox_counts_without_contact_data(
         notifications_api,
         "customer_notification_channels_configured",
         lambda _settings: {
+            CustomerNotificationChannel.EMAIL: True,
+            CustomerNotificationChannel.SMS: False,
+        },
+    )
+    monkeypatch.setattr(
+        app.state,
+        "customer_notification_worker_task",
+        _RunningWorkerTask(),
+        raising=False,
+    )
+    response = await client.get(
+        "/api/notificaciones/clientes/estado",
+        headers={"Cookie": _cookie("dispatcher")},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "channels": {
+            "email": {
+                "configured": True,
+                "pending": 1,
+                "retrying": 1,
+                "processing": 0,
+                "failed": 1,
+            },
+            "sms": {
+                "configured": False,
+                "pending": 1,
+                "retrying": 0,
+                "processing": 1,
+                "failed": 0,
+            },
+        },
+        "workerRunning": True,
+        "warning": "Hay avisos agotados tras varios intentos; requieren revisión operativa.",
+    }
+    assert "private@example.com" not in response.text
+    assert "+573001234567" not in response.text
+    assert "Private notification content" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_status_explains_configured_channels_waiting_for_a_worker(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.api.notifications as notifications_api
+
+    monkeypatch.setattr(
+        notifications_api,
+        "customer_notification_channels_configured",
+        lambda _settings: {
+            CustomerNotificationChannel.EMAIL: True,
+            CustomerNotificationChannel.SMS: False,
+        },
+    )
+    monkeypatch.setattr(app.state, "customer_notification_worker_task", None, raising=False)
+
+    response = await client.get(
+        "/api/notificaciones/clientes/estado",
+        headers={"Cookie": _cookie("dispatcher")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["workerRunning"] is False
+    assert "se intentan enviar al asignar la ruta o registrar el GPS" in response.json()["warning"]
+    assert "no habrá reintento automático" in response.json()["warning"]
