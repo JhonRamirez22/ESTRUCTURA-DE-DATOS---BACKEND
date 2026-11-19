@@ -498,3 +498,86 @@ async def test_http_assistant_rejects_mixed_order_and_unsafe_requests_before_net
     calls = 0
 
     async def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
+        api_key="test-key",
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(respond),
+    )
+    answer = await assistant.answer(
+        delivery_status="PENDING",
+        route_status=None,
+        messages=[CustomerChatTurn(role="user", content=question)],
+    )
+
+    assert "Solo puedo ayudarte" in answer
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "question",
+    [
+        "¿Ya fue asignado?",
+        "¿Ya viene?",
+        "¿Ya salió?",
+        "¿Por dónde va?",
+        "¿Cuánto falta?",
+        "¿A qué hora llega?",
+    ],
+)
+async def test_http_assistant_accepts_natural_order_follow_up_questions(question: str) -> None:
+    calls = 0
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "Tu pedido está en seguimiento."}}]},
+        )
+
+    assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
+        api_key="test-key",
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(respond),
+    )
+
+    answer = await assistant.answer(
+        delivery_status="EN_ROUTE",
+        route_status="IN_PROGRESS",
+        messages=[CustomerChatTurn(role="user", content=question)],
+    )
+
+    assert answer == "Tu pedido está en seguimiento."
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_http_assistant_accepts_short_follow_up_only_after_an_order_question() -> None:
+    captured: dict[str, object] = {}
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "La guía sigue en ruta."}}]},
+        )
+
+    assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
+        api_key="test-key",
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(respond),
+    )
+    answer = await assistant.answer(
+        delivery_status="EN_ROUTE",
+        route_status="IN_PROGRESS",
