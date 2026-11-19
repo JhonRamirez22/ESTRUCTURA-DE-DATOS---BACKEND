@@ -496,3 +496,86 @@ async def test_route_lifecycle_updates_points_and_courier_atomically(
         json={"status": "IN_PROGRESS"},
     )
     assert started.status_code == 200, started.text
+    assert started.json()["route"]["status"] == "IN_PROGRESS"
+    async with session_factory() as session:
+        courier = await session.get(Courier, _COURIER_ID)
+        point = await session.get(DeliveryPoint, point_id)
+        assert courier is not None and courier.status == CourierStatus.ON_ROUTE
+        assert point is not None and point.status == DeliveryPointStatus.EN_ROUTE
+
+    refused = await client.patch(
+        f"/api/rutas/{route_id}",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"status": "COMPLETED"},
+    )
+    assert refused.status_code == 409
+
+    async with session_factory() as session:
+        point = await session.get(DeliveryPoint, point_id)
+        assert point is not None
+        point.status = DeliveryPointStatus.DELIVERED
+        await session.commit()
+    completed = await client.patch(
+        f"/api/rutas/{route_id}",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"status": "COMPLETED"},
+    )
+    assert completed.status_code == 200
+    async with session_factory() as session:
+        route = await session.get(Route, UUID(route_id))
+        courier = await session.get(Courier, _COURIER_ID)
+        assert route is not None and route.completed_at is not None
+        assert courier is not None and courier.status == CourierStatus.AVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_cancelling_route_keeps_delivered_stops_and_requeues_only_active_ones(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    point_ids = [
+        await _create_point(session_factory),
+        await _create_point(session_factory, address="Calle 18 # 20-30"),
+    ]
+    created = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={
+            "courierId": str(_COURIER_ID),
+            "deliveryPointIds": [str(point) for point in point_ids],
+        },
+    )
+    assert created.status_code == 201, created.text
+    route_id = created.json()["route"]["id"]
+    delivered_id = UUID(created.json()["orderedDeliveryPointIds"][0])
+    active_id = next(point_id for point_id in point_ids if point_id != delivered_id)
+
+    started = await client.patch(
+        f"/api/rutas/{route_id}",
+        headers={"Cookie": _cookie("courier", _COURIER_ID)},
+        json={"status": "IN_PROGRESS"},
+    )
+    assert started.status_code == 200, started.text
+    delivered = await client.patch(
+        f"/api/pedidos/{delivered_id}",
+        headers={"Cookie": _cookie("courier", _COURIER_ID)},
+        json={"status": "DELIVERED"},
+    )
+    assert delivered.status_code == 200, delivered.text
+
+    cancelled = await client.patch(
+        f"/api/rutas/{route_id}",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"status": "CANCELLED"},
+    )
+
+    assert cancelled.status_code == 200, cancelled.text
+    async with session_factory() as session:
+        delivered_point = await session.get(DeliveryPoint, delivered_id)
+        active_point = await session.get(DeliveryPoint, active_id)
+        courier = await session.get(Courier, _COURIER_ID)
+        route = await session.get(Route, UUID(route_id))
+        assert delivered_point is not None
+        assert delivered_point.status is DeliveryPointStatus.DELIVERED
+        assert delivered_point.route_id == UUID(route_id)
