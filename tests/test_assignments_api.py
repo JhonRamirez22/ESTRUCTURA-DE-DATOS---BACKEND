@@ -595,3 +595,88 @@ async def test_dispatch_plans_couriers_in_parallel_with_a_cap_and_keeps_request_
         for i in range(6)
     ]
     points = [
+        await _create_point(session_factory, latitude=1.214 + i * 0.001, longitude=-77.28)
+        for i in range(6)
+    ]
+    assignments = [
+        {"courierId": str(c.id), "deliveryPointIds": [str(p.id)]}
+        for c, p in zip(couriers, points, strict=True)
+    ]
+    response = await client.post(
+        "/api/asignaciones/aplicar",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={"assignments": assignments},
+    )
+    assert response.status_code == 201, response.text
+    routes = response.json()["routes"]
+    assert [r["route"]["courierId"] for r in routes] == [str(c.id) for c in couriers]
+    assert 2 <= provider.peak <= MAX_CONCURRENT_PLANS
+
+
+@pytest.mark.asyncio
+async def test_dispatch_reports_the_first_failing_assignment_and_saves_nothing(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    good = await _create_courier(session_factory, latitude=1.2136, longitude=-77.2811)
+    busy = await _create_courier(
+        session_factory, latitude=1.2146, longitude=-77.2811, status=CourierStatus.ON_ROUTE
+    )
+    first = await _create_point(session_factory, latitude=1.214, longitude=-77.28)
+    second = await _create_point(session_factory, latitude=1.215, longitude=-77.28)
+    response = await client.post(
+        "/api/asignaciones/aplicar",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={"assignments": [
+            {"courierId": str(good.id), "deliveryPointIds": [str(first.id)]},
+            {"courierId": str(busy.id), "deliveryPointIds": [str(second.id)]},
+        ]},
+    )
+    assert response.status_code == 409
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Route)) == 0
+
+
+class NoSegmentMatrixProvider(FakeMatrixProvider):
+    """Behaves like OSRM when one coordinate is farther than 50 m from any road."""
+
+    def __init__(self, bad: tuple[float, float]) -> None:
+        self._bad = bad
+
+    async def get_duration_matrix(self, coordinates: Sequence[Coordinate]) -> dict[str, Any]:
+        from app.core.routing.routing_errors import RoutingClientError
+
+        for index, coordinate in enumerate(coordinates):
+            if (round(coordinate[0], 4), round(coordinate[1], 4)) == self._bad:
+                message = f"Could not find a matching segment for coordinate {index}"
+                body = f'{{"message":"{message}","code":"NoSegment"}}'
+                raise RoutingClientError("OSRM request failed (HTTP 400)", 400, body)
+        return await super().get_duration_matrix(coordinates)
+
+
+@pytest.mark.asyncio
+async def test_a_point_without_a_nearby_road_is_left_out_not_fatal(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier = await _create_courier(session_factory, latitude=1.2136, longitude=-77.2811)
+    good = await _create_point(session_factory, latitude=1.214, longitude=-77.28)
+    off_road = await _create_point(session_factory, latitude=1.2005, longitude=-77.277)
+    app.dependency_overrides[get_routing_providers] = lambda: (
+        NoSegmentMatrixProvider((-77.277, 1.2005)),
+        FakeRouteProvider(),
+    )
+
+    response = await client.post(
+        "/api/asignaciones",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={"courierIds": [str(courier.id)],
+              "deliveryPointIds": [str(good.id), str(off_road.id)]},
+    )
+
+    payload = response.json()
+    assert response.status_code == 200, payload
+    assert payload["assignments"] == [
+        {"courierId": str(courier.id), "deliveryPointIds": [str(good.id)]}
+    ]
+    assert payload["unassignedDeliveryPointIds"] == [str(off_road.id)]
