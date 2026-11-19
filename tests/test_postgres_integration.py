@@ -465,3 +465,80 @@ async def test_route_batch_failure_rolls_back_partial_assignments_in_postgres() 
             first_point = await session.get(DeliveryPoint, _FIRST_POINT_ID)
             conflicting_point = await session.get(DeliveryPoint, _CONFLICTING_POINT_ID)
             assert list(created_routes) == []
+            assert first_point is not None and first_point.route_id is None
+            assert conflicting_point is not None
+            assert conflicting_point.route_id == _EXISTING_ROUTE_ID
+            assert conflicting_point.sequence_index == 0
+    finally:
+        try:
+            if seeded:
+                async with session_factory() as session:
+                    await session.execute(
+                        delete(Notification).where(
+                            Notification.recipient_id.in_(
+                                {str(_COURIER_ID), str(_COMPETING_COURIER_ID)}
+                            )
+                        )
+                    )
+                    await session.execute(
+                        delete(Route).where(Route.id == _EXISTING_ROUTE_ID)
+                    )
+                    await session.execute(
+                        delete(DeliveryPoint).where(
+                            DeliveryPoint.id.in_({_FIRST_POINT_ID, _CONFLICTING_POINT_ID})
+                        )
+                    )
+                    await session.execute(
+                        delete(Courier).where(
+                            Courier.id.in_({_COURIER_ID, _COMPETING_COURIER_ID})
+                        )
+                    )
+                    await session.commit()
+        finally:
+            await engine.dispose()
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_POSTGRES_INTEGRATION") != "1",
+    reason="Activa RUN_POSTGRES_INTEGRATION=1 para usar la base PostgreSQL configurada.",
+)
+@pytest.mark.asyncio
+async def test_route_cancellation_preserves_delivered_points_in_postgres() -> None:
+    settings = get_settings()
+    engine = create_async_engine(settings.sqlalchemy_database_url, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    seeded = False
+
+    try:
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+
+        async with session_factory() as session:
+            session.add(
+                Courier(
+                    id=_CANCELLATION_COURIER_ID,
+                    name="Courier con entregas",
+                    phone=f"test-{_CANCELLATION_COURIER_ID.hex[:20]}",
+                    status=CourierStatus.ON_ROUTE,
+                    current_lat=1.2136,
+                    current_lng=-77.2811,
+                    last_location_at=datetime.now(UTC).replace(tzinfo=None),
+                )
+            )
+            await session.flush()
+            session.add(
+                Route(
+                    id=_CANCELLATION_ROUTE_ID,
+                    courier_id=_CANCELLATION_COURIER_ID,
+                    status=RouteStatus.IN_PROGRESS,
+                    estimated_duration_minutes=10.0,
+                    estimated_distance_meters=1_000.0,
+                )
+            )
+            await session.flush()
+            session.add_all(
+                [
+                    DeliveryPoint(
+                        id=_DELIVERED_POINT_ID,
+                        address="Carrera 25 # 4 Sur-65, Pasto",
+                        lat=1.214,
