@@ -540,3 +540,80 @@ async def test_dispatcher_can_edit_and_delete_only_unassigned_pending_orders(
     )
     deleted = await client.delete(f"/api/pedidos/{point_id}", headers=dispatcher)
     deleted_again = await client.delete(f"/api/pedidos/{point_id}", headers=dispatcher)
+    assert blocked_delete.status_code == 409
+    assert blocked_location_edit.status_code == 409
+    assert deleted.status_code == 204
+    assert deleted_again.status_code == 404
+    async with session_factory() as session:
+        assert await session.get(DeliveryPoint, point_id) is None
+        assigned_point = await session.get(DeliveryPoint, assigned_point_id)
+        assert assigned_point is not None
+        assert assigned_point.lat == 1.2136
+        assert assigned_point.lng == -77.2811
+
+
+@pytest.mark.asyncio
+async def test_address_ai_requires_opt_in_and_rejects_location_outside_pasto(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeAdvisor:
+        async def normalize_address(self, _request: AddressAiRequest) -> AddressAiResponse:
+            return AddressAiResponse(
+                normalizedAddress="Calle 100, Quito",
+                isInPasto=True,
+                confidence=0.99,
+                city="Pasto",
+                department="Nariño",
+                country="Colombia",
+            )
+
+    monkeypatch.setenv("AI_ALLOW_LOCATION_DATA_SHARING", "true")
+    get_settings.cache_clear()
+    app.dependency_overrides[get_address_ai_advisor] = lambda: FakeAdvisor()
+    try:
+        response = await client.post(
+            "/api/pedidos",
+            headers={"Cookie": _cookie("dispatcher")},
+            json={
+                "address": "Calle 100",
+                "lat": 1.2136,
+                "lng": -77.2811,
+                "orderId": "AI-OUTSIDE",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_address_ai_advisor, None)
+        get_settings.cache_clear()
+
+    payload = response.json()
+    assert response.status_code == 201
+    assert payload["deliveryPoint"]["address"] == "Calle 100"
+    assert payload["addressNormalization"]["source"] == "deterministic"
+    assert "no confirmó" in payload["addressNormalization"]["warning"]
+
+
+@pytest.mark.asyncio
+async def test_order_priority_defaults_to_normal_and_is_validated(
+    client: httpx.AsyncClient,
+) -> None:
+    dispatcher = {"Cookie": _cookie("dispatcher")}
+    base = {"address": "Calle 2", "lat": 1.2136, "lng": -77.2811}
+    normal = await client.post(
+        "/api/pedidos", headers=dispatcher, json={**base, "orderId": "PRIO-1"}
+    )
+    assert normal.status_code == 201
+    assert normal.json()["deliveryPoint"]["priority"] == 1
+    urgent = await client.post(
+        "/api/pedidos", headers=dispatcher, json={**base, "orderId": "PRIO-2", "priority": 3}
+    )
+    assert urgent.json()["deliveryPoint"]["priority"] == 3
+    for invalid in (0, 4, "alta"):
+        body = {**base, "orderId": "PRIO-X", "priority": invalid}
+        rejected = await client.post("/api/pedidos", headers=dispatcher, json=body)
+        assert rejected.status_code == 400, rejected.text
+    point_id = normal.json()["deliveryPoint"]["id"]
+    patched = await client.patch(
+        f"/api/pedidos/{point_id}", headers=dispatcher, json={"priority": 2}
+    )
+    assert patched.json()["deliveryPoint"]["priority"] == 2
