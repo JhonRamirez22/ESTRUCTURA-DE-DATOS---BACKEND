@@ -581,3 +581,86 @@ async def test_http_assistant_accepts_short_follow_up_only_after_an_order_questi
     answer = await assistant.answer(
         delivery_status="EN_ROUTE",
         route_status="IN_PROGRESS",
+        messages=[
+            CustomerChatTurn(role="user", content="¿Ya fue asignado?"),
+            CustomerChatTurn(role="user", content="¿Y a qué hora?"),
+        ],
+    )
+
+    body = captured["body"]
+    assert isinstance(body, dict)
+    sent_messages = body["messages"]
+    assert isinstance(sent_messages, list)
+    assert [message["content"] for message in sent_messages[1:]] == [
+        "¿Mi pedido ya fue asignado?",
+        "¿Cuánto falta para que llegue mi pedido?",
+    ]
+    assert answer == "La guía sigue en ruta."
+
+
+@pytest.mark.asyncio
+async def test_unrelated_question_breaks_context_for_later_short_follow_up() -> None:
+    calls = 0
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
+        api_key="test-key",
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(respond),
+    )
+    answer = await assistant.answer(
+        delivery_status="PENDING",
+        route_status=None,
+        messages=[
+            CustomerChatTurn(role="user", content="¿Qué pasa con mi pedido?"),
+            CustomerChatTurn(role="user", content="Escríbeme una canción de rock"),
+            CustomerChatTurn(role="user", content="¿Y a qué hora?"),
+        ],
+    )
+
+    assert "Solo puedo ayudarte" in answer
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_old_order_question_does_not_authorize_a_later_unrelated_question() -> None:
+    calls = 0
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
+        api_key="test-key",
+        model="test-model",
+        timeout_ms=200,
+        transport=httpx.MockTransport(respond),
+    )
+    answer = await assistant.answer(
+        delivery_status="PENDING",
+        route_status=None,
+        messages=[
+            CustomerChatTurn(role="user", content="¿Qué pasa con mi pedido?"),
+            CustomerChatTurn(role="user", content="Escríbeme una canción de rock"),
+        ],
+    )
+
+    assert "Solo puedo ayudarte" in answer
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_http_assistant_reports_rate_limit_and_timeout_without_remote_details() -> None:
+    async def rate_limited(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, text="private vendor payload")
+
+    assistant = HttpOrderChatAssistant(
+        api_url="https://models.example/v1/chat/completions",
