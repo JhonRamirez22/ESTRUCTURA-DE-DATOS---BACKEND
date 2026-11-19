@@ -542,3 +542,80 @@ async def test_route_cancellation_preserves_delivered_points_in_postgres() -> No
                         id=_DELIVERED_POINT_ID,
                         address="Carrera 25 # 4 Sur-65, Pasto",
                         lat=1.214,
+                        lng=-77.28,
+                        status=DeliveryPointStatus.DELIVERED,
+                        order_id=f"INTEGRATION-{_DELIVERED_POINT_ID}",
+                        tracking_token=f"INTEGRATION-{_DELIVERED_POINT_ID}",
+                        route_id=_CANCELLATION_ROUTE_ID,
+                        sequence_index=0,
+                    ),
+                    DeliveryPoint(
+                        id=_ACTIVE_POINT_ID,
+                        address="Calle 18 # 20-30, Pasto",
+                        lat=1.215,
+                        lng=-77.279,
+                        status=DeliveryPointStatus.EN_ROUTE,
+                        order_id=f"INTEGRATION-{_ACTIVE_POINT_ID}",
+                        tracking_token=f"INTEGRATION-{_ACTIVE_POINT_ID}",
+                        route_id=_CANCELLATION_ROUTE_ID,
+                        sequence_index=1,
+                    ),
+                ]
+            )
+            await session.commit()
+            seeded = True
+
+        async with session_factory() as session:
+            await update_route_status(session, _CANCELLATION_ROUTE_ID, RouteStatus.CANCELLED)
+
+        async with session_factory() as session:
+            route = await session.get(Route, _CANCELLATION_ROUTE_ID)
+            delivered_point = await session.get(DeliveryPoint, _DELIVERED_POINT_ID)
+            active_point = await session.get(DeliveryPoint, _ACTIVE_POINT_ID)
+            courier = await session.get(Courier, _CANCELLATION_COURIER_ID)
+            assert route is not None and route.status is RouteStatus.CANCELLED
+            assert delivered_point is not None
+            assert delivered_point.status is DeliveryPointStatus.DELIVERED
+            assert delivered_point.route_id == _CANCELLATION_ROUTE_ID
+            assert delivered_point.sequence_index == 0
+            assert active_point is not None
+            assert active_point.status is DeliveryPointStatus.PENDING
+            assert active_point.route_id is None
+            assert active_point.sequence_index is None
+            assert courier is not None and courier.status is CourierStatus.AVAILABLE
+    finally:
+        try:
+            if seeded:
+                async with session_factory() as session:
+                    await session.execute(
+                        delete(Route).where(Route.id == _CANCELLATION_ROUTE_ID)
+                    )
+                    await session.execute(
+                        delete(DeliveryPoint).where(
+                            DeliveryPoint.id.in_({_DELIVERED_POINT_ID, _ACTIVE_POINT_ID})
+                        )
+                    )
+                    await session.execute(
+                        delete(Courier).where(Courier.id == _CANCELLATION_COURIER_ID)
+                    )
+                    await session.commit()
+        finally:
+            await engine.dispose()
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_POSTGRES_INTEGRATION") != "1",
+    reason="Activa RUN_POSTGRES_INTEGRATION=1 para usar la base PostgreSQL configurada.",
+)
+@pytest.mark.asyncio
+async def test_customer_notification_outbox_persists_and_deduplicates_in_postgres() -> None:
+    settings = get_settings()
+    engine = create_async_engine(settings.sqlalchemy_database_url, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    point_id = uuid4()
+    route_id = uuid4()
+    order_reference = f"INTEGRATION-NOTIFICATION-{point_id}"
+    seeded = False
+
+    try:
+        async with engine.connect() as connection:
