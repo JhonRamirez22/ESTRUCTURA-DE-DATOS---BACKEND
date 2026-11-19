@@ -463,3 +463,80 @@ async def test_courier_can_only_close_own_active_route_delivery_and_token_is_hid
     forbidden = await client.patch(
         f"/api/pedidos/{point_id}", headers=other_cookie, json={"status": "DELIVERED"}
     )
+    changed_fields = await client.patch(
+        f"/api/pedidos/{point_id}",
+        headers=own_cookie,
+        json={"status": "DELIVERED", "orderId": "spoof"},
+    )
+    completed = await client.patch(
+        f"/api/pedidos/{point_id}", headers=own_cookie, json={"status": "DELIVERED"}
+    )
+    repeated = await client.patch(
+        f"/api/pedidos/{point_id}", headers=own_cookie, json={"status": "FAILED"}
+    )
+
+    assert forbidden.status_code == 404
+    assert changed_fields.status_code == 403
+    assert completed.status_code == 200
+    assert completed.json()["deliveryPoint"]["status"] == "DELIVERED"
+    assert "trackingToken" not in completed.json()["deliveryPoint"]
+    assert repeated.status_code == 409
+    async with session_factory() as session:
+        notifications = list((await session.scalars(select(Notification))).all())
+        persisted = await session.get(DeliveryPoint, point_id)
+        assert persisted is not None
+        assert persisted.status is DeliveryPointStatus.DELIVERED
+        assert len(notifications) == 1
+        assert notifications[0].recipient_id == "dispatcher"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_can_edit_and_delete_only_unassigned_pending_orders(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    dispatcher = {"Cookie": _cookie("dispatcher")}
+    created = await client.post(
+        "/api/pedidos",
+        headers=dispatcher,
+        json={
+            "address": "Calle 2",
+            "lat": 1.2136,
+            "lng": -77.2811,
+            "orderId": "EDIT-ME",
+            "timeWindow": {"start": "09:00", "end": "12:00"},
+        },
+    )
+    point_id = UUID(created.json()["deliveryPoint"]["id"])
+    updated = await client.patch(
+        f"/api/pedidos/{point_id}",
+        headers=dispatcher,
+        json={"address": "cra 3", "timeWindow": None},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["deliveryPoint"]["address"] == "Carrera 3"
+    assert updated.json()["deliveryPoint"]["timeWindow"] is None
+
+    assigned_id = uuid4()
+    courier_id = await _create_courier(session_factory)
+    async with session_factory() as session:
+        session.add(
+            Route(
+                id=assigned_id,
+                courier_id=courier_id,
+                status=RouteStatus.PLANNED,
+                estimated_duration_minutes=10,
+                estimated_distance_meters=1_000,
+            )
+        )
+        await session.commit()
+    assigned_point_id = await _create_delivery_point(session_factory, route_id=assigned_id)
+
+    blocked_delete = await client.delete(f"/api/pedidos/{assigned_point_id}", headers=dispatcher)
+    blocked_location_edit = await client.patch(
+        f"/api/pedidos/{assigned_point_id}",
+        headers=dispatcher,
+        json={"lat": 1.215, "lng": -77.279},
+    )
+    deleted = await client.delete(f"/api/pedidos/{point_id}", headers=dispatcher)
+    deleted_again = await client.delete(f"/api/pedidos/{point_id}", headers=dispatcher)
