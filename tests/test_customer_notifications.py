@@ -516,3 +516,89 @@ async def test_worker_rechecks_opt_in_after_claim_before_sending(
     now = datetime.now(UTC).replace(tzinfo=None)
     async with session_factory() as session:
         persisted = await session.get(DeliveryPoint, point.id)
+        assert persisted is not None
+        await enqueue_order_assigned_notification(session, persisted, route_id, now=now)
+        await session.commit()
+
+    claim = notifications._claim_pending_notifications
+
+    async def claim_then_revoke(
+        factory: async_sessionmaker[AsyncSession],
+        claim_time: datetime,
+        settings: Settings,
+        enabled_channels: tuple[CustomerNotificationChannel, ...],
+    ) -> list[tuple[UUID, CustomerNotificationChannel, str | None, str | None, str, str]]:
+        claimed = await claim(factory, claim_time, settings, enabled_channels)
+        async with session_factory() as session:
+            async with session.begin():
+                persisted = await session.get(DeliveryPoint, point.id)
+                assert persisted is not None
+                persisted.email_notifications_enabled = False
+                await cancel_pending_customer_notifications(session, point.id)
+        return claimed
+
+    monkeypatch.setattr(notifications, "_claim_pending_notifications", claim_then_revoke)
+    sender = _FakeSender()
+    summary = await dispatch_pending_customer_notifications(
+        session_factory,
+        settings=_smtp_settings(),
+        sender=sender,
+        now=now,
+    )
+
+    assert summary.attempted == summary.sent == summary.deferred == 0
+    assert sender.messages == []
+    async with session_factory() as session:
+        event_row = await session.scalar(select(CustomerNotificationOutbox))
+        assert event_row is not None
+        assert event_row.status is CustomerNotificationStatus.CANCELLED
+        assert event_row.recipient_email is None
+        assert event_row.text_body == ""
+
+
+class _FakeSmsSender:
+    def __init__(self, failure: Exception | None = None) -> None:
+        self.messages: list[CustomerSms] = []
+        self.failure = failure
+
+    def send(self, message: CustomerSms) -> None:
+        if self.failure is not None:
+            raise self.failure
+        self.messages.append(message)
+
+
+@pytest.mark.asyncio
+async def test_sms_delivery_uses_twilio_channel_and_redacts_recipient_after_send(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    point = await _create_point(session_factory, opted_in=False, sms_opted_in=True)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with session_factory() as session:
+        persisted = await session.get(DeliveryPoint, point.id)
+        assert persisted is not None
+        await enqueue_courier_near_notification(session, persisted, uuid4(), now=now)
+        await session.commit()
+
+    sms_sender = _FakeSmsSender()
+    summary = await dispatch_pending_customer_notifications(
+        session_factory,
+        settings=Settings(
+            notification_sms_twilio_account_sid="AC" + "b" * 32,
+            notification_sms_twilio_auth_token=SecretStr("sms-test-token"),
+            notification_sms_twilio_from_phone="+15005550006",
+        ),
+        sms_sender=sms_sender,
+        now=now,
+    )
+
+    assert summary.configured is True
+    assert summary.attempted == summary.sent == 1
+    assert len(sms_sender.messages) == 1
+    assert sms_sender.messages[0].recipient == "+573001234567"
+    assert "500 m" in sms_sender.messages[0].text_body
+    async with session_factory() as session:
+        row = await session.scalar(select(CustomerNotificationOutbox))
+        assert row is not None
+        assert row.status is CustomerNotificationStatus.SENT
+        assert row.recipient_phone is None
+        assert row.text_body == ""
