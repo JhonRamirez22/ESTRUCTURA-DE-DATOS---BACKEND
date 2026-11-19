@@ -510,3 +510,88 @@ async def test_joint_assignment_can_be_turned_off_with_a_setting(
         "/api/asignaciones",
         headers={"Cookie": _dispatcher_cookie()},
         json={"courierIds": [str(courier.id), str(other.id)], "deliveryPointIds": [str(point.id)]},
+    )
+    assert response.status_code == 200
+    assert response.json()["improvement"] == {"enabled": False, "applied": False}
+
+
+async def _create_courier(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    latitude: float,
+    longitude: float,
+    status: CourierStatus = CourierStatus.AVAILABLE,
+) -> Courier:
+    courier = Courier(
+        id=uuid4(),
+        name="Courier de prueba",
+        phone=f"+57300{uuid4().int % 10_000_000:07d}",
+        status=status,
+        current_lat=latitude,
+        current_lng=longitude,
+        last_location_at=datetime.now(UTC).replace(tzinfo=None),
+    )
+    async with session_factory() as session:
+        session.add(courier)
+        await session.commit()
+    return courier
+
+
+async def _create_point(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    latitude: float,
+    longitude: float,
+    customer_email: str | None = None,
+    email_notifications_enabled: bool = False,
+    customer_phone: str | None = None,
+    sms_notifications_enabled: bool = False,
+) -> DeliveryPoint:
+    point = DeliveryPoint(
+        id=uuid4(),
+        address="Punto de prueba, Pasto",
+        lat=latitude,
+        lng=longitude,
+        status=DeliveryPointStatus.PENDING,
+        order_id=f"ORDER-{uuid4()}",
+        customer_email=customer_email,
+        email_notifications_enabled=email_notifications_enabled,
+        customer_phone=customer_phone,
+        sms_notifications_enabled=sms_notifications_enabled,
+        tracking_token=f"TRACK-{uuid4()}",
+    )
+    async with session_factory() as session:
+        session.add(point)
+        await session.commit()
+    return point
+
+
+class _SlowTrackingRouteProvider(FakeRouteProvider):
+    def __init__(self) -> None:
+        self.active = 0
+        self.peak = 0
+
+    async def get_route(self, coordinates: Sequence[Coordinate]) -> RouteResult:
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            await asyncio.sleep(0.05)
+            return await super().get_route(coordinates)
+        finally:
+            self.active -= 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_plans_couriers_in_parallel_with_a_cap_and_keeps_request_order(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from app.api.assignments import MAX_CONCURRENT_PLANS
+
+    provider = _SlowTrackingRouteProvider()
+    app.dependency_overrides[get_routing_providers] = lambda: (FakeMatrixProvider(), provider)
+    couriers = [
+        await _create_courier(session_factory, latitude=1.2136 + i * 0.001, longitude=-77.2811)
+        for i in range(6)
+    ]
+    points = [
