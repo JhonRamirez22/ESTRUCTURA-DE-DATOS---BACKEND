@@ -481,3 +481,83 @@ async def test_invalid_code_and_logout_preserve_existing_http_contract(
     assert logout.status_code == 200
     assert logout.json() == {"ok": True}
     assert "Max-Age=0" in logout.headers["set-cookie"]
+    assert "HttpOnly" in logout.headers["set-cookie"]
+    assert logout.headers["cache-control"] == "no-store, private"
+
+
+@pytest.mark.asyncio
+async def test_external_return_to_is_rejected(
+    client: httpx.AsyncClient,
+) -> None:
+    response = await client.post(
+        "/api/auth/login",
+        json={"accessCode": DISPATCHER_CODE, "returnTo": "//evil.example"},
+    )
+
+    body = response.json()
+    expected = {"authenticated": True, "redirectTo": "/dashboard"}
+    assert body == {**expected, "accessToken": body["accessToken"]}
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_and_courier_sessions_coexist_in_one_browser(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier_id = "a1b2c3d4-0000-4000-8000-00000000c0de"
+    access_code = create_courier_access_code(courier_id)
+    async with session_factory() as session:
+        session.add(Courier(
+            id=UUID(courier_id),
+            name="Repartidor de prueba",
+            phone="3000000001",
+            status=CourierStatus.AVAILABLE,
+            credential=CourierCredential(access_code_hash=hash_courier_access_code(access_code)),
+        ))
+        await session.commit()
+
+    dispatcher = await client.post("/api/v1/auth/login", json={"accessCode": DISPATCHER_CODE})
+    assert dispatcher.status_code == 200
+    dispatch_cookie = client.cookies.get("rutas-pasto-dispatch-session")
+    assert dispatch_cookie is not None
+
+    courier = await client.post("/api/v1/auth/login", json={"accessCode": access_code})
+    assert courier.status_code == 200
+    # El inicio de sesión del repartidor no reemplaza la cookie de despacho.
+    assert client.cookies.get("rutas-pasto-dispatch-session") == dispatch_cookie
+    assert client.cookies.get("rutas-pasto-courier-session") is not None
+
+    dispatcher_page = await client.get(
+        "/api/v1/auth/access", params={"path": "/dashboard"},
+        headers={"X-Session-Role": "dispatcher"},
+    )
+    courier_page = await client.get(
+        "/api/v1/auth/access", params={"path": "/repartidor"},
+    )
+    assert dispatcher_page.json()["allowed"] is True
+    assert courier_page.json()["allowed"] is True
+
+    dispatcher_session = await client.get(
+        "/api/v1/auth/session", headers={"X-Session-Role": "dispatcher"},
+    )
+    assert dispatcher_session.headers.get("X-Session-Role") == "dispatcher"
+    assert "X-CSRF-Token" in dispatcher_session.headers
+
+    # Cerrar la sesión de repartidor no cierra la de despacho.
+    await client.post(
+        "/api/v1/auth/logout",
+        headers={
+            "X-Session-Role": "courier",
+            "X-CSRF-Token": courier.headers["X-CSRF-Token"],
+        },
+    )
+    still_dispatcher = await client.get(
+        "/api/v1/auth/session", headers={"X-Session-Role": "dispatcher"},
+    )
+    assert still_dispatcher.headers.get("X-Session-Role") == "dispatcher"
+
+
+async def _email_session(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
