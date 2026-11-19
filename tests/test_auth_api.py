@@ -561,3 +561,83 @@ async def _email_session(
     client: httpx.AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
+) -> str:
+    monkeypatch.setenv("AUTH_LEGACY_CODE_LOGIN_ENABLED", "false")
+    get_settings.cache_clear()
+    async with session_factory() as session:
+        session.add(Account(
+            email="despacho@example.com",
+            password_hash=hash_password("Una contraseña privada 2026"),
+            role="dispatcher",
+        ))
+        await session.commit()
+    login = await client.post("/api/v1/auth/login", json={
+        "email": "despacho@example.com", "password": "Una contraseña privada 2026"})
+    assert login.status_code == 200
+    return str(login.json()["accessToken"])
+
+
+@pytest.mark.asyncio
+async def test_password_change_needs_the_current_password_and_closes_all_sessions(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api import auth as auth_module
+
+    anonymous = await client.post("/api/v1/auth/password", json={
+        "currentPassword": "x", "newPassword": "Otra contraseña privada 2027"})
+    assert anonymous.status_code == 401
+    token = await _email_session(client, session_factory, monkeypatch)
+
+    wrong = await client.post("/api/v1/auth/password", json={
+        "currentPassword": "no es esta", "newPassword": "Otra contraseña privada 2027"})
+    assert wrong.status_code == 403
+    short = await client.post("/api/v1/auth/password", json={
+        "currentPassword": "Una contraseña privada 2026", "newPassword": "corta"})
+    assert short.status_code == 400
+    same = await client.post("/api/v1/auth/password", json={
+        "currentPassword": "Una contraseña privada 2026",
+        "newPassword": "Una contraseña privada 2026"})
+    assert same.status_code == 400
+
+    changed = await client.post("/api/v1/auth/password", json={
+        "currentPassword": "Una contraseña privada 2026",
+        "newPassword": "Otra contraseña privada 2027"})
+    assert changed.status_code == 200 and changed.json()["reloginRequired"] is True
+    assert "contraseña" not in changed.text.replace("reloginRequired", "")
+
+    # La sesión anterior ya no sirve y la contraseña vieja tampoco.
+    stale = await client.get("/api/v1/auth/session", headers={"Authorization": f"Bearer {token}"})
+    assert stale.json() == {"authenticated": False}
+    client.cookies.clear()
+    old = await client.post("/api/v1/auth/login", json={
+        "email": "despacho@example.com", "password": "Una contraseña privada 2026"})
+    assert old.status_code == 401
+    fresh = await client.post("/api/v1/auth/login", json={
+        "email": "despacho@example.com", "password": "Otra contraseña privada 2027"})
+    assert fresh.status_code == 200
+
+    async with session_factory() as session:
+        events = (await session.scalars(
+            select(SecurityAuditEvent).where(SecurityAuditEvent.action == "password_change")
+        )).all()
+        actions = [(event.action, event.outcome) for event in events]
+    assert ("password_change", "denied") in actions and ("password_change", "allowed") in actions
+    assert auth_module.PASSWORD_CHANGE_ATTEMPT_LIMIT == 5
+
+
+@pytest.mark.asyncio
+async def test_password_change_attempts_are_rate_limited(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _email_session(client, session_factory, monkeypatch)
+    codes = [
+        (await client.post("/api/v1/auth/password", json={
+            "currentPassword": f"mal-{i}", "newPassword": "Otra contraseña privada 2027"}
+        )).status_code
+        for i in range(7)
+    ]
+    assert codes[:5] == [403] * 5 and 429 in codes[5:]
