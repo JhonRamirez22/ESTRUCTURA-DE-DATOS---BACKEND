@@ -1157,3 +1157,85 @@ async def test_optimization_summary_requires_groq_and_never_changes_routes(
     assert response.status_code == 503
 
 
+class _FakeOrderAdvisor:
+    def __init__(self, order: list[int] | None) -> None:
+        self._order = order
+
+    async def suggest_order(self, durations_minutes, current_order):  # type: ignore[no-untyped-def]
+        if self._order is None:
+            raise RuntimeError("proveedor caído")
+        return self._order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("order", "expected_reason"), [
+    (None, "no respondió"),
+    ([0, 1, 1], "inválido"),
+])
+async def test_ai_order_is_never_applied_when_it_fails_or_is_invalid(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    order: list[int] | None,
+    expected_reason: str,
+) -> None:
+    from app.services.route_order_advisor import get_route_order_advisor
+
+    await _create_courier(session_factory)
+    first_id = await _create_point(session_factory)
+    second_id = await _create_point(session_factory, address="Calle 18 # 20-30")
+    created = await client.post(
+        "/api/rutas", headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(first_id), str(second_id)]},
+    )
+    route = created.json()["route"]
+    app.dependency_overrides[get_route_order_advisor] = lambda: _FakeOrderAdvisor(order)
+    try:
+        proposal = await client.post(
+            f"/api/v1/rutas/{route['id']}/propuesta",
+            headers={"Cookie": _cookie("courier", _COURIER_ID)},
+        )
+    finally:
+        app.dependency_overrides.pop(get_route_order_advisor, None)
+    assert proposal.status_code == 200, proposal.text
+    ai_order = proposal.json()["aiOrder"]
+    assert ai_order["accepted"] is False
+    assert expected_reason in str(ai_order["reason"])
+
+
+_DISPATCHER_ONLY = (
+    ("POST", "/api/v1/rutas"),
+    ("POST", "/api/v1/asignaciones"),
+    ("POST", "/api/v1/asignaciones/aplicar"),
+    ("GET", "/api/v1/repartidores"),
+    ("POST", "/api/v1/repartidores"),
+    ("GET", "/api/v1/repartidores/{id}"),
+    ("PATCH", "/api/v1/repartidores/{id}"),
+    ("DELETE", "/api/v1/repartidores/{id}"),
+    ("POST", "/api/v1/repartidores/{id}/codigo"),
+    ("DELETE", "/api/v1/repartidores/{id}/ubicacion"),  # un repartidor ajeno: 403 por propiedad
+    ("PUT", "/api/v1/auth/courier-account"),
+    ("GET", "/api/v1/analitica"),
+    ("POST", "/api/v1/direcciones/resolver"),
+    ("GET", "/api/v1/geocoding/search"),
+    ("GET", "/api/v1/optimizaciones/recientes"),
+    ("POST", "/api/v1/optimizaciones/resumen"),
+    ("GET", "/api/v1/notificaciones/clientes/estado"),
+)
+
+
+@pytest.mark.asyncio
+async def test_a_courier_session_cannot_use_dispatcher_only_operations(
+    client: httpx.AsyncClient,
+) -> None:
+    from app.db.session import get_session_factory
+
+    allowed: list[str] = []
+    cookie = {"Cookie": _cookie("courier", _COURIER_ID), "Origin": "http://localhost:3000"}
+    app.dependency_overrides[get_session_factory] = lambda: None
+    try:
+        for method, template in _DISPATCHER_ONLY:
+            url = template.replace("{id}", str(uuid4()))
+            response = await client.request(
+                method, url, headers=cookie,
+                params={"q": "Pasto"} if "geocoding" in url else None,
+                json={} if method in {"POST", "PUT", "PATCH"} else None,
