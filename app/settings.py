@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     database_pool_size: int = Field(default=10, ge=1, le=100)
     database_max_overflow: int = Field(default=10, ge=0, le=100)
     database_pool_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    # Mueve pedidos entre repartidores para acortar las rutas (ver joint_assignment).
+    joint_assignment_enabled: bool = True
     # Peticiones en curso por proceso; por encima se responde 503 al instante, sin colas.
     max_inflight_requests: int = Field(default=200, ge=1, le=10_000)
     database_ssl_mode: Literal["disable", "require", "verify-ca", "verify-full"] = "disable"

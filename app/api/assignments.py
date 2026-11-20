@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -24,6 +25,7 @@ from app.core.optimization.assign_orders import (
     OrderPoint,
     assign_orders,
 )
+from app.core.optimization.joint_assignment import JointAssignmentResult, improve_assignment
 from app.core.routing.cached_matrix_provider import CachedMatrixProvider
 from app.core.routing.cached_route_provider import CachedRouteProvider
 from app.core.routing.routing_errors import RoutingClientError
@@ -53,6 +55,7 @@ from app.services.route_traffic_advisor import (
     get_route_traffic_advisor,
 )
 from app.services.traffic import TrafficService, get_traffic_service
+from app.settings import get_settings
 
 router = APIRouter(prefix="/asignaciones", tags=["asignaciones"])
 _LOGGER = logging.getLogger(__name__)
@@ -165,6 +168,7 @@ async def propose_assignments(
     candidate_count = 0
     matrix_source = "not-needed"
     travel_costs_minutes: dict[tuple[str, str], float | None] = {}
+    road_durations: list[list[float | None]] | None = None
     if couriers and points:
         matrix_provider, _ = providers
         courier_coordinates = [
@@ -199,6 +203,7 @@ async def propose_assignments(
             return _error("El proveedor vial devolvió distancias inválidas.", 502)
 
         point_offset = len(courier_coordinates)
+        road_durations = durations
         for courier_index, courier in enumerate(couriers):
             for point_index, point in enumerate(points):
                 pair = (str(courier.id), str(point.id))
@@ -232,6 +237,18 @@ async def propose_assignments(
         [OrderPoint(str(point.id), Coordinates(point.lat, point.lng)) for point in points],
         options=AssignOrdersOptions([], travel_costs_minutes),
     )
+    improvement: dict[str, object] = {"enabled": False, "applied": False}
+    if road_durations is not None and get_settings().joint_assignment_enabled:
+        usable = [c for c in couriers if c.current_lat is not None and c.current_lng is not None]
+        joint = await asyncio.to_thread(
+            improve_assignment,
+            road_durations,
+            {str(courier.id): index for index, courier in enumerate(usable)},
+            {str(point.id): len(usable) + index for index, point in enumerate(points)},
+            result,
+        )
+        result = joint.assignments
+        improvement = _improvement_view(joint)
     assignments = [
         {"courierId": courier_id, "deliveryPointIds": point_ids}
         for courier_id, point_ids in result.items()
@@ -251,8 +268,34 @@ async def propose_assignments(
                 point_id for point_id in requested_ids if point_id not in assigned_ids
             ],
             "ai": ai_status,
+            "improvement": improvement,
         }
     )
+
+
+def _improvement_view(joint: JointAssignmentResult) -> dict[str, object]:
+    """Resumen verificable de lo que cambió el reparto conjunto, sin datos personales."""
+    return {
+        "enabled": True,
+        "applied": bool(joint.moves),
+        "beforeMinutes": round(joint.before.total_minutes, 1),
+        "afterMinutes": round(joint.after.total_minutes, 1),
+        "savedMinutes": round(joint.saved_total_minutes, 1),
+        "longestBeforeMinutes": round(joint.before.longest_route_minutes, 1),
+        "longestAfterMinutes": round(joint.after.longest_route_minutes, 1),
+        "evaluations": joint.evaluations,
+        "moves": [
+            {
+                "kind": move.kind,
+                "deliveryPointId": move.order_id,
+                "fromCourierId": move.from_courier,
+                "toCourierId": move.to_courier,
+                "swappedDeliveryPointId": move.swapped_order_id,
+                "gainMinutes": round(move.gain, 1),
+            }
+            for move in joint.moves[:10]
+        ],
+    }
 
 
 @router.post("/aplicar", status_code=201)
