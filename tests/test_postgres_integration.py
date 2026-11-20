@@ -619,3 +619,80 @@ async def test_customer_notification_outbox_persists_and_deduplicates_in_postgre
 
     try:
         async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+
+        async with session_factory() as session:
+            session.add(
+                DeliveryPoint(
+                    id=point_id,
+                    address="Carrera 25 # 4 Sur-65, Pasto",
+                    lat=1.214,
+                    lng=-77.28,
+                    status=DeliveryPointStatus.PENDING,
+                    order_id=order_reference,
+                    tracking_token=f"TRACK-{point_id}",
+                    customer_email="integration@example.invalid",
+                    email_notifications_enabled=True,
+                    customer_phone="+573001234567",
+                    sms_notifications_enabled=True,
+                )
+            )
+            await session.commit()
+            seeded = True
+
+        async with session_factory() as session:
+            point = await session.get(DeliveryPoint, point_id)
+            assert point is not None
+            expected_channels = (
+                CustomerNotificationChannel.EMAIL,
+                CustomerNotificationChannel.SMS,
+            )
+            assert await enqueue_order_assigned_notification(session, point, route_id) == (
+                expected_channels
+            )
+            assert await enqueue_order_assigned_notification(session, point, route_id) == ()
+            assert await enqueue_courier_near_notification(session, point, route_id) == (
+                expected_channels
+            )
+            assert await enqueue_courier_near_notification(session, point, route_id) == ()
+            await session.commit()
+
+        async with session_factory() as session:
+            rows = list(
+                (
+                    await session.scalars(
+                        select(CustomerNotificationOutbox).where(
+                            CustomerNotificationOutbox.delivery_point_id == point_id
+                        )
+                    )
+                ).all()
+            )
+            assert len(rows) == 4
+            assert {row.event_type for row in rows} == {
+                CustomerNotificationEvent.ORDER_ASSIGNED,
+                CustomerNotificationEvent.COURIER_NEAR,
+            }
+            assert {row.channel for row in rows} == set(expected_channels)
+            assert all(row.status is CustomerNotificationStatus.PENDING for row in rows)
+            assert all(row.attempt_count == 0 for row in rows)
+            assert all("integration@example.invalid" not in row.text_body for row in rows)
+            assert all("3001234567" not in row.text_body for row in rows)
+            assert all("Carrera 25" not in row.text_body for row in rows)
+            counts = await CustomerNotificationRepository(session).active_outbox_counts()
+            assert counts[CustomerNotificationChannel.EMAIL]["pending"] == 2
+            assert counts[CustomerNotificationChannel.SMS]["pending"] == 2
+    finally:
+        try:
+            if seeded:
+                async with session_factory() as session:
+                    await session.execute(
+                        delete(CustomerNotificationOutbox).where(
+                            CustomerNotificationOutbox.delivery_point_id == point_id
+                        )
+                    )
+                    await session.execute(
+                        delete(DeliveryPoint).where(DeliveryPoint.id == point_id)
+                    )
+                    await session.commit()
+        finally:
+            await engine.dispose()
