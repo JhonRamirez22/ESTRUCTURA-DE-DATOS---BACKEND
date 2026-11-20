@@ -996,3 +996,86 @@ async def test_chat_provider_failures_use_private_safe_status_fallback(
     assert "No hay un tiempo de llegada confiable" in response.json()["reply"]
     assert "el respaldo se generó localmente" in response.json()["providerNotice"]
     assert "private upstream details" not in response.text
+    assert response.headers["cache-control"] == "private, no-store, max-age=0"
+
+
+@pytest.mark.parametrize(
+    ("delivery_status", "route_status", "question", "eta", "expected_phrase"),
+    [
+        ("PENDING", None, "¿Ya fue asignado mi pedido?", None, "pendiente de asignación"),
+        (
+            "EN_ROUTE",
+            "IN_PROGRESS",
+            "¿Cuánto falta para que llegue mi pedido?",
+            8.7,
+            "aproximadamente 9 minutos",
+        ),
+        (
+            "EN_ROUTE",
+            "IN_PROGRESS",
+            "¿Dónde va mi pedido?",
+            None,
+            "la ruta de tu pedido está en curso",
+        ),
+        (
+            "PENDING",
+            None,
+            "¿Cuándo llega mi pedido?",
+            float("nan"),
+            "No hay un tiempo de llegada confiable",
+        ),
+        ("PENDING", None, "Cuéntame un chiste", None, "Solo puedo ayudarte"),
+    ],
+)
+def test_order_fallback_uses_only_verified_status_and_scoped_questions(
+    delivery_status: str,
+    route_status: str | None,
+    question: str,
+    eta: float | None,
+    expected_phrase: str,
+) -> None:
+    reply = build_order_fallback_answer(
+        delivery_status=delivery_status,
+        route_status=route_status,
+        estimated_minutes_from_now=eta,
+        messages=[CustomerChatTurn(role="user", content=question)],
+    )
+
+    assert expected_phrase in reply
+
+
+@pytest.mark.asyncio
+async def test_chat_api_limits_requests_per_guide_and_returns_retry_after(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.api.customer_chat as customer_chat_api
+    from app.services.customer_chat_rate_limiter import CustomerChatRateLimiter
+
+    await _create_order(session_factory)
+    assistant = _FakeAssistant()
+    app.dependency_overrides[get_customer_order_chat] = lambda: assistant
+    monkeypatch.setattr(
+        customer_chat_api,
+        "_CHAT_RATE_LIMITER",
+        CustomerChatRateLimiter(max_requests=2, window_seconds=60),
+    )
+    payload = {
+        "guide": "secret-guide-123",
+        "messages": [{"role": "user", "content": "¿Qué pasa con mi pedido?"}],
+    }
+
+    first = await client.post("/api/cliente/chat", json=payload)
+    second = await client.post("/api/cliente/chat", json=payload)
+    limited = await client.post("/api/cliente/chat", json=payload)
+
+    assert first.status_code == second.status_code == 200
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == "60"
+    assert len(assistant.calls) == 2
+    async with session_factory() as session:
+        row = await session.scalar(select(CustomerChatRateLimitWindow))
+    assert row is not None
+    assert row.guide_hash != "secret-guide-123"
+    assert row.request_count == 3
