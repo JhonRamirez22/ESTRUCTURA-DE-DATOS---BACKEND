@@ -745,3 +745,86 @@ async def test_route_recalculation_preserves_completed_stop_history(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     await _create_courier(session_factory)
+    first_id = await _create_point(session_factory)
+    second_id = await _create_point(session_factory, address="Calle 18 # 20-30")
+    created = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(first_id), str(second_id)]},
+    )
+    assert created.status_code == 201, created.text
+    route_id = created.json()["route"]["id"]
+    completed_id = UUID(created.json()["orderedDeliveryPointIds"][0])
+    active_id = second_id if completed_id == first_id else first_id
+    added_id = await _create_point(session_factory, address="Carrera 12 # 7-20")
+
+    started = await client.patch(
+        f"/api/rutas/{route_id}",
+        headers={"Cookie": _cookie("courier", _COURIER_ID)},
+        json={"status": "IN_PROGRESS"},
+    )
+    assert started.status_code == 200, started.text
+    delivered = await client.patch(
+        f"/api/pedidos/{completed_id}",
+        headers={"Cookie": _cookie("courier", _COURIER_ID)},
+        json={"status": "DELIVERED"},
+    )
+    assert delivered.status_code == 200, delivered.text
+
+    recalculated = await client.post(
+        f"/api/rutas/{route_id}/recalcular",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"deliveryPointIds": [str(added_id)]},
+    )
+
+    assert recalculated.status_code == 200, recalculated.text
+    async with session_factory() as session:
+        points = list(
+            (
+                await session.scalars(
+                    select(DeliveryPoint).where(
+                        DeliveryPoint.id.in_([completed_id, active_id, added_id])
+                    )
+                )
+            ).all()
+        )
+        by_id = {point.id: point for point in points}
+        completed_point = by_id[completed_id]
+        assert completed_point.status is DeliveryPointStatus.DELIVERED
+        assert completed_point.route_id == UUID(route_id)
+        assert completed_point.sequence_index == 0
+        assert by_id[active_id].route_id == UUID(route_id)
+        assert by_id[added_id].route_id == UUID(route_id)
+        assert {by_id[active_id].sequence_index, by_id[added_id].sequence_index} == {1, 2}
+
+
+@pytest.mark.asyncio
+async def test_route_creation_rejects_coordinates_changed_after_optimization(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    plan = OptimizedRoutePlan(
+        courier_id=_COURIER_ID,
+        planned_courier_location=(-77.2811, 1.2136),
+        ordered_delivery_point_ids=(point_id,),
+        planned_delivery_point_coordinates=((point_id, (-77.28, 1.214)),),
+        estimated_duration_minutes=7.0,
+        estimated_distance_meters=800.0,
+        baseline_duration_minutes=7.0,
+        baseline_distance_meters=800.0,
+        geometry={
+            "type": "LineString",
+            "coordinates": [(-77.2811, 1.2136), (-77.28, 1.214)],
+        },
+        geometry_provider=RouteGeometryProvider.OSRM,
+        matrix_source="osrm",
+        warning=None,
+        traffic_ai={"source": "deterministic", "applied": False},
+    )
+
+    # Simula que el pedido se corrige mientras el proveedor de calles calcula la ruta.
+    async with session_factory() as session:
+        point = await session.get(DeliveryPoint, point_id)
+        assert point is not None
+        point.lat = 1.215
