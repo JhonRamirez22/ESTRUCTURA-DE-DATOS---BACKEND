@@ -662,3 +662,86 @@ async def test_dispatcher_can_undo_recalculations_in_persisted_lifo_order(
     assert listed.json()["routes"][0]["canUndo"] is True
 
     undo_latest = await client.post(f"/api/rutas/{route_id}/deshacer-recalculo", headers=dispatcher)
+    assert undo_latest.status_code == 200, undo_latest.text
+    assert undo_latest.json()["undone"] is True
+    assert undo_latest.json()["canUndo"] is True
+    assert undo_latest.json()["releasedDeliveryPointIds"] == [str(added_id)]
+    assert undo_latest.json()["route"]["geometry"] == first_revision_route["geometry"]
+    assert [point["id"] for point in undo_latest.json()["route"]["deliveryPoints"]] == [
+        str(first_id)
+    ]
+
+    undo_previous = await client.post(
+        f"/api/rutas/{route_id}/deshacer-recalculo",
+        headers=dispatcher,
+    )
+    assert undo_previous.status_code == 200, undo_previous.text
+    assert undo_previous.json()["canUndo"] is False
+    assert undo_previous.json()["route"]["estimatedDurationMinutes"] == initial_route[
+        "estimatedDurationMinutes"
+    ]
+    assert undo_previous.json()["route"]["geometry"] == initial_route["geometry"]
+
+    async with session_factory() as session:
+        restored_point = await session.get(DeliveryPoint, first_id)
+        released_point = await session.get(DeliveryPoint, added_id)
+        assert restored_point is not None
+        assert restored_point.route_id == UUID(route_id)
+        assert restored_point.sequence_index == 0
+        assert released_point is not None
+        assert released_point.route_id is None
+        assert released_point.sequence_index is None
+        assert released_point.status is DeliveryPointStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_route_recalculation_undo_requires_dispatcher_and_safe_active_stops(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    created = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(point_id)]},
+    )
+    route_id = created.json()["route"]["id"]
+
+    no_history = await client.post(
+        f"/api/rutas/{route_id}/deshacer-recalculo",
+        headers={"Cookie": _cookie("dispatcher")},
+    )
+    denied = await client.post(
+        f"/api/rutas/{route_id}/deshacer-recalculo",
+        headers={"Cookie": _cookie("courier", _COURIER_ID)},
+    )
+    assert no_history.status_code == 409
+    assert denied.status_code == 403
+
+    recalculated = await client.post(
+        f"/api/rutas/{route_id}/recalcular",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={},
+    )
+    assert recalculated.status_code == 200, recalculated.text
+    async with session_factory() as session:
+        point = await session.get(DeliveryPoint, point_id)
+        assert point is not None
+        point.status = DeliveryPointStatus.DELIVERED
+        await session.commit()
+
+    unsafe_undo = await client.post(
+        f"/api/rutas/{route_id}/deshacer-recalculo",
+        headers={"Cookie": _cookie("dispatcher")},
+    )
+    assert unsafe_undo.status_code == 409
+    assert "cambió de estado" in unsafe_undo.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_route_recalculation_preserves_completed_stop_history(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _create_courier(session_factory)
