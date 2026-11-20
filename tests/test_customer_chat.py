@@ -830,3 +830,86 @@ async def test_eta_provider_failure_keeps_order_chat_available_without_guessing(
     assert assistant.calls[0]["estimated_minutes_from_now"] is None
 
 
+@pytest.mark.asyncio
+async def test_euclidean_matrix_fallback_is_not_presented_as_a_road_eta(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    routing_providers: tuple[_FakeMatrixProvider, _FakeRouteProvider],
+) -> None:
+    guide = f"FALLBACK-ETA-{uuid4()}"
+    await _create_active_order(session_factory, guide)
+    routing_providers[0].source = "euclidean-fallback"
+    routing_providers[1].fails = True
+    assistant = _FakeAssistant()
+    app.dependency_overrides[get_customer_order_chat] = lambda: assistant
+
+    response = await client.post(
+        "/api/cliente/chat",
+        json={
+            "guide": guide,
+            "messages": [{"role": "user", "content": "¿Cuánto falta?"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert assistant.calls[0]["estimated_minutes_from_now"] is None
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected"),
+    [
+        ([CustomerChatTurn(role="user", content="¿Cuánto falta?")], True),
+        ([CustomerChatTurn(role="user", content="¿Y a qué hora?")], False),
+        (
+            [
+                CustomerChatTurn(role="user", content="¿Ya fue asignado?"),
+                CustomerChatTurn(role="user", content="¿Y a qué hora?"),
+            ],
+            True,
+        ),
+        (
+            [
+                CustomerChatTurn(role="user", content="¿Qué pasa con mi pedido?"),
+                CustomerChatTurn(role="user", content="¿Cuál es la capital de Francia?"),
+                CustomerChatTurn(role="user", content="¿Y a qué hora?"),
+            ],
+            False,
+        ),
+    ],
+)
+def test_eta_detection_stays_inside_the_current_order_scope(
+    messages: list[CustomerChatTurn], expected: bool
+) -> None:
+    assert customer_asks_for_arrival_estimate(messages) is expected
+
+
+@pytest.mark.asyncio
+async def test_chat_status_reports_unconfigured_without_exposing_provider_details(
+    client: httpx.AsyncClient,
+) -> None:
+    app.dependency_overrides[get_customer_order_chat] = lambda: None
+    response = await client.get("/api/cliente/chat/estado")
+
+    assert response.status_code == 200
+    assert response.json() == {"configured": False}
+    assert response.headers["cache-control"] == "private, no-store, max-age=0"
+    assert "api" not in response.text.lower()
+    assert "key" not in response.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_chat_status_reports_configured_provider_as_a_boolean(
+    client: httpx.AsyncClient,
+) -> None:
+    assistant: OrderChatAssistant = _FakeAssistant()
+    app.dependency_overrides[get_customer_order_chat] = lambda: assistant
+
+    response = await client.get("/api/cliente/chat/estado")
+
+    assert response.status_code == 200
+    assert response.json() == {"configured": True}
+    assert response.headers["cache-control"] == "private, no-store, max-age=0"
+
+
+@pytest.mark.asyncio
+async def test_chat_endpoint_hides_unknown_orders_and_unconfigured_provider(
