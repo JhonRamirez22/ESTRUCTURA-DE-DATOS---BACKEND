@@ -7,7 +7,7 @@ import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 from uuid import UUID
 
@@ -27,6 +27,12 @@ from app.core.optimization.nearest_neighbor import nearest_neighbor
 from app.core.optimization.or_opt import or_opt
 from app.core.optimization.order_verifier import verify_candidate_order
 from app.core.optimization.refine import RefineResult, refine_route
+from app.core.optimization.time_windows import (
+    Window,
+    WindowEvaluation,
+    plan_with_windows,
+    window_from_json,
+)
 from app.core.optimization.two_opt import two_opt
 from app.core.routing.cached_matrix_provider import (
     CachedMatrixProvider,
@@ -449,6 +455,17 @@ async def build_optimized_route_plan(
         optimized_duration = _route_cost(optimization_matrix, optimized_route)
     ai_order.pop("route", None)
 
+    window_summary = (
+        _apply_time_windows(
+            optimization_matrix, optimized_route, delivery_point_ids, points_by_id, current_time
+        )
+        if get_settings().time_windows_enabled
+        else None
+    )
+    if window_summary is not None:
+        optimized_route = cast(list[int], window_summary.pop("route"))
+        optimized_duration = _route_cost(optimization_matrix, optimized_route)
+
     final_coordinates = [coordinates[index] for index in optimized_route]
     if final_coordinates != ordered_coordinates:
         route_result = await route_provider.get_route(final_coordinates)
@@ -489,6 +506,8 @@ async def build_optimized_route_plan(
         ai_order=ai_order,
         computed_at=current_time,
     )
+    if window_summary is not None:
+        optimization["timeWindows"] = window_summary
     distances = matrix_result.get("distances_meters")
     baseline_distance = (
         _route_cost(distances, baseline_route)
@@ -523,6 +542,58 @@ async def build_optimized_route_plan(
         ai_order=ai_order,
         optimization=optimization,
     )
+
+
+_BOGOTA_OFFSET = timedelta(hours=-5)
+
+
+def _apply_time_windows(
+    matrix: Sequence[Sequence[float | None]],
+    route: list[int],
+    delivery_point_ids: Sequence[UUID],
+    points_by_id: Mapping[UUID, DeliveryPoint],
+    current_time: datetime,
+) -> dict[str, object] | None:
+    """Reordena para cumplir ventanas y prioridades; ``None`` si ningún pedido las usa."""
+    local = current_time + _BOGOTA_OFFSET
+    now_minute = local.hour * 60 + local.minute + local.second / 60
+    windows: dict[int, Window] = {}
+    priority: dict[int, float] = {}
+    for index, point_id in enumerate(delivery_point_ids, start=1):
+        point = points_by_id[point_id]
+        window = window_from_json(point.time_window, now_minute)
+        if window is not None:
+            windows[index] = window
+        if point.priority > 1:
+            priority[index] = float(point.priority)
+    if not windows:
+        return None
+    plan = plan_with_windows(matrix, route, windows, priority)
+    changed = plan.route != route and plan.after.objective < plan.before.objective - 1e-9
+    return {
+        "applied": changed,
+        "route": plan.route if changed else route,
+        "windowedStops": len(windows),
+        "lateStopsBefore": plan.before.late_stops,
+        "lateStopsAfter": plan.after.late_stops if changed else plan.before.late_stops,
+        "lateMinutesBefore": round(_plain_lateness(plan.before, windows, route), 1),
+        "lateMinutesAfter": round(
+            _plain_lateness(plan.after, windows, plan.route) if changed
+            else _plain_lateness(plan.before, windows, route), 1,
+        ),
+    }
+
+
+def _plain_lateness(
+    evaluation: WindowEvaluation, windows: Mapping[int, Window], route: Sequence[int]
+) -> float:
+    """Minutos de retraso sin ponderar por prioridad, para mostrarlos al despachador."""
+    total = 0.0
+    for node, arrival in zip(route, evaluation.arrivals, strict=False):
+        window = windows.get(node)
+        if window is not None and arrival > window.latest:
+            total += arrival - window.latest
+    return total
 
 
 def _optimization_summary(

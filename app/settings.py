@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     joint_assignment_enabled: bool = True
     # Avisos en contexto para el despachador (ver dispatch_suggestions).
     ai_suggestions_enabled: bool = True
+    # Respeta ventanas horarias y prioridades de los pedidos al ordenar la ruta.
+    time_windows_enabled: bool = True
     # Peticiones en curso por proceso; por encima se responde 503 al instante, sin colas.
     max_inflight_requests: int = Field(default=200, ge=1, le=10_000)
     database_ssl_mode: Literal["disable", "require", "verify-ca", "verify-full"] = "disable"
