@@ -106,14 +106,25 @@ async def test_verified_text_is_used_and_name_stays_local(ai_on: None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_invented_figure_or_missing_placeholder_falls_back(ai_on: None) -> None:
+async def test_invented_figure_or_two_placeholders_fall_back(ai_on: None) -> None:
     cards = _card()
     fallback = cards[0]["text"]
-    for bad in ("{courier} lleva 40 min sin ubicación.", "Beto lleva 14 min sin ubicación."):
+    for bad in ("{courier} lleva 40 min sin ubicación.", "{courier} y {courier} llevan 14 min."):
         out, status = await ds.phrase_with_ai(
             cards, budget=ds.DailyBudget(5), transport=_groq({cards[0]["id"]: bad})
         )
         assert out[0]["text"] == fallback and status["accepted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_missing_placeholder_gets_the_courier_name_prepended(ai_on: None) -> None:
+    cards = _card()
+    out, status = await ds.phrase_with_ai(
+        cards, budget=ds.DailyBudget(5),
+        transport=_groq({cards[0]["id"]: "GPS inactivo desde hace 14 minutos"}),
+    )
+    assert out[0]["text"] == "Beto: GPS inactivo desde hace 14 minutos"
+    assert out[0]["source"] == "groq-validated" and status["accepted"] == 1
 
 
 @pytest.mark.asyncio
