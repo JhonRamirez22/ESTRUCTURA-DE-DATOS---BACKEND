@@ -159,3 +159,23 @@ def test_text_credentials_need_their_own_permission_not_the_location_one(
     get_settings.cache_clear()
     assert li._text_credentials() is None
     get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_text_mode_leaves_room_for_reasoning_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"texts": {}}'}}]})
+
+    model = "openai/gpt-oss-20b"
+    monkeypatch.setattr(li, "_text_credentials", lambda: ("http://x", "k", model, 1000))
+    await li._chat_json("sys", {"a": 1}, transport=httpx.MockTransport(handler), text_only=True)
+    monkeypatch.setattr(li, "_settings_credentials", lambda: ("http://x", "k", model, 1000))
+    await li._chat_json("sys", {"a": 1}, transport=httpx.MockTransport(handler))
+    text_body, location_body = sent
+    assert text_body["max_tokens"] == li.TEXT_MAX_TOKENS
+    assert text_body["reasoning_effort"] == "low"
+    # Las funciones que mandan ubicaciones conservan su petición de siempre.
+    assert location_body["max_tokens"] == 500 and "reasoning_effort" not in location_body

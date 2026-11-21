@@ -27,6 +27,7 @@ from app.settings import get_settings
 
 _LOGGER = logging.getLogger(__name__)
 MAX_GROUP_SIZE = 6
+TEXT_MAX_TOKENS = 1500
 # El agrupamiento compara todos los pares (O(n²)): se acota para no bloquear el servidor.
 MAX_GROUP_INPUT = 300
 GROUP_RADIUS_M = 400.0
@@ -105,9 +106,13 @@ async def _chat_json(
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
         "temperature": 0.1,
-        "max_tokens": 500,
+        # Los modelos que razonan gastan parte del tope pensando: con poco margen la respuesta
+        # llega cortada y deja de ser JSON. El modo texto redacta varias frases a la vez.
+        "max_tokens": TEXT_MAX_TOKENS if text_only else 500,
         "stream": False,
     }
+    if text_only and "gpt-oss" in model:
+        body["reasoning_effort"] = "low"
     try:
         async with httpx.AsyncClient(timeout=timeout_ms / 1000, transport=transport) as client:
             response = await client.post(
