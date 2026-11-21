@@ -221,11 +221,29 @@ async def close_routing_clients() -> None:
         _routing_clients = None
 
 
+@dataclass(frozen=True, slots=True)
+class PlanInputs:
+    """Lo que el plan necesita de la base de datos; cargarlo aparte permite calcular en paralelo."""
+
+    courier: Courier | None
+    points: list[DeliveryPoint]
+
+
+async def load_plan_inputs(
+    session: AsyncSession, courier_id: UUID, delivery_point_ids: Sequence[UUID]
+) -> PlanInputs:
+    repository = RouteRepository(session)
+    courier = await repository.get_courier(courier_id)
+    points = await repository.get_delivery_points(delivery_point_ids)
+    return PlanInputs(courier, points)
+
+
 async def build_optimized_route_plan(
     session: AsyncSession,
     courier_id: UUID,
     delivery_point_ids: Sequence[UUID],
     *,
+    inputs: PlanInputs | None = None,
     matrix_provider: MatrixProvider,
     route_provider: RouteProvider,
     traffic_ai_advisor: RouteTrafficAdvisor | None = None,
@@ -243,8 +261,9 @@ async def build_optimized_route_plan(
         raise RoutePlanningError("deliveryPointIds no puede contener duplicados.", 400)
 
     current_time = _as_naive_utc(now or datetime.now(UTC))
-    repository = RouteRepository(session)
-    courier = await repository.get_courier(courier_id)
+    if inputs is None:
+        inputs = await load_plan_inputs(session, courier_id, delivery_point_ids)
+    courier = inputs.courier
     if courier is None:
         raise RoutePlanningError("El courier solicitado no existe.", 404)
     can_recalculate = allow_on_route_courier and courier.status == CourierStatus.ON_ROUTE
@@ -259,7 +278,7 @@ async def build_optimized_route_plan(
     if not is_within_pasto_service_area(courier.current_lat, courier.current_lng):
         raise RouteConflictError("La última ubicación del repartidor está fuera de Pasto.")
 
-    points = await repository.get_delivery_points(delivery_point_ids)
+    points = inputs.points
     points_by_id = {point.id: point for point in points}
     missing_id = next(
         (point_id for point_id in delivery_point_ids if point_id not in points_by_id),

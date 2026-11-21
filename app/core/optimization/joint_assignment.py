@@ -27,6 +27,8 @@ MAKESPAN_WEIGHT = 0.5
 MAX_PASSES = 25
 MAX_EVALUATIONS = 4_000
 MAX_ORDERS_PER_COURIER = 50
+# Mismo criterio de balance que ``assign_orders``: nadie recibe más de 1,5 veces la carga media.
+LOAD_CAP_MULTIPLIER = 1.5
 MIN_GAIN_MINUTES = 0.05
 NEIGHBOURS_FOR_SWAPS = 6
 
@@ -150,6 +152,14 @@ def improve_assignment(
     """
     evaluator = _Evaluator(matrix)
     current = {courier: list(orders) for courier, orders in assignments.items()}
+    total_orders = sum(len(orders) for orders in current.values())
+    # Sin este tope, minimizar minutos totales «mejora» dejando todo a un solo repartidor.
+    load_cap = min(
+        MAX_ORDERS_PER_COURIER,
+        max(1, math.floor(total_orders / max(1, len(current)) * LOAD_CAP_MULTIPLIER)),
+    )
+    # Nunca por debajo de lo que el reparto de partida ya le dio a alguien.
+    load_cap = max(load_cap, max((len(orders) for orders in current.values()), default=0))
     before = _cost_of(evaluator, courier_index, order_index, current)
     moves: list[Move] = []
     if len(current) < 2 or not any(current.values()):
@@ -159,7 +169,9 @@ def improve_assignment(
     for _ in range(MAX_PASSES):
         if evaluator.evaluations >= MAX_EVALUATIONS:
             break
-        best = _best_move(matrix, evaluator, courier_index, order_index, current, state, weight)
+        best = _best_move(
+            matrix, evaluator, courier_index, order_index, current, state, weight, load_cap
+        )
         if best is None:
             break
         _apply(current, best.move)
@@ -176,6 +188,7 @@ def _best_move(
     current: Mapping[str, list[str]],
     state: AssignmentCost,
     weight: float,
+    load_cap: int,
 ) -> _Candidate | None:
     heap = MinHeap[_Candidate, tuple[object, ...]](_compare, lambda item: item.key)
     base_objective = state.objective(weight)
@@ -190,8 +203,10 @@ def _best_move(
         for order in orders:
             o = order_index[order]
             for target in current:
-                if target == source or len(current[target]) >= MAX_ORDERS_PER_COURIER:
+                if target == source or len(current[target]) >= load_cap:
                     continue
+                if len(current[source]) <= 1:
+                    continue  # quien tiene pedidos sigue trabajando: no se deja a nadie sin ruta
                 if evaluator.evaluations >= MAX_EVALUATIONS:
                     return heap.extract_min()
                 new_source = evaluator.route_minutes(courier_index[source], sets[source] - {o})

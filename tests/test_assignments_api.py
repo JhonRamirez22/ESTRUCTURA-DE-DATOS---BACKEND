@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -563,3 +564,74 @@ async def _create_point(
         session.add(point)
         await session.commit()
     return point
+
+
+class _SlowTrackingRouteProvider(FakeRouteProvider):
+    def __init__(self) -> None:
+        self.active = 0
+        self.peak = 0
+
+    async def get_route(self, coordinates: Sequence[Coordinate]) -> RouteResult:
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            await asyncio.sleep(0.05)
+            return await super().get_route(coordinates)
+        finally:
+            self.active -= 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_plans_couriers_in_parallel_with_a_cap_and_keeps_request_order(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from app.api.assignments import MAX_CONCURRENT_PLANS
+
+    provider = _SlowTrackingRouteProvider()
+    app.dependency_overrides[get_routing_providers] = lambda: (FakeMatrixProvider(), provider)
+    couriers = [
+        await _create_courier(session_factory, latitude=1.2136 + i * 0.001, longitude=-77.2811)
+        for i in range(6)
+    ]
+    points = [
+        await _create_point(session_factory, latitude=1.214 + i * 0.001, longitude=-77.28)
+        for i in range(6)
+    ]
+    assignments = [
+        {"courierId": str(c.id), "deliveryPointIds": [str(p.id)]}
+        for c, p in zip(couriers, points, strict=True)
+    ]
+    response = await client.post(
+        "/api/asignaciones/aplicar",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={"assignments": assignments},
+    )
+    assert response.status_code == 201, response.text
+    routes = response.json()["routes"]
+    assert [r["route"]["courierId"] for r in routes] == [str(c.id) for c in couriers]
+    assert 2 <= provider.peak <= MAX_CONCURRENT_PLANS
+
+
+@pytest.mark.asyncio
+async def test_dispatch_reports_the_first_failing_assignment_and_saves_nothing(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    good = await _create_courier(session_factory, latitude=1.2136, longitude=-77.2811)
+    busy = await _create_courier(
+        session_factory, latitude=1.2146, longitude=-77.2811, status=CourierStatus.ON_ROUTE
+    )
+    first = await _create_point(session_factory, latitude=1.214, longitude=-77.28)
+    second = await _create_point(session_factory, latitude=1.215, longitude=-77.28)
+    response = await client.post(
+        "/api/asignaciones/aplicar",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={"assignments": [
+            {"courierId": str(good.id), "deliveryPointIds": [str(first.id)]},
+            {"courierId": str(busy.id), "deliveryPointIds": [str(second.id)]},
+        ]},
+    )
+    assert response.status_code == 409
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Route)) == 0

@@ -49,6 +49,7 @@ from app.services.route_planner import (
     create_optimized_routes_batch,
     get_route_optimization,
     get_routing_providers,
+    load_plan_inputs,
 )
 from app.services.route_traffic_advisor import (
     HttpRouteTrafficAdvisor,
@@ -59,6 +60,8 @@ from app.settings import get_settings
 
 router = APIRouter(prefix="/asignaciones", tags=["asignaciones"])
 _LOGGER = logging.getLogger(__name__)
+# Con el servidor vial público, más de 3 consultas simultáneas suelen toparse con su límite.
+MAX_CONCURRENT_PLANS = 3
 _NO_STORE = {"Cache-Control": "private, no-store, max-age=0"}
 
 
@@ -330,20 +333,38 @@ async def apply_assignments(
         return _validation_error(error)
 
     matrix_provider, route_provider = providers
-    plans: list[OptimizedRoutePlan] = []
+    plans: list[OptimizedRoutePlan]
     try:
-        for assignment in parsed.assignments:
-            plans.append(
-                await build_optimized_route_plan(
+        # La base de datos se lee en orden (una sesión no admite uso concurrente); lo lento son
+        # las consultas a proveedores externos, que sí se hacen a la vez, con tope.
+        loaded = [
+            await load_plan_inputs(session, a.courier_id, a.delivery_point_ids)
+            for a in parsed.assignments
+        ]
+        gate = asyncio.Semaphore(MAX_CONCURRENT_PLANS)
+
+        async def plan_for(index: int) -> OptimizedRoutePlan:
+            assignment = parsed.assignments[index]
+            async with gate:
+                return await build_optimized_route_plan(
                     session,
                     assignment.courier_id,
                     assignment.delivery_point_ids,
+                    inputs=loaded[index],
                     matrix_provider=cast(MatrixProvider, matrix_provider),
                     route_provider=cast(RouteProvider, route_provider),
                     traffic_ai_advisor=advisor,
                     traffic_provider=traffic,
                 )
-            )
+
+        outcomes = await asyncio.gather(
+            *(plan_for(i) for i in range(len(parsed.assignments))), return_exceptions=True
+        )
+        # El primer error en el orden de la solicitud es el que se informa, como antes.
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+        plans = [outcome for outcome in outcomes if not isinstance(outcome, BaseException)]
         results = await create_optimized_routes_batch(session, plans)
         queued_by_channel = {
             channel: sum(
