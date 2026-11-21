@@ -1239,3 +1239,85 @@ async def test_a_courier_session_cannot_use_dispatcher_only_operations(
                 method, url, headers=cookie,
                 params={"q": "Pasto"} if "geocoding" in url else None,
                 json={} if method in {"POST", "PUT", "PATCH"} else None,
+            )
+            if response.status_code != 403:
+                allowed.append(f"{method} {template} -> {response.status_code}")
+    finally:
+        app.dependency_overrides.pop(get_session_factory, None)
+    assert allowed == []
+
+
+def _plan(ids: list[UUID], baseline: float | None, estimated: float) -> object:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        ordered_delivery_point_ids=ids, estimated_duration_minutes=estimated,
+        estimated_distance_meters=1000, baseline_duration_minutes=baseline, geometry=None,
+        matrix_source="osrm", traffic_ai=None, live_traffic=None, ai_order=None, warning=None,
+    )
+
+
+def test_proposal_is_worth_applying_only_above_the_minimum_gain() -> None:
+    from app.api.routes import _proposal_json
+
+    first, second = uuid4(), uuid4()
+    current = [first, second]
+    swapped = [second, first]
+    small = _proposal_json(_plan(swapped, 10.0, 9.5), current)  # type: ignore[arg-type]
+    assert small["changed"] is True and small["worthApplying"] is False
+    big = _proposal_json(_plan(swapped, 10.0, 8.0), current)  # type: ignore[arg-type]
+    assert big["worthApplying"] is True
+    disconnected = _proposal_json(_plan(swapped, None, 8.0), current)  # type: ignore[arg-type]
+    assert disconnected["worthApplying"] is True
+    same = _proposal_json(_plan(current, 10.0, 5.0), current)  # type: ignore[arg-type]
+    assert same["worthApplying"] is False
+
+
+@pytest.mark.asyncio
+async def test_eta_adds_labelled_historical_estimate_only_when_history_is_enabled(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import timedelta
+
+    from app.models import TrafficObservation
+    from app.services import eta_history
+
+    await _create_courier(session_factory)
+    point_id = await _create_point(session_factory)
+    created = await client.post(
+        "/api/rutas",
+        headers={"Cookie": _cookie("dispatcher")},
+        json={"courierId": str(_COURIER_ID), "deliveryPointIds": [str(point_id)]},
+    )
+    route_id = created.json()["route"]["id"]
+    cookie = {"Cookie": _cookie("courier", _COURIER_ID)}
+    base = datetime.now(UTC).replace(tzinfo=None, minute=0, second=0, microsecond=0)
+    async with session_factory() as session:
+        session.add_all(
+            TrafficObservation(
+                from_stop="SIM-zona-a", to_stop="SIM-zona-b", multiplier=2.0, level="ALTO",
+                road_closure=False, point_lat=1.214, point_lng=-77.28,
+                hour_of_day=0, observed_at=base - timedelta(hours=hours),
+            )
+            for hours in range(24 * 10)
+        )
+        await session.commit()
+
+    eta_history.reset_cache()
+    off = await client.get(f"/api/rutas/{route_id}/eta", headers=cookie)
+    assert off.json()["historical"] is None
+    assert "historicalMinutesFromNow" not in off.json()["etas"][0]
+
+    monkeypatch.setenv("TRAFFIC_HISTORY_ENABLED", "true")
+    get_settings.cache_clear()
+    eta_history.reset_cache()
+    on = await client.get(f"/api/rutas/{route_id}/eta", headers=cookie)
+    body = on.json()
+    assert body["etas"][0]["estimatedMinutesFromNow"] == 6.0  # el ETA vial no se toca
+    assert body["etas"][0]["historicalMinutesFromNow"] == 12.0
+    assert body["etas"][0]["historicalLevel"] == "zone"
+    assert body["historical"]["simulatedShare"] == 1.0
+    eta_history.reset_cache()
+    get_settings.cache_clear()
