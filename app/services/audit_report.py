@@ -1,0 +1,417 @@
+"""Informes de auditoría por usuario: qué hizo, cuándo y con qué resultado (solo despacho).
+
+Recoge de la base de datos los movimientos de un repartidor, una cuenta de despacho o un pedido
+(cliente) en un periodo y los entrega como ``ReportData`` neutro; ``render_report`` lo convierte
+en PDF. Los datos de contacto del cliente se muestran enmascarados: la auditoría prueba que
+hubo avisos, no reexpone el teléfono ni el correo completos.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from uuid import UUID
+
+from sqlalchemy import func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.location.proximity import haversine_m
+from app.core.reports.pdf import PdfReport
+from app.models import (
+    Courier,
+    CustomerNotificationOutbox,
+    DeliveryPoint,
+    DeliveryPointStatus,
+    LocationEvent,
+    Notification,
+    Route,
+)
+from app.models.account import Account
+from app.models.security import AccessSession, SecurityAuditEvent
+
+BOGOTA = timedelta(hours=-5)
+MAX_ROWS = 300
+MAX_DAYS = 366
+GPS_GAP_BREAK_M = 2_000.0  # un salto mayor no cuenta como recorrido (GPS perdido)
+
+
+@dataclass(slots=True)
+class Section:
+    title: str
+    headers: list[str]
+    rows: list[list[str]]
+    fractions: list[float]
+    note: str | None = None
+
+
+@dataclass(slots=True)
+class ReportData:
+    title: str
+    subject: list[tuple[str, str]]
+    sections: list[Section] = field(default_factory=list)
+
+
+class AuditPeriodError(ValueError):
+    """El periodo pedido no es válido."""
+
+
+def period_bounds(start: date, end: date) -> tuple[datetime, datetime]:
+    """Fechas locales de Bogotá a instantes UTC [inicio, fin)."""
+    if end < start:
+        raise AuditPeriodError("La fecha final debe ser igual o posterior a la inicial.")
+    if (end - start).days >= MAX_DAYS:
+        raise AuditPeriodError(f"El periodo no puede superar {MAX_DAYS} días.")
+    begin = datetime(start.year, start.month, start.day) - BOGOTA
+    finish = datetime(end.year, end.month, end.day) + timedelta(days=1) - BOGOTA
+    return begin, finish
+
+
+def local(moment: datetime | None) -> str:
+    return "—" if moment is None else (moment + BOGOTA).strftime("%Y-%m-%d %H:%M")
+
+
+def mask_email(value: str | None) -> str:
+    if not value or "@" not in value:
+        return "—"
+    name, domain = value.split("@", 1)
+    return f"{name[:1]}***@{domain}"
+
+
+def mask_phone(value: str | None) -> str:
+    if not value:
+        return "—"
+    return f"***{value[-3:]}" if len(value) > 3 else "***"
+
+
+def _cap(rows: list[list[str]], total: int) -> tuple[list[list[str]], str | None]:
+    if total <= MAX_ROWS:
+        return rows, None
+    return rows[:MAX_ROWS], f"Se muestran {MAX_ROWS} de {total} registros (los más recientes)."
+
+
+def _distance_km(events: Sequence[LocationEvent]) -> float:
+    total = 0.0
+    for before, after in zip(events, events[1:], strict=False):
+        step = haversine_m(before.lat, before.lng, after.lat, after.lng)
+        if step <= GPS_GAP_BREAK_M:
+            total += step
+    return total / 1000.0
+
+
+async def _security_section(
+    session: AsyncSession, account_id: UUID, begin: datetime, end: datetime
+) -> Section:
+    rows = (
+        await session.scalars(
+            select(SecurityAuditEvent)
+            .where(
+                SecurityAuditEvent.account_id == account_id,
+                SecurityAuditEvent.created_at >= begin,
+                SecurityAuditEvent.created_at < end,
+            )
+            .order_by(SecurityAuditEvent.created_at.desc())
+            .limit(MAX_ROWS + 1)
+        )
+    ).all()
+    total = len(rows)
+    table = [
+        [local(e.created_at), e.action, e.outcome, e.request_id[:8]] for e in rows[:MAX_ROWS]
+    ]
+    note = f"Se muestran los {MAX_ROWS} más recientes." if total > MAX_ROWS else None
+    return Section(
+        "Eventos de seguridad", ["Fecha (Bogotá)", "Acción", "Resultado", "Solicitud"],
+        table, [3, 4, 2, 2], note,
+    )
+
+
+async def _sessions_section(
+    session: AsyncSession, account_id: UUID, begin: datetime, end: datetime
+) -> Section:
+    rows = (
+        await session.scalars(
+            select(AccessSession)
+            .where(
+                AccessSession.account_id == account_id,
+                AccessSession.created_at >= begin,
+                AccessSession.created_at < end,
+            )
+            .order_by(AccessSession.created_at.desc())
+            .limit(MAX_ROWS)
+        )
+    ).all()
+    table = [
+        [local(s.created_at), local(s.last_seen_at), local(s.expires_at),
+         "Revocada " + local(s.revoked_at) if s.revoked_at else "—"]
+        for s in rows
+    ]
+    return Section(
+        "Sesiones de acceso", ["Inicio", "Última actividad", "Vence", "Revocación"],
+        table, [3, 3, 3, 3],
+    )
+
+
+async def collect_courier_report(
+    session: AsyncSession, courier_id: UUID, begin: datetime, end: datetime
+) -> ReportData | None:
+    courier = await session.get(Courier, courier_id)
+    if courier is None:
+        return None
+    account = await session.scalar(select(Account).where(Account.courier_id == courier_id))
+    events = (
+        await session.scalars(
+            select(LocationEvent)
+            .where(
+                LocationEvent.courier_id == courier_id,
+                LocationEvent.recorded_at >= begin,
+                LocationEvent.recorded_at < end,
+            )
+            .order_by(LocationEvent.recorded_at.asc())
+            .limit(50_000)
+        )
+    ).all()
+    routes = (
+        await session.scalars(
+            select(Route)
+            .where(
+                Route.courier_id == courier_id,
+                Route.created_at >= begin,
+                Route.created_at < end,
+            )
+            .order_by(Route.created_at.desc())
+        )
+    ).all()
+    route_ids = [route.id for route in routes]
+    points = (
+        list(
+            (
+                await session.scalars(
+                    select(DeliveryPoint).where(DeliveryPoint.route_id.in_(route_ids))
+                )
+            ).all()
+        )
+        if route_ids
+        else []
+    )
+    by_route: dict[UUID, list[DeliveryPoint]] = defaultdict(list)
+    for point in points:
+        if point.route_id is not None:
+            by_route[point.route_id].append(point)
+    delivered = sum(p.status == DeliveryPointStatus.DELIVERED for p in points)
+    failed = sum(p.status == DeliveryPointStatus.FAILED for p in points)
+
+    data = ReportData(
+        "Auditoría de repartidor",
+        [
+            ("Repartidor", courier.name),
+            ("Teléfono", courier.phone),
+            ("Estado actual", courier.status.value),
+            ("Última ubicación", local(courier.last_location_at)),
+            ("Cuenta", account.email if account else "Sin cuenta de correo"),
+            ("Cuenta habilitada", "Sí" if account and account.enabled else "No"),
+            ("Rutas en el periodo", str(len(routes))),
+            ("Entregas completadas / fallidas", f"{delivered} / {failed}"),
+            ("Eventos GPS / distancia", f"{len(events)} / {_distance_km(events):.1f} km"),
+        ],
+    )
+
+    route_rows = []
+    for route in routes:
+        stops = by_route.get(route.id, [])
+        actual = (
+            f"{(route.completed_at - route.started_at).total_seconds() / 60:.0f}"
+            if route.started_at and route.completed_at
+            else "—"
+        )
+        route_rows.append([
+            local(route.created_at), route.status.value, str(len(stops)),
+            str(sum(p.status == DeliveryPointStatus.DELIVERED for p in stops)),
+            str(sum(p.status == DeliveryPointStatus.FAILED for p in stops)),
+            f"{route.estimated_duration_minutes:.0f}",
+            "—" if route.baseline_duration_minutes is None
+            else f"{route.baseline_duration_minutes:.0f}",
+            actual,
+        ])
+    rows, note = _cap(route_rows, len(route_rows))
+    data.sections.append(Section(
+        "Rutas", ["Creada", "Estado", "Paradas", "Entreg.", "Fallid.", "Est. min", "Base min",
+                  "Real min"], rows, [3, 3, 2, 2, 2, 2, 2, 2], note,
+    ))
+
+    point_rows = [
+        [route_ref, point.order_id, point.status.value, point.address]
+        for route in routes
+        for point in sorted(by_route.get(route.id, []), key=lambda p: p.sequence_index or 0)
+        for route_ref in [local(route.created_at)]
+    ]
+    rows, note = _cap(point_rows, len(point_rows))
+    data.sections.append(Section(
+        "Entregas asignadas", ["Ruta creada", "Pedido", "Estado", "Dirección"], rows,
+        [3, 3, 2, 6], note,
+    ))
+
+    per_day: dict[str, list[LocationEvent]] = defaultdict(list)
+    for event in events:
+        per_day[(event.recorded_at + BOGOTA).strftime("%Y-%m-%d")].append(event)
+    gps_rows = [
+        [day, str(len(items)), local(items[0].recorded_at)[11:], local(items[-1].recorded_at)[11:],
+         f"{_distance_km(items):.1f}"]
+        for day, items in sorted(per_day.items(), reverse=True)
+    ]
+    rows, note = _cap(gps_rows, len(gps_rows))
+    data.sections.append(Section(
+        "Actividad GPS por día", ["Día", "Eventos", "Primero", "Último", "Km"], rows,
+        [3, 2, 2, 2, 2], note,
+    ))
+
+    if account is not None:
+        data.sections.append(await _sessions_section(session, account.id, begin, end))
+        data.sections.append(await _security_section(session, account.id, begin, end))
+
+    notices = (
+        await session.scalars(
+            select(Notification)
+            .where(
+                Notification.recipient_id == str(courier_id),
+                Notification.created_at >= begin,
+                Notification.created_at < end,
+            )
+            .order_by(Notification.created_at.desc())
+            .limit(MAX_ROWS)
+        )
+    ).all()
+    data.sections.append(Section(
+        "Avisos internos recibidos", ["Fecha", "Tipo", "Título"],
+        [[local(n.created_at), n.kind.value, n.title] for n in notices], [3, 4, 6],
+    ))
+    return data
+
+
+async def collect_account_report(
+    session: AsyncSession, account_id: UUID, begin: datetime, end: datetime
+) -> ReportData | None:
+    account = await session.get(Account, account_id)
+    if account is None or account.role != "dispatcher":
+        return None
+    data = ReportData(
+        "Auditoría de cuenta de despacho",
+        [
+            ("Cuenta", account.email),
+            ("Rol", "Despachador"),
+            ("Habilitada", "Sí" if account.enabled else "No"),
+        ],
+    )
+    data.sections.append(await _sessions_section(session, account.id, begin, end))
+    data.sections.append(await _security_section(session, account.id, begin, end))
+    return data
+
+
+async def collect_order_report(
+    session: AsyncSession, point_id: UUID, begin: datetime, end: datetime
+) -> ReportData | None:
+    point = await session.get(DeliveryPoint, point_id)
+    if point is None:
+        return None
+    route = await session.get(Route, point.route_id) if point.route_id else None
+    courier = await session.get(Courier, route.courier_id) if route else None
+    data = ReportData(
+        "Auditoría de pedido y cliente",
+        [
+            ("Pedido", point.order_id),
+            ("Estado", point.status.value),
+            ("Dirección", point.address),
+            ("Prioridad", {1: "Normal", 2: "Alta", 3: "Urgente"}.get(point.priority, "Normal")),
+            ("Ventana horaria", str(point.time_window) if point.time_window else "—"),
+            ("Correo del cliente (enmascarado)", mask_email(point.customer_email)),
+            ("Teléfono del cliente (enmascarado)", mask_phone(point.customer_phone)),
+            ("Aviso por correo / SMS autorizado",
+             f"{'Sí' if point.email_notifications_enabled else 'No'} / "
+             f"{'Sí' if point.sms_notifications_enabled else 'No'}"),
+            ("Repartidor asignado", courier.name if courier else "Sin asignar"),
+            ("Ruta", f"{route.status.value} · creada {local(route.created_at)}" if route else "—"),
+        ],
+    )
+    outbox = (
+        await session.scalars(
+            select(CustomerNotificationOutbox)
+            .where(
+                CustomerNotificationOutbox.delivery_point_id == point_id,
+                CustomerNotificationOutbox.created_at >= begin,
+                CustomerNotificationOutbox.created_at < end,
+            )
+            .order_by(CustomerNotificationOutbox.created_at.desc())
+            .limit(MAX_ROWS)
+        )
+    ).all()
+    data.sections.append(Section(
+        "Avisos enviados al cliente",
+        ["Creado", "Evento", "Canal", "Estado", "Intentos", "Enviado", "Error"],
+        [[local(o.created_at), o.event_type.value, o.channel.value, o.status.value,
+          str(o.attempt_count), local(o.sent_at), o.last_error_code or "—"] for o in outbox],
+        [3, 3, 2, 2, 2, 3, 3],
+    ))
+    tracking = (
+        await session.scalars(
+            select(AccessSession)
+            .where(
+                AccessSession.delivery_point_id == point_id,
+                AccessSession.created_at >= begin,
+                AccessSession.created_at < end,
+            )
+            .order_by(AccessSession.created_at.desc())
+            .limit(MAX_ROWS)
+        )
+    ).all()
+    data.sections.append(Section(
+        "Consultas de seguimiento del cliente", ["Inicio", "Última actividad", "Revocación"],
+        [[local(s.created_at), local(s.last_seen_at), local(s.revoked_at)] for s in tracking],
+        [3, 3, 3],
+    ))
+    contact = []
+    if point.customer_email:
+        contact.append(func.lower(DeliveryPoint.customer_email) == point.customer_email.lower())
+    if point.customer_phone:
+        contact.append(DeliveryPoint.customer_phone == point.customer_phone)
+    if contact:
+        others = (
+            await session.scalars(
+                select(DeliveryPoint)
+                .where(or_(*contact), DeliveryPoint.id != point_id)
+                .order_by(DeliveryPoint.id.desc())
+                .limit(MAX_ROWS)
+            )
+        ).all()
+        data.sections.append(Section(
+            "Otros pedidos con el mismo contacto", ["Pedido", "Estado", "Dirección"],
+            [[o.order_id, o.status.value, o.address] for o in others], [3, 2, 6],
+        ))
+    return data
+
+
+def render_report(
+    data: ReportData, *, begin: datetime, end: datetime, generated_by: str, generated_at: datetime
+) -> bytes:
+    period = f"{local(begin)[:10]} a {local(end - timedelta(seconds=1))[:10]}"
+    subtitle = (
+        f"Periodo: {period} (hora de Bogotá). Generado el {local(generated_at)} por "
+        f"{generated_by}. Documento confidencial: contiene datos personales."
+    )
+    report = PdfReport(data.title, subtitle, "Rutas Pasto · Auditoría de datos")
+    report.heading("Datos del sujeto")
+    report.key_values(data.subject)
+    for section in data.sections:
+        report.heading(f"{section.title} ({len(section.rows)})")
+        report.table(section.headers, section.rows, section.fractions)
+        if section.note:
+            report.paragraph(section.note, gray=0.4)
+    report.heading("Alcance y límites")
+    report.paragraph(
+        "Este informe refleja lo registrado en el sistema durante el periodo. La actividad "
+        "GPS se resume por día (no se listan coordenadas) y los contactos de clientes van "
+        "enmascarados. No incluye contraseñas ni credenciales. Los eventos de seguridad "
+        "dependen de lo que el sistema audita en cada momento.",
+        gray=0.3,
+    )
+    return report.build()
+

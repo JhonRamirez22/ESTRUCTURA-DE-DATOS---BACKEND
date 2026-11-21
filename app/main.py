@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from app.api.addresses import router as addresses_router
 from app.api.analytics import router as analytics_router
 from app.api.assignments import router as assignments_router
+from app.api.audit import router as audit_router
 from app.api.auth import router as auth_router
 from app.api.couriers import get_location_event_queue
 from app.api.couriers import router as couriers_router
@@ -95,6 +96,7 @@ for router in (
     geocoding_router, analytics_router, couriers_router, orders_router,
     assignments_router, routes_router, tracking_router, traffic_router, traffic_tiles_router,
     optimizations_router, order_requests_router, intelligence_router,
+    audit_router,
 ):
     app.include_router(router, prefix="/api/v1")
     if get_settings().legacy_api_alias_enabled:

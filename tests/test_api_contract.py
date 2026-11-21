@@ -56,6 +56,8 @@ _EXPECTED_OPERATIONS = frozenset(
         ("GET", "/api/inteligencia/agrupaciones"),
         ("GET", "/api/inteligencia/sugerencias"),
         ("GET", "/api/inteligencia/resumen-turno"),
+        ("GET", "/api/auditoria/sujetos"),
+        ("GET", "/api/auditoria/informe"),
         ("POST", "/api/inteligencia/rutas/{}/explicar"),
         ("POST", "/api/solicitudes/{}/aceptar"),
         ("POST", "/api/solicitudes/{}/rechazar"),
