@@ -591,3 +591,29 @@ async def test_address_ai_requires_opt_in_and_rejects_location_outside_pasto(
     assert payload["deliveryPoint"]["address"] == "Calle 100"
     assert payload["addressNormalization"]["source"] == "deterministic"
     assert "no confirmó" in payload["addressNormalization"]["warning"]
+
+
+@pytest.mark.asyncio
+async def test_order_priority_defaults_to_normal_and_is_validated(
+    client: httpx.AsyncClient,
+) -> None:
+    dispatcher = {"Cookie": _cookie("dispatcher")}
+    base = {"address": "Calle 2", "lat": 1.2136, "lng": -77.2811}
+    normal = await client.post(
+        "/api/pedidos", headers=dispatcher, json={**base, "orderId": "PRIO-1"}
+    )
+    assert normal.status_code == 201
+    assert normal.json()["deliveryPoint"]["priority"] == 1
+    urgent = await client.post(
+        "/api/pedidos", headers=dispatcher, json={**base, "orderId": "PRIO-2", "priority": 3}
+    )
+    assert urgent.json()["deliveryPoint"]["priority"] == 3
+    for invalid in (0, 4, "alta"):
+        body = {**base, "orderId": "PRIO-X", "priority": invalid}
+        rejected = await client.post("/api/pedidos", headers=dispatcher, json=body)
+        assert rejected.status_code == 400, rejected.text
+    point_id = normal.json()["deliveryPoint"]["id"]
+    patched = await client.patch(
+        f"/api/pedidos/{point_id}", headers=dispatcher, json={"priority": 2}
+    )
+    assert patched.json()["deliveryPoint"]["priority"] == 2

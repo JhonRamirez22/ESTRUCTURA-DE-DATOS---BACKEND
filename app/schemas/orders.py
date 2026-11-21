@@ -59,6 +59,7 @@ class OrderCreateRequest(BaseModel):
         min_length=1, max_length=MAX_ORDER_ID_LENGTH, validation_alias="orderId"
     )
     time_window: JsonValue | None = Field(default=None, validation_alias="timeWindow")
+    priority: int = Field(default=1, ge=1, le=3)
     customer_email: str | None = Field(
         default=None, max_length=320, validation_alias="customerEmail"
     )
@@ -136,6 +137,7 @@ class OrderUpdateRequest(BaseModel):
     )
     status: DeliveryPointStatus | None = None
     time_window: JsonValue | None = Field(default=None, validation_alias="timeWindow")
+    priority: int | None = Field(default=None, ge=1, le=3)
     customer_email: str | None = Field(
         default=None, max_length=320, validation_alias="customerEmail"
     )
@@ -230,6 +232,7 @@ class DeliveryPointView(BaseModel):
     lat: float
     lng: float
     time_window: JsonValue | None = Field(serialization_alias="timeWindow")
+    priority: int = 1
     status: DeliveryPointStatus
     order_id: str = Field(serialization_alias="orderId")
     tracking_token: str | None = Field(serialization_alias="trackingToken")

@@ -9,11 +9,13 @@ from enum import StrEnum
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
     Index,
     Integer,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -107,6 +109,7 @@ class DeliveryPoint(Base):
             "sequence_index",
             name="delivery_points_route_sequence_idx",
         ),
+        CheckConstraint("priority BETWEEN 1 AND 3", name="delivery_points_priority_range"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -138,6 +141,10 @@ class DeliveryPoint(Base):
         ForeignKey("routes.id", ondelete="SET NULL", onupdate="CASCADE"),
     )
     sequence_index: Mapped[int | None] = mapped_column(Integer)
+    # 1 normal, 2 alta, 3 urgente: pesa el retraso al ordenar con ventanas horarias.
+    priority: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=1, server_default="1"
+    )
 
     route: Mapped[Route | None] = relationship(back_populates="delivery_points")
 

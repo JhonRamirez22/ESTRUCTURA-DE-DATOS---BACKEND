@@ -105,6 +105,7 @@ async def create_delivery_point(
         lat=data.lat,
         lng=data.lng,
         time_window=data.time_window,
+        priority=data.priority,
         status=DeliveryPointStatus.PENDING,
         order_id=data.order_id,
         customer_email=data.customer_email,
@@ -307,6 +308,8 @@ async def update_delivery_point(
             updates["status"] = data.status
         if "time_window" in fields:
             updates["time_window"] = data.time_window
+        if data.priority is not None:
+            updates["priority"] = data.priority
         if "customer_email" in fields or not next_email_notifications_enabled:
             updates["customer_email"] = next_customer_email
         if data.email_notifications_enabled is not None:
@@ -419,6 +422,7 @@ def _point_view(
         lat=point.lat,
         lng=point.lng,
         time_window=cast(JsonValue | None, point.time_window),
+        priority=point.priority,
         status=point.status,
         order_id=point.order_id,
         tracking_token=point.tracking_token,

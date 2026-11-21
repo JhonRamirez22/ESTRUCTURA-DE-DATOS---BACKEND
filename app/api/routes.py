@@ -882,6 +882,7 @@ def _point_json(point: DeliveryPoint, *, dispatcher: bool) -> dict[str, object]:
         "lat": point.lat,
         "lng": point.lng,
         "timeWindow": point.time_window,
+        "priority": point.priority,
         "status": point.status.value,
         "sequenceIndex": point.sequence_index,
     }
