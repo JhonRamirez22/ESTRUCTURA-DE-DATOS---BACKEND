@@ -197,7 +197,7 @@ async def phrase_with_ai(
                         text = texts.get(card["id"])
                         if _acceptable(text, card):
                             card["text"] = str(text).strip().replace(
-                                _PLACEHOLDER, str(card["_name"])
+                                _PLACEHOLDER, str(card.get("_name", ""))
                             )[:240]
                             card["source"] = "groq-validated"
                             status["accepted"] += 1
@@ -213,7 +213,8 @@ async def phrase_with_ai(
 def _acceptable(text: object, card: dict[str, Any]) -> bool:
     if not isinstance(text, str) or not text.strip() or len(text) > 240:
         return False
-    if text.count(_PLACEHOLDER) != 1:
+    # Con repartidor, su nombre va como marcador; sin él, el texto no debe llevar marcador.
+    if text.count(_PLACEHOLDER) != (1 if "_name" in card else 0):
         return False
     if not verify_explanation(text.replace(_PLACEHOLDER, ""), _figure_values(card["figures"])):
         record_incident("groq", "sugerencias:texto-no-verificado")
