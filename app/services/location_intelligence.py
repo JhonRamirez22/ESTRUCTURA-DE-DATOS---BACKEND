@@ -73,13 +73,28 @@ def _settings_credentials() -> tuple[str, str, str, int] | None:
     return api_url, api_key, model, settings.ai_traffic_timeout_ms
 
 
+def _text_credentials() -> tuple[str, str, str, int] | None:
+    """Groq solo para redactar: exige su permiso propio, no el de compartir ubicaciones."""
+    settings = get_settings()
+    if not settings.ai_text_phrasing_enabled:
+        return None
+    key = settings.customer_chat_api_key
+    api_url = (settings.customer_chat_api_url or "").strip()
+    model = (settings.customer_chat_model or "").strip()
+    api_key = key.get_secret_value().strip() if key is not None else ""
+    if not api_url or not api_key or not model:
+        return None
+    return api_url, api_key, model, settings.ai_traffic_timeout_ms
+
+
 async def _chat_json(
     system: str,
     payload: Mapping[str, Any],
     *,
     transport: httpx.AsyncBaseTransport | None = None,
+    text_only: bool = False,
 ) -> dict[str, Any]:
-    credentials = _settings_credentials()
+    credentials = _text_credentials() if text_only else _settings_credentials()
     if credentials is None:
         raise IntelligenceUnavailable("La IA no está configurada o no tiene permiso de datos.")
     api_url, api_key, model, timeout_ms = credentials

@@ -108,3 +108,13 @@ async def test_provider_failure_preserves_the_road_matrix() -> None:
     warning = summary["warning"]
     assert isinstance(warning, str)
     assert "costo base" in warning
+
+
+def test_traffic_history_hour_is_bogota_local_time_not_utc() -> None:
+    from datetime import datetime
+
+    from app.services.route_planner import _bogota_hour
+
+    assert _bogota_hour(datetime(2026, 11, 20, 22, 30)) == 17  # 22:30 UTC = 17:30 en Bogotá
+    assert _bogota_hour(datetime(2026, 11, 21, 3, 0)) == 22  # cruza la medianoche UTC
+    assert _bogota_hour(datetime(2026, 11, 20, 5, 0)) == 0

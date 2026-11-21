@@ -139,6 +139,18 @@ async def seed_demo(
     return SeedSummary(len(DEMO_COURIERS), created, accounts)
 
 
+async def refresh_demo_gps(session: AsyncSession, *, now: datetime) -> int:
+    """Renueva la posición y la hora GPS de los repartidores demo disponibles; no crea nada."""
+    renewed = 0
+    for name, _phone, lat, lng in DEMO_COURIERS:
+        courier = await session.get(Courier, demo_id(f"courier:{name}"))
+        if courier is not None and courier.status == CourierStatus.AVAILABLE:
+            courier.current_lat, courier.current_lng, courier.last_location_at = lat, lng, now
+            renewed += 1
+    await session.commit()
+    return renewed
+
+
 async def reset_operational_data(session: AsyncSession) -> dict[str, int]:
     """Borra pedidos, rutas, repartidores y eventos. Conserva cuentas, sesiones y auditoría."""
     counts: dict[str, int] = {}

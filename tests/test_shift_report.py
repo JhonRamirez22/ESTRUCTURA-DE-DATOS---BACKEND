@@ -110,7 +110,7 @@ def _groq(texts: dict[str, str]) -> httpx.MockTransport:
 async def test_ai_text_without_courier_must_not_contain_placeholder_and_keep_figures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(li, "_settings_credentials", lambda: ("http://x", "k", "m", 1000))
+    monkeypatch.setattr(li, "_text_credentials", lambda: ("http://x", "k", "m", 1000))
     cards = build_shift_cards([_route(delivered=3, failed=2)], NOW)
     alert = next(card for card in cards if card["kind"] == "failure_rate")
     good = "Fallaron 2 de 5 entregas, un 40 %."
@@ -127,7 +127,7 @@ async def test_ai_text_without_courier_must_not_contain_placeholder_and_keep_fig
 
 @pytest.mark.asyncio
 async def test_overrun_card_keeps_name_local(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(li, "_settings_credentials", lambda: ("http://x", "k", "m", 1000))
+    monkeypatch.setattr(li, "_text_credentials", lambda: ("http://x", "k", "m", 1000))
     cards = build_shift_cards([_route(estimated=30, run_minutes=55)], NOW)
     overrun = next(card for card in cards if card["kind"] == "route_overrun")
     text = "La ruta de {courier} tardó 55 min frente a 30 estimados."

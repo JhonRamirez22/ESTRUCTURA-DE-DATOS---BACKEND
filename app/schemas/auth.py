@@ -39,6 +39,18 @@ class EmailLoginRequest(BaseModel):
         return AccountCredentials.normalize_email(value)
 
 
+class PasswordChangeRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    current_password: SecretStr = Field(alias="currentPassword", min_length=1, max_length=128)
+    new_password: SecretStr = Field(alias="newPassword", min_length=15, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def reject_common_password(cls, value: SecretStr) -> SecretStr:
+        return AccountCredentials.reject_common_password(value)
+
+
 class CourierAccountRequest(AccountCredentials):
     courier_id: str = Field(alias="courierId")
 

@@ -190,7 +190,9 @@ async def phrase_with_ai(
                         for c in result
                     ]
                 }
-                parsed = await _chat_json(_PHRASE_PROMPT, payload, transport=transport)
+                parsed = await _chat_json(
+                    _PHRASE_PROMPT, payload, transport=transport, text_only=True
+                )
                 texts = parsed.get("texts")
                 if isinstance(texts, dict):
                     for card in result:

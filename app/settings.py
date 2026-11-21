@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     ai_suggestions_enabled: bool = True
     # Respeta ventanas horarias y prioridades de los pedidos al ordenar la ruta.
     time_windows_enabled: bool = True
+    # Groq solo redacta textos con cifras y alias, sin ubicaciones, nombres ni direcciones.
+    ai_text_phrasing_enabled: bool = False
+    # Muestra el botón «Renovar GPS demo»; solo para entornos de demostración.
+    demo_mode: bool = False
     # Peticiones en curso por proceso; por encima se responde 503 al instante, sin colas.
     max_inflight_requests: int = Field(default=200, ge=1, le=10_000)
     database_ssl_mode: Literal["disable", "require", "verify-ca", "verify-full"] = "disable"

@@ -43,6 +43,7 @@ from app.schemas.auth import (
     LoginResponse,
     LogoutResponse,
     PageAccessResponse,
+    PasswordChangeRequest,
     SessionResponse,
 )
 from app.services.access_sessions import (
@@ -70,6 +71,11 @@ LOGIN_WINDOW_SECONDS = 60
 # Límite estricto por correo y cliente: el bloqueo de un atacante no alcanza a los demás.
 _LOGIN_LIMITER = CustomerChatRateLimiter(
     max_requests=LOGIN_ATTEMPT_LIMIT, window_seconds=LOGIN_WINDOW_SECONDS
+)
+# Cambiar la contraseña exige la actual: se limita para que una sesión robada no pueda adivinarla.
+PASSWORD_CHANGE_ATTEMPT_LIMIT = 5
+_PASSWORD_LIMITER = CustomerChatRateLimiter(
+    max_requests=PASSWORD_CHANGE_ATTEMPT_LIMIT, window_seconds=600
 )
 # Tope amplio por correo: frena la fuerza bruta repartida entre muchos clientes sin que un solo
 # atacante pueda alcanzarlo (su propio límite lo detiene antes: 10 por minuto).
@@ -499,6 +505,58 @@ async def require_courier_session(
     return claims
 
 
+@router.post("/password")
+async def change_password(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    claims: Annotated[SessionClaims | None, Depends(get_optional_session)],
+) -> JSONResponse:
+    """La cuenta con sesión cambia su propia contraseña; todas sus sesiones se cierran."""
+    account_raw = claims.get("accountId") if claims else None
+    if claims is None or not account_raw:
+        return _error("Debes iniciar sesión con tu cuenta para cambiar la contraseña.", 401)
+    try:
+        data = PasswordChangeRequest.model_validate(await request.json())
+    except (ValidationError, json.JSONDecodeError, UnicodeDecodeError):
+        return _error("La contraseña nueva debe tener de 15 a 128 caracteres.", 400)
+    secret = _configured_secret(get_settings())
+    if secret is None:
+        return _error("El acceso no está configurado.", 503)
+    account = await session.get(Account, UUID(account_raw))
+    if account is None or not account.enabled:
+        return _error("Debes iniciar sesión con tu cuenta para cambiar la contraseña.", 401)
+    retry_after = await _PASSWORD_LIMITER.retry_after_shared(
+        session, f"password:{account.id}", hmac_secret=secret
+    )
+    if retry_after is not None:
+        return JSONResponse(
+            {"error": "Demasiados intentos. Espera unos minutos."},
+            status_code=429,
+            headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+        )
+    current = data.current_password.get_secret_value()
+    new = data.new_password.get_secret_value()
+    if not await run_in_threadpool(verify_password, current, account.password_hash):
+        _audit(session, request, "password_change", account.id, outcome="denied")
+        await session.commit()
+        return _error("La contraseña actual no es correcta.", 403)
+    if new == current:
+        return _error("La contraseña nueva debe ser distinta de la actual.", 400)
+    account.password_hash = await run_in_threadpool(hash_password, new)
+    await revoke_account_sessions(session, account.id)
+    _audit(session, request, "password_change", account.id)
+    await session.commit()
+    secure = get_settings().node_env == "production"
+    response = JSONResponse(
+        {"ok": True, "reloginRequired": True}, headers={"Cache-Control": "no-store, private"}
+    )
+    for role in ("dispatcher", "courier"):
+        response.headers.append(
+            "Set-Cookie", cleared_session_cookie(session_cookie_name(role), secure)
+        )
+    return response
+
+
 @router.put("/courier-account")
 async def save_courier_account(
     request: Request,
@@ -586,6 +644,8 @@ def _required_page_role(path: str) -> SessionRole | None:
     if path == "/pedidos" or path.startswith("/pedidos/"):
         return "dispatcher"
     if path == "/personal" or path.startswith("/personal/"):
+        return "dispatcher"
+    if path == "/auditoria" or path.startswith("/auditoria/"):
         return "dispatcher"
     if path == "/repartidor" or path.startswith("/repartidor/"):
         return "courier"

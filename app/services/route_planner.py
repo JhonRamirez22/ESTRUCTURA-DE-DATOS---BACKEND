@@ -723,6 +723,11 @@ def _optimization_summary(
     }
 
 
+def _bogota_hour(observed_utc: datetime) -> int:
+    """Hora local de Bogotá (UTC-5) de una medición en UTC; el perfil horario usa hora local."""
+    return (observed_utc + _BOGOTA_OFFSET).hour
+
+
 async def _persist_traffic_history(
     session: AsyncSession, route_id: UUID, live_traffic: Mapping[str, object]
 ) -> None:
@@ -745,7 +750,7 @@ async def _persist_traffic_history(
                 road_closure=bool(item.get("roadClosure")),
                 point_lng=float(point[0]),
                 point_lat=float(point[1]),
-                hour_of_day=observed.hour,
+                hour_of_day=_bogota_hour(observed),
                 observed_at=observed,
             )
         )

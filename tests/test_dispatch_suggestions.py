@@ -83,7 +83,7 @@ def _groq(texts: dict[str, str]) -> httpx.MockTransport:
 
 @pytest.fixture
 def ai_on(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(li, "_settings_credentials", lambda: ("http://x", "k", "m", 1000))
+    monkeypatch.setattr(li, "_text_credentials", lambda: ("http://x", "k", "m", 1000))
     monkeypatch.setattr(ds, "_chat_json", li._chat_json)
 
 
@@ -131,3 +131,31 @@ async def test_daily_budget_stops_ai_calls_but_keeps_text(ai_on: None) -> None:
 async def test_without_credentials_everything_still_works() -> None:
     out, status = await ds.phrase_with_ai(_card(), budget=ds.DailyBudget(5))
     assert out[0]["source"] == "deterministic" and status["source"] == "deterministic"
+
+
+def test_text_credentials_need_their_own_permission_not_the_location_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.settings import get_settings
+
+    monkeypatch.setenv("CUSTOMER_CHAT_API_KEY", "clave-de-prueba")
+    monkeypatch.setenv("CUSTOMER_CHAT_MODEL", "modelo")
+    monkeypatch.setenv("AI_ALLOW_LOCATION_DATA_SHARING", "true")
+    monkeypatch.setenv("AI_ALLOW_ROUTE_LOCATION_SHARING", "true")
+    monkeypatch.setenv("AI_TEXT_PHRASING_ENABLED", "false")
+    get_settings.cache_clear()
+    assert li._text_credentials() is None  # el permiso de ubicaciones no basta
+
+    monkeypatch.setenv("AI_TEXT_PHRASING_ENABLED", "true")
+    monkeypatch.setenv("AI_ALLOW_LOCATION_DATA_SHARING", "false")
+    monkeypatch.setenv("AI_ALLOW_ROUTE_LOCATION_SHARING", "false")
+    get_settings.cache_clear()
+    credentials = li._text_credentials()
+    assert credentials is not None and credentials[1] == "clave-de-prueba"
+    # Y el permiso de texto no abre las funciones que sí mandan ubicaciones.
+    assert li._settings_credentials() is None
+
+    monkeypatch.setenv("CUSTOMER_CHAT_API_KEY", "")
+    get_settings.cache_clear()
+    assert li._text_credentials() is None
+    get_settings.cache_clear()
