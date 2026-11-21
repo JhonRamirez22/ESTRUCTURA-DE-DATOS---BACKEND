@@ -19,6 +19,7 @@ from app.models import (
     Route,
     RouteRevision,
     RouteStatus,
+    TrafficObservation,
 )
 from app.repositories.limits import MAX_ROUTE_ROWS
 
@@ -71,6 +72,17 @@ class RouteRepository:
             statement.order_by(Route.created_at.desc()).limit(MAX_ROUTE_ROWS)
         )
         return list(routes.all())
+
+    async def list_recent_traffic_observations(
+        self, since: datetime, limit: int = 5_000
+    ) -> list[TrafficObservation]:
+        rows = await self._session.scalars(
+            select(TrafficObservation)
+            .where(TrafficObservation.observed_at >= since)
+            .order_by(TrafficObservation.observed_at.desc())
+            .limit(limit)
+        )
+        return list(rows.all())
 
     async def get_route_courier_id(self, route_id: UUID) -> UUID | None:
         return await self._session.scalar(select(Route.courier_id).where(Route.id == route_id))

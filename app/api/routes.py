@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from datetime import UTC, datetime
-from typing import Annotated, cast
+from typing import Annotated, Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
@@ -34,6 +34,7 @@ from app.models import (
     RouteStatus,
 )
 from app.repositories.route_repository import RouteRepository
+from app.services.eta_history import StopForEta, historical_eta
 from app.services.optimization_feed import record_applied, record_proposal
 from app.services.route_order_advisor import RouteOrderAdvisor, get_route_order_advisor
 from app.services.route_planner import (
@@ -57,6 +58,7 @@ from app.services.route_traffic_advisor import (
 )
 from app.services.route_traffic_overlay import sample_route_traffic_overlay
 from app.services.traffic import TrafficService, get_traffic_service
+from app.settings import get_settings
 
 router = APIRouter(prefix="/rutas", tags=["rutas"])
 _LOGGER = logging.getLogger(__name__)
@@ -443,6 +445,17 @@ async def propose_route_endpoint(
         return _error("No se pudo calcular la propuesta de ruta.", 500)
 
 
+def _historical_fields(historical: dict[str, Any] | None, stop_id: str) -> dict[str, Any]:
+    if historical is None or stop_id not in historical["perStop"]:
+        return {}
+    item = historical["perStop"][stop_id]
+    return {
+        "historicalMinutesFromNow": item["minutes"],
+        "historicalMultiplier": item["multiplier"],
+        "historicalLevel": item["level"],
+    }
+
+
 def _proposal_json(plan: OptimizedRoutePlan, current_ids: list[UUID]) -> dict[str, object]:
     ordered = [str(point_id) for point_id in plan.ordered_delivery_point_ids]
     current = [str(point_id) for point_id in current_ids]
@@ -663,6 +676,21 @@ async def get_route_eta(
             matrix_result["durations_minutes"],
             matrix_result.get("distances_meters"),
         )
+        historical: dict[str, Any] | None = None
+        if get_settings().traffic_history_enabled:
+            try:
+                historical = await historical_eta(
+                    RouteRepository(session),
+                    [
+                        StopForEta(
+                            str(point.id), point.lat, point.lng, eta.estimated_minutes_from_now
+                        )
+                        for point, eta in zip(points, etas, strict=False)
+                    ],
+                    datetime.now(UTC).replace(tzinfo=None),
+                )
+            except SQLAlchemyError as error:
+                _log_database_error("No se pudo leer el historial de tráfico", error)
         warnings = [
             matrix_result.get("warning"),
             "Los tiempos son estimaciones de la red vial; no incluyen tráfico en vivo.",
@@ -678,9 +706,11 @@ async def get_route_eta(
                         "stopId": eta.stop_id,
                         "distanceFromCourierMeters": eta.distance_from_courier_meters,
                         "estimatedMinutesFromNow": eta.estimated_minutes_from_now,
+                        **_historical_fields(historical, eta.stop_id),
                     }
                     for eta in etas
                 ],
+                "historical": historical["summary"] if historical else None,
                 "matrixSource": matrix_result["source"],
                 "routeId": str(route.id),
                 "warning": " ".join(item for item in warnings if item),
