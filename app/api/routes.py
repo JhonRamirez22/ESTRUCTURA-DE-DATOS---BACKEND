@@ -354,6 +354,8 @@ async def recalculate_route_endpoint(
 # Propuestas en memoria por proceso: el repartidor consulta cada 5 s, pero TomTom y Groq
 # se invocan como máximo una vez por minuto y combinación de paradas y zona de GPS.
 _PROPOSAL_TTL_SECONDS = 60.0
+# Menos que esto no justifica molestar al repartidor con un cambio de orden.
+MIN_PROPOSAL_GAIN_MINUTES = 1.0
 _PROPOSAL_CACHE_LIMIT = 256
 _ProposalKey = tuple[UUID, tuple[UUID, ...], float, float]
 _PROPOSAL_CACHE: dict[_ProposalKey, tuple[float, dict[str, object]]] = {}
@@ -447,7 +449,12 @@ def _proposal_json(plan: OptimizedRoutePlan, current_ids: list[UUID]) -> dict[st
     improvement: float | None = None
     if plan.baseline_duration_minutes is not None:
         improvement = round(plan.baseline_duration_minutes - plan.estimated_duration_minutes, 1)
+    worth_applying = ordered != current and (
+        improvement is None or improvement >= MIN_PROPOSAL_GAIN_MINUTES
+    )
     return {
+        "worthApplying": worth_applying,
+        "minGainMinutes": MIN_PROPOSAL_GAIN_MINUTES,
         "orderedDeliveryPointIds": ordered,
         "currentDeliveryPointIds": current,
         "changed": ordered != current,

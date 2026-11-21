@@ -1118,6 +1118,7 @@ async def test_route_proposal_is_scoped_and_never_persists_the_order(
     body = proposal.json()
     assert body["orderedDeliveryPointIds"] == [str(point_id)]
     assert body["changed"] is False
+    assert body["worthApplying"] is False
     assert body["cached"] is False
     assert "TRACK-" not in proposal.text
 
@@ -1244,3 +1245,29 @@ async def test_a_courier_session_cannot_use_dispatcher_only_operations(
     finally:
         app.dependency_overrides.pop(get_session_factory, None)
     assert allowed == []
+
+
+def _plan(ids: list[UUID], baseline: float | None, estimated: float) -> object:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        ordered_delivery_point_ids=ids, estimated_duration_minutes=estimated,
+        estimated_distance_meters=1000, baseline_duration_minutes=baseline, geometry=None,
+        matrix_source="osrm", traffic_ai=None, live_traffic=None, ai_order=None, warning=None,
+    )
+
+
+def test_proposal_is_worth_applying_only_above_the_minimum_gain() -> None:
+    from app.api.routes import _proposal_json
+
+    first, second = uuid4(), uuid4()
+    current = [first, second]
+    swapped = [second, first]
+    small = _proposal_json(_plan(swapped, 10.0, 9.5), current)  # type: ignore[arg-type]
+    assert small["changed"] is True and small["worthApplying"] is False
+    big = _proposal_json(_plan(swapped, 10.0, 8.0), current)  # type: ignore[arg-type]
+    assert big["worthApplying"] is True
+    disconnected = _proposal_json(_plan(swapped, None, 8.0), current)  # type: ignore[arg-type]
+    assert disconnected["worthApplying"] is True
+    same = _proposal_json(_plan(current, 10.0, 5.0), current)  # type: ignore[arg-type]
+    assert same["worthApplying"] is False
