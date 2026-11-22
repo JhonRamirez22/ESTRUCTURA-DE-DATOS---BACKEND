@@ -110,6 +110,7 @@ class DeliveryPoint(Base):
             name="delivery_points_route_sequence_idx",
         ),
         CheckConstraint("priority BETWEEN 1 AND 3", name="delivery_points_priority_range"),
+        Index("delivery_points_scheduled_for_idx", "scheduled_for"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -145,6 +146,12 @@ class DeliveryPoint(Base):
     priority: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=1, server_default="1"
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, server_default=func.now()
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
+    # UTC instant the customer asked for; ``None`` means "as soon as possible".
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
 
     route: Mapped[Route | None] = relationship(back_populates="delivery_points")
 

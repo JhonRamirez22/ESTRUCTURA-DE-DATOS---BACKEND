@@ -18,11 +18,13 @@ from app.models.enums import (
     CustomerNotificationChannel,
     CustomerNotificationEvent,
     CustomerNotificationStatus,
+    DeliveryEventType,
     DeliveryPointStatus,
     NotificationKind,
     RouteGeometryProvider,
     RouteStatus,
 )
+from app.models.history import DeliveryEvent
 from app.models.security import AccessSession, SecurityAuditEvent
 
 __all__ = [
@@ -38,6 +40,8 @@ __all__ = [
     "CustomerNotificationOutbox",
     "CustomerNotificationStatus",
     "CourierStatus",
+    "DeliveryEvent",
+    "DeliveryEventType",
     "DeliveryPoint",
     "DeliveryPointStatus",
     "LocationEvent",

@@ -34,6 +34,7 @@ from app.models import (
     RouteStatus,
 )
 from app.repositories.route_repository import RouteRepository
+from app.services.delivery_events import EventActor
 from app.services.eta_history import StopForEta, historical_eta
 from app.services.optimization_feed import record_applied, record_proposal
 from app.services.route_order_advisor import RouteOrderAdvisor, get_route_order_advisor
@@ -181,7 +182,7 @@ async def create_route(
             traffic_provider=traffic,
             order_advisor=order_advisor,
         )
-        result = await create_optimized_route(session, plan)
+        result = await create_optimized_route(session, plan, EventActor.from_claims(claims))
         return _json(_operation_json(result), status_code=201, headers=_NO_STORE)
     except RoutePlanningError as error:
         return _error(str(error), error.status_code)
@@ -258,7 +259,9 @@ async def patch_route_status(
             return _error("La ruta no existe.", 404)
         if not dispatcher and existing_courier_id != _claim_courier_id(cast(SessionClaims, claims)):
             return _error("La ruta no existe.", 404)
-        route = await update_route_status(session, parsed_id, parsed_body.status)
+        route = await update_route_status(
+            session, parsed_id, parsed_body.status, EventActor.from_claims(claims)
+        )
         return _json({"route": _route_json(route, dispatcher=dispatcher)}, headers=_NO_STORE)
     except RoutePlanningError as error:
         return _error(str(error), error.status_code)

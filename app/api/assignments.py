@@ -38,6 +38,7 @@ from app.services.customer_notifications import (
     customer_notification_channels_configured,
     dispatch_pending_customer_notifications_background,
 )
+from app.services.delivery_events import EventActor
 from app.services.route_planner import (
     MAX_ROUTE_STOPS,
     MatrixProvider,
@@ -365,7 +366,9 @@ async def apply_assignments(
             if isinstance(outcome, BaseException):
                 raise outcome
         plans = [outcome for outcome in outcomes if not isinstance(outcome, BaseException)]
-        results = await create_optimized_routes_batch(session, plans)
+        results = await create_optimized_routes_batch(
+            session, plans, EventActor.from_claims(claims)
+        )
         queued_by_channel = {
             channel: sum(
                 count

@@ -137,6 +137,7 @@ async def test_sqlalchemy_schema_persists_existing_entities_and_constraints() ->
             "couriers",
             "customer_chat_rate_limit_windows",
             "customer_notification_outbox",
+            "delivery_events",
             "delivery_points",
             "location_events",
         "notifications",

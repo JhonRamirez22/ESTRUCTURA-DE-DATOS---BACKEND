@@ -36,9 +36,13 @@ from app.schemas.orders import (
     OrderUpdateRequest,
     RouteSummaryView,
 )
+from app.services.access_sessions import utc_now
 from app.services.address_advisor import AddressAiAdvisor, get_address_ai_advisor
 from app.services.address_normalization import AddressNormalizationResult, normalize_address
 from app.services.customer_notifications import cancel_pending_customer_notifications
+from app.services.delivery_events import DeliveryEventRecorder, EventActor
+from app.services.scheduling import DeliverySchedule
+from app.settings import get_settings
 
 router = APIRouter(prefix="/pedidos", tags=["pedidos"])
 _LOGGER = logging.getLogger(__name__)
@@ -106,6 +110,7 @@ async def create_delivery_point(
         lng=data.lng,
         time_window=data.time_window,
         priority=data.priority,
+        scheduled_for=data.scheduled_for,
         status=DeliveryPointStatus.PENDING,
         order_id=data.order_id,
         customer_email=data.customer_email,
@@ -117,6 +122,7 @@ async def create_delivery_point(
     repository = DeliveryPointRepository(session)
     try:
         repository.add(point)
+        DeliveryEventRecorder(session).created(point, EventActor.from_claims(claims))
         await session.commit()
         await repository.refresh(point)
         return _json(
@@ -279,6 +285,7 @@ async def update_delivery_point(
         )
 
         previous_status = point.status
+        previous_schedule = point.scheduled_for
         next_address = normalize_pasto_address(data.address or point.address)
         next_latitude = point.lat if data.lat is None else data.lat
         next_longitude = point.lng if data.lng is None else data.lng
@@ -310,6 +317,10 @@ async def update_delivery_point(
             updates["time_window"] = data.time_window
         if data.priority is not None:
             updates["priority"] = data.priority
+        if "scheduled_for" in fields:
+            updates["scheduled_for"] = data.scheduled_for
+        if data.status == DeliveryPointStatus.DELIVERED:
+            updates["delivered_at"] = utc_now()
         if "customer_email" in fields or not next_email_notifications_enabled:
             updates["customer_email"] = next_customer_email
         if data.email_notifications_enabled is not None:
@@ -338,6 +349,16 @@ async def update_delivery_point(
         # original capturado antes para cancelar avisos pendientes al revocar consentimiento.
         if customer_notification_consent_changed:
             await cancel_pending_customer_notifications(session, parsed_id)
+
+        recorder = DeliveryEventRecorder(session)
+        actor = EventActor.from_claims(claims)
+        if data.status is not None and data.status != previous_status:
+            recorder.status_changed(
+                point, previous_status.value, data.status.value, actor,
+                courier_id=UUID(courier_id) if courier_id is not None else None,
+            )
+        if "scheduled_for" in fields and data.scheduled_for != previous_schedule:
+            recorder.rescheduled(point, previous_schedule, data.scheduled_for, actor)
 
         if (
             previous_status != data.status
@@ -393,7 +414,10 @@ async def delete_delivery_point(
         return _error("El pedido no existe.", 404)
     try:
         repository = DeliveryPointRepository(session)
+        existing = await repository.get_delivery_point(parsed_id)
         deleted = await repository.delete_if_pending_unassigned(parsed_id)
+        if deleted and existing is not None:
+            DeliveryEventRecorder(session).deleted(existing, EventActor.from_claims(claims))
         if not deleted:
             point = await repository.get_delivery_point(parsed_id)
             if point is None:
@@ -428,8 +452,22 @@ def _point_view(
         tracking_token=point.tracking_token,
         route_id=point.route_id,
         sequence_index=point.sequence_index,
+        scheduled_for=point.scheduled_for,
+        schedule_state=_schedule_state(point),
+        created_at=point.created_at,
+        delivered_at=point.delivered_at,
         route=RouteSummaryView.model_validate(route) if route is not None else None,
     )
+
+
+def _schedule_state(point: DeliveryPoint) -> str | None:
+    """Only open shipments show a schedule badge; a delivered one is simply done."""
+    if point.status not in {DeliveryPointStatus.PENDING, DeliveryPointStatus.REQUESTED}:
+        return None
+    state = DeliverySchedule(lead_minutes=get_settings().scheduled_lead_minutes).state(
+        point.scheduled_for
+    )
+    return state.value if state is not None else None
 
 
 def _point_json(
@@ -475,6 +513,7 @@ def _validation_error(error: ValidationError) -> JSONResponse:
         "lng": "lng debe ser un número finito dentro del rango permitido.",
         "orderId": "orderId debe ser un string no vacío.",
         "timeWindow": "timeWindow debe ser un valor JSON válido.",
+        "scheduledFor": "scheduledFor debe ser una fecha y hora futura (máximo 60 días).",
         "status": "status debe ser REQUESTED, PENDING, EN_ROUTE, DELIVERED o FAILED.",
     }
     message = messages.get(field_name, str(first["msg"]))

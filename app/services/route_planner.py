@@ -70,6 +70,7 @@ from app.models import (
 from app.repositories.notification_repository import NotificationRepository
 from app.repositories.route_repository import RouteRepository
 from app.services.customer_notifications import enqueue_order_assigned_notification
+from app.services.delivery_events import SYSTEM_ACTOR, DeliveryEventRecorder, EventActor
 from app.services.route_order_advisor import MAX_AI_ORDER_STOPS, RouteOrderAdvisor
 from app.services.route_traffic_advisor import RouteTrafficAdvisor
 from app.settings import get_settings
@@ -789,14 +790,16 @@ def _traffic_level(multiplier: float | None, closed: bool) -> str:
 async def create_optimized_route(
     session: AsyncSession,
     plan: OptimizedRoutePlan,
+    actor: EventActor = SYSTEM_ACTOR,
 ) -> RouteOperationResult:
-    results = await create_optimized_routes_batch(session, [plan])
+    results = await create_optimized_routes_batch(session, [plan], actor)
     return results[0]
 
 
 async def create_optimized_routes_batch(
     session: AsyncSession,
     plans: Sequence[OptimizedRoutePlan],
+    actor: EventActor = SYSTEM_ACTOR,
 ) -> list[RouteOperationResult]:
     if not plans:
         raise RoutePlanningError("Se requiere al menos una asignación para aplicar.", 400)
@@ -847,6 +850,9 @@ async def create_optimized_routes_batch(
             )
             assigned_points = await repository.get_delivery_points(
                 plan.ordered_delivery_point_ids
+            )
+            DeliveryEventRecorder(session).assigned(
+                assigned_points, route.id, plan.courier_id, actor
             )
             queued_by_channel = {
                 CustomerNotificationChannel.EMAIL: 0,
@@ -1064,6 +1070,7 @@ async def update_route_status(
     session: AsyncSession,
     route_id: UUID,
     next_status: RouteStatus,
+    actor: EventActor = SYSTEM_ACTOR,
 ) -> Route:
     await session.rollback()
     async with session.begin():
@@ -1078,13 +1085,23 @@ async def update_route_status(
             raise RouteConflictError("No se puede completar una ruta con pedidos pendientes.")
 
         now = datetime.now(UTC).replace(tzinfo=None)
+        recorder = DeliveryEventRecorder(session)
         if next_status == RouteStatus.CANCELLED:
+            recorder.released(
+                [p for p in route.delivery_points if p.status in _ACTIVE_POINT_STATUSES],
+                actor,
+                "route cancelled",
+            )
             await repository.release_active_delivery_points(
                 route_id,
                 _ACTIVE_POINT_STATUSES,
                 reset_to_pending=True,
             )
         elif next_status == RouteStatus.IN_PROGRESS:
+            recorder.started(
+                [p for p in route.delivery_points if p.status == DeliveryPointStatus.PENDING],
+                actor,
+            )
             await repository.mark_pending_delivery_points_en_route(route_id)
             if route.started_at is None:
                 route.started_at = now

@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     ai_text_phrasing_enabled: bool = False
     # Muestra el botón «Renovar GPS demo»; solo para entornos de demostración.
     demo_mode: bool = False
+    # A scheduled shipment becomes «due soon» this many minutes before its time.
+    scheduled_lead_minutes: int = 60
     # Recalcula cada 10 s las rutas activas y propone mejoras (nunca las aplica solo).
     live_optimization_enabled: bool = True
     # Peticiones en curso por proceso; por encima se responde 503 al instante, sin colas.

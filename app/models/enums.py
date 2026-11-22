@@ -53,3 +53,20 @@ class CustomerNotificationStatus(StrEnum):
     SENT = "SENT"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
+
+
+class DeliveryEventType(StrEnum):
+    """What happened to a shipment. Stored as text so new kinds never need an enum migration."""
+
+    REQUESTED = "REQUESTED"
+    CREATED = "CREATED"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+    SCHEDULED = "SCHEDULED"
+    RESCHEDULED = "RESCHEDULED"
+    ASSIGNED = "ASSIGNED"
+    STARTED = "STARTED"
+    DELIVERED = "DELIVERED"
+    FAILED = "FAILED"
+    RELEASED = "RELEASED"
+    DELETED = "DELETED"

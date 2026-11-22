@@ -32,7 +32,7 @@ from app.core.location.pasto_area import (
 from app.core.location.proximity import haversine_m
 from app.core.structures.lru_cache import LruCache
 from app.db.session import get_session
-from app.models import DeliveryPoint, DeliveryPointStatus
+from app.models import DeliveryEventType, DeliveryPoint, DeliveryPointStatus
 from app.repositories.delivery_point_repository import DeliveryPointRepository
 from app.schemas.orders import OrderRequestCreate
 from app.services.address_advisor import AddressAiAdvisor, get_address_ai_advisor
@@ -44,6 +44,11 @@ from app.services.address_geocoder import (
 from app.services.address_resolver import resolve_address
 from app.services.client_identity import client_key
 from app.services.customer_chat_rate_limiter import CustomerChatRateLimiter
+from app.services.delivery_events import (
+    CUSTOMER_ACTOR,
+    DeliveryEventRecorder,
+    EventActor,
+)
 from app.settings import get_settings
 
 router = APIRouter(prefix="/solicitudes", tags=["solicitudes"])
@@ -128,6 +133,9 @@ async def create_order_request(
             tracking_token=str(uuid4()),
         )
         repository.add(point)
+        DeliveryEventRecorder(session).record(
+            point, DeliveryEventType.REQUESTED, CUSTOMER_ACTOR, to_status="REQUESTED"
+        )
         await session.commit()
     except IntegrityError:
         await session.rollback()
@@ -209,14 +217,21 @@ async def lookup_address(
 @router.post("/{request_id}/aceptar")
 async def accept_order_request(
     request_id: str,
-    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> JSONResponse:
     parsed_id = _parse_uuid(request_id)
     if parsed_id is None:
         return _error("La solicitud no existe.", 404)
     try:
-        accepted = await DeliveryPointRepository(session).accept_request(parsed_id)
+        repository = DeliveryPointRepository(session)
+        pending = await repository.get_delivery_point(parsed_id)
+        accepted = await repository.accept_request(parsed_id)
+        if accepted and pending is not None:
+            DeliveryEventRecorder(session).record(
+                pending, DeliveryEventType.ACCEPTED, EventActor.from_claims(claims),
+                from_status="REQUESTED", to_status="PENDING",
+            )
         await session.commit()
     except SQLAlchemyError as error:
         await session.rollback()
@@ -232,14 +247,18 @@ async def accept_order_request(
 @router.post("/{request_id}/rechazar")
 async def reject_order_request(
     request_id: str,
-    _claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
+    claims: Annotated[SessionClaims, Depends(require_dispatcher_session)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> JSONResponse:
     parsed_id = _parse_uuid(request_id)
     if parsed_id is None:
         return _error("La solicitud no existe.", 404)
     try:
-        rejected = await DeliveryPointRepository(session).reject_request(parsed_id)
+        repository = DeliveryPointRepository(session)
+        waiting = await repository.get_delivery_point(parsed_id)
+        rejected = await repository.reject_request(parsed_id)
+        if rejected and waiting is not None:
+            DeliveryEventRecorder(session).rejected(waiting, EventActor.from_claims(claims))
         await session.commit()
     except SQLAlchemyError as error:
         await session.rollback()

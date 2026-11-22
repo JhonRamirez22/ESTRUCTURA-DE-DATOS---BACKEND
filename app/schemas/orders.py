@@ -20,6 +20,7 @@ from pydantic import (
 
 from app.core.validation import normalize_email, plain_text
 from app.models.enums import DeliveryPointStatus, RouteGeometryProvider, RouteStatus
+from app.services.scheduling import DeliverySchedule
 
 _Latitude = Annotated[float, Field(strict=True, ge=-90, le=90, allow_inf_nan=False)]
 _Longitude = Annotated[float, Field(strict=True, ge=-180, le=180, allow_inf_nan=False)]
@@ -60,6 +61,7 @@ class OrderCreateRequest(BaseModel):
     )
     time_window: JsonValue | None = Field(default=None, validation_alias="timeWindow")
     priority: int = Field(default=1, ge=1, le=3)
+    scheduled_for: datetime | None = Field(default=None, validation_alias="scheduledFor")
     customer_email: str | None = Field(
         default=None, max_length=320, validation_alias="customerEmail"
     )
@@ -87,6 +89,11 @@ class OrderCreateRequest(BaseModel):
     @classmethod
     def _time_window_size(cls, value: JsonValue | None) -> JsonValue | None:
         return _check_time_window(value)
+
+    @field_validator("scheduled_for")
+    @classmethod
+    def _schedule_in_range(cls, value: datetime | None) -> datetime | None:
+        return DeliverySchedule().parse(value)
 
     @model_validator(mode="after")
     def validate_email_consent(self) -> OrderCreateRequest:
@@ -138,6 +145,7 @@ class OrderUpdateRequest(BaseModel):
     status: DeliveryPointStatus | None = None
     time_window: JsonValue | None = Field(default=None, validation_alias="timeWindow")
     priority: int | None = Field(default=None, ge=1, le=3)
+    scheduled_for: datetime | None = Field(default=None, validation_alias="scheduledFor")
     customer_email: str | None = Field(
         default=None, max_length=320, validation_alias="customerEmail"
     )
@@ -166,11 +174,16 @@ class OrderUpdateRequest(BaseModel):
     def _time_window_size(cls, value: JsonValue | None) -> JsonValue | None:
         return _check_time_window(value)
 
+    @field_validator("scheduled_for")
+    @classmethod
+    def _schedule_in_range(cls, value: datetime | None) -> datetime | None:
+        return DeliverySchedule().parse(value)
+
     @model_validator(mode="after")
     def validate_update(self) -> OrderUpdateRequest:
         if not self.model_fields_set:
             raise ValueError("No hay campos válidos para actualizar.")
-        nullable_fields = {"time_window", "customer_email", "customer_phone"}
+        nullable_fields = {"time_window", "customer_email", "customer_phone", "scheduled_for"}
         if self.customer_email is not None:
             self.customer_email = normalize_email(self.customer_email)
         if (
@@ -238,4 +251,15 @@ class DeliveryPointView(BaseModel):
     tracking_token: str | None = Field(serialization_alias="trackingToken")
     route_id: UUID | None = Field(serialization_alias="routeId")
     sequence_index: int | None = Field(serialization_alias="sequenceIndex")
+    scheduled_for: datetime | None = Field(default=None, serialization_alias="scheduledFor")
+    schedule_state: str | None = Field(default=None, serialization_alias="scheduleState")
+    created_at: datetime | None = Field(default=None, serialization_alias="createdAt")
+    delivered_at: datetime | None = Field(default=None, serialization_alias="deliveredAt")
     route: RouteSummaryView | None = None
+
+    @field_serializer("scheduled_for", "created_at", "delivered_at")
+    def serialize_point_dates(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return normalized.isoformat(timespec="milliseconds").replace("+00:00", "Z")
