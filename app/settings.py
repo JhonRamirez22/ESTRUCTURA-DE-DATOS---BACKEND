@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     ai_text_phrasing_enabled: bool = False
     # Muestra el botón «Renovar GPS demo»; solo para entornos de demostración.
     demo_mode: bool = False
+    # Recalcula cada 10 s las rutas activas y propone mejoras (nunca las aplica solo).
+    live_optimization_enabled: bool = True
     # Peticiones en curso por proceso; por encima se responde 503 al instante, sin colas.
     max_inflight_requests: int = Field(default=200, ge=1, le=10_000)
     database_ssl_mode: Literal["disable", "require", "verify-ca", "verify-full"] = "disable"
