@@ -177,6 +177,8 @@ async def test_unassigned_delivery_point_returns_only_guide_and_destination(
         "status": "PENDING",
         "address": point.address,
         "coordinates": {"lat": point.lat, "lng": point.lng},
+        "milestones": [],
+        "scheduledFor": None,
         "route": None,
     }
     assert providers[0].calls == 0

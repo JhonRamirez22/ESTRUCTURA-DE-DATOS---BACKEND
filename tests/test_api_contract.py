@@ -57,6 +57,8 @@ _EXPECTED_OPERATIONS = frozenset(
         ("GET", "/api/inteligencia/sugerencias"),
         ("GET", "/api/inteligencia/resumen-turno"),
         ("GET", "/api/optimizaciones/en-vivo"),
+        ("GET", "/api/historial/envios"),
+        ("GET", "/api/historial/envios/{}/eventos"),
         ("GET", "/api/demo/estado"),
         ("POST", "/api/demo/renovar-gps"),
         ("POST", "/api/auth/password"),

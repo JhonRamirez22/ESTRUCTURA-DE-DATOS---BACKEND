@@ -345,3 +345,97 @@ def test_schedule_parse_boundaries() -> None:
         schedule.parse(now.replace(tzinfo=UTC) - timedelta(minutes=10))
     with pytest.raises(ValueError):
         schedule.parse(now.replace(tzinfo=UTC) + timedelta(days=MAX_DAYS_AHEAD + 1))
+
+
+# ---- history API and customer milestones ---------------------------------------------------
+
+
+async def _lifecycle(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession], ref: str
+) -> tuple[dict[str, Any], UUID]:
+    courier_id = await _courier(factory)
+    point = await _create(client, ref)
+    applied = await client.post(
+        "/api/asignaciones/aplicar", headers=_cookie("dispatcher"),
+        json={"assignments": [{"courierId": str(courier_id), "deliveryPointIds": [point["id"]]}]},
+    )
+    route_id = applied.json()["routes"][0]["route"]["id"]
+    await client.patch(
+        f"/api/rutas/{route_id}", headers=_cookie("dispatcher"), json={"status": "IN_PROGRESS"}
+    )
+    await client.patch(
+        f"/api/pedidos/{point['id']}", headers=_cookie("courier", courier_id),
+        json={"status": "DELIVERED"},
+    )
+    return point, courier_id
+
+
+@pytest.mark.asyncio
+async def test_history_lists_filters_and_paginates_for_dispatch_only(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    done, courier_id = await _lifecycle(client, factory, "L-1")
+    await _create(client, "L-2")
+    await _create(client, "L-3", scheduledFor=(datetime.now(UTC) + timedelta(days=2)).isoformat())
+    head = _cookie("dispatcher")
+    everything = (await client.get("/api/historial/envios", headers=head)).json()
+    assert everything["total"] == 3 and {i["orderId"] for i in everything["items"]} == {
+        "L-1", "L-2", "L-3"}
+    delivered = (await client.get("/api/historial/envios?estado=DELIVERED", headers=head)).json()
+    assert [i["orderId"] for i in delivered["items"]] == ["L-1"]
+    assert delivered["items"][0]["courierName"] == "Ana" and delivered["items"][0]["events"] >= 4
+    assert delivered["items"][0]["deliveredAt"] is not None
+    by_courier = (await client.get(
+        f"/api/historial/envios?repartidor={courier_id}", headers=head)).json()
+    assert by_courier["total"] == 1
+    text = (await client.get("/api/historial/envios?q=l-2", headers=head)).json()
+    assert [i["orderId"] for i in text["items"]] == ["L-2"]
+    wildcard = (await client.get("/api/historial/envios?q=%25", headers=head)).json()
+    assert wildcard["total"] == 0  # the wildcard is escaped
+    scheduled = (await client.get("/api/historial/envios?programados=true", headers=head)).json()
+    assert [i["orderId"] for i in scheduled["items"]] == ["L-3"]
+    paged = (await client.get("/api/historial/envios?tamano=2&pagina=2", headers=head)).json()
+    assert paged["total"] == 3 and len(paged["items"]) == 1 and paged["pageSize"] == 2
+    today = (datetime.now(UTC) + BOGOTA_OFFSET).date().isoformat()
+    in_range = (await client.get(
+        f"/api/historial/envios?desde={today}&hasta={today}", headers=head)).json()
+    assert in_range["total"] == 3
+    backwards = await client.get(
+        "/api/historial/envios?desde=2026-11-20&hasta=2026-11-01", headers=head)
+    assert backwards.status_code == 400
+    assert done["id"] in {i["id"] for i in everything["items"]}
+    assert (await client.get("/api/historial/envios")).status_code == 401
+    assert (await client.get("/api/historial/envios", headers=_cookie(
+        "courier", courier_id))).status_code in {401, 403}
+
+
+@pytest.mark.asyncio
+async def test_timeline_shows_each_step_with_actor_and_courier(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    point, _ = await _lifecycle(client, factory, "T-1")
+    body = (await client.get(
+        f"/api/historial/envios/{point['id']}/eventos", headers=_cookie("dispatcher"))).json()
+    kinds = [e["type"] for e in body["events"]]
+    assert kinds[0] == "CREATED" and kinds[-1] == "DELIVERED"
+    assert {"ASSIGNED", "STARTED"} <= set(kinds)
+    delivered = body["events"][-1]
+    assert delivered["actor"] == "courier" and delivered["courierName"] == "Ana"
+    assert (await client.get(
+        f"/api/historial/envios/{uuid4()}/eventos", headers=_cookie("dispatcher"))
+    ).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_customer_tracking_shows_milestones_but_never_actors_or_couriers(
+    client: httpx.AsyncClient, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    point, _ = await _lifecycle(client, factory, "C-1")
+    guide = point["trackingToken"]
+    body = (await client.get(f"/api/seguimiento?guia={guide}")).json()["tracking"]
+    kinds = [m["type"] for m in body["milestones"]]
+    assert kinds[0] == "CREATED" and kinds[-1] == "DELIVERED"
+    assert all(set(m) == {"type", "at"} for m in body["milestones"])
+    flat = str(body["milestones"])
+    assert "dispatcher" not in flat and "courier" not in flat and "Ana" not in flat
+    assert "RELEASED" not in kinds and "ACCEPTED" not in kinds

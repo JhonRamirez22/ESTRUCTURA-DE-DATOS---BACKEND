@@ -26,6 +26,7 @@ from app.services.customer_eta_traffic import (
     FirstLegTrafficEstimate,
     estimate_first_leg_with_traffic,
 )
+from app.services.delivery_history import DeliveryHistoryReader
 from app.services.route_planner import get_routing_providers
 from app.services.traffic import TrafficService, get_traffic_service
 from app.settings import get_settings
@@ -79,11 +80,24 @@ async def get_tracking(
     if delivery_point is None:
         return _error("No encontramos un pedido con esa guía.", 404)
 
+    try:
+        milestones = await DeliveryHistoryReader(session).customer_milestones(delivery_point.id)
+    except SQLAlchemyError:
+        milestones = []  # the history is an extra: tracking still answers without it
+    scheduled_for = delivery_point.scheduled_for
     base_tracking: dict[str, object] = {
         "guide": delivery_point.tracking_token,
         "status": delivery_point.status.value,
         "address": delivery_point.address,
         "coordinates": {"lat": delivery_point.lat, "lng": delivery_point.lng},
+        # Moments only: never who handled the shipment or where it was.
+        "milestones": [
+            {"type": kind, "at": when.isoformat(timespec="seconds") + "Z"}
+            for kind, when in milestones
+        ],
+        "scheduledFor": (
+            scheduled_for.isoformat(timespec="seconds") + "Z" if scheduled_for else None
+        ),
     }
     route = delivery_point.route
     if route is None:
