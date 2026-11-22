@@ -419,6 +419,8 @@ async def test_page_access_is_decided_by_backend_without_exposing_role(
     staff_page = await client.get("/api/auth/access", params={"path": "/personal"})
     audit_page = await client.get("/api/auth/access", params={"path": "/auditoria"})
     assert audit_page.json() == {"allowed": True, "redirectTo": None}
+    history_page = await client.get("/api/auth/access", params={"path": "/historial"})
+    assert history_page.json() == {"allowed": True, "redirectTo": None}
 
     assert dispatcher_access.json() == {"allowed": True, "redirectTo": None}
     assert staff_page.json() == {"allowed": True, "redirectTo": None}

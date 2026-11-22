@@ -647,6 +647,8 @@ def _required_page_role(path: str) -> SessionRole | None:
         return "dispatcher"
     if path == "/auditoria" or path.startswith("/auditoria/"):
         return "dispatcher"
+    if path == "/historial" or path.startswith("/historial/"):
+        return "dispatcher"
     if path == "/repartidor" or path.startswith("/repartidor/"):
         return "courier"
     return None
