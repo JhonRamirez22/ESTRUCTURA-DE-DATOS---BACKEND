@@ -26,6 +26,11 @@ from app.repositories.route_repository import RouteRepository
 from app.routing.cost_matrix import CostMatrix
 from app.routing.domain import CourierState, Fleet, GeoPoint, Route, Stop
 from app.routing.reoptimizer import FleetProposal, LiveFleetReoptimizer, RouteProposal
+from app.services.live_explanations import (
+    ExplanationPhraser,
+    LiveExplainer,
+    NextStopFinder,
+)
 
 TICK_SECONDS = 10.0
 MAX_GEOMETRY_ROUTES = 8
@@ -117,6 +122,12 @@ class LiveOptimizationService:
         payload = self._envelope(
             proposal, geometries, built.skipped, str(result.get("source", "osrm")), cached=False
         )
+        next_stops = NextStopFinder(fleet, matrix).find()
+        explanations = LiveExplainer().build(proposal, next_stops)
+        payload["explanationSource"] = await ExplanationPhraser().phrase(explanations)
+        payload["nextStops"] = [item.as_json() for item in next_stops]
+        payload["focusRouteId"] = next((i.route_id for i in next_stops if i.focus), None)
+        payload["explanations"] = [item.as_json() for item in explanations]
         payload["computeMs"] = round((datetime.now(UTC) - started).total_seconds() * 1000)
         self._cache.put(key, payload)
         return payload
@@ -199,6 +210,10 @@ class LiveOptimizationService:
             "savedMinutes": round(proposal.saved_minutes, 1) if proposal else 0.0,
             "changed": bool(proposal and proposal.changed),
             "skippedRoutes": skipped,
+            "nextStops": [],
+            "focusRouteId": None,
+            "explanations": [],
+            "explanationSource": "deterministic",
         }
 
 

@@ -255,3 +255,24 @@ async def test_polling_is_rate_limited(setup: Any) -> None:
     client, _, _ = setup
     codes = [(await _live(client)).status_code for _ in range(23)]
     assert codes[:20] == [200] * 20 and 429 in codes[20:]
+
+
+@pytest.mark.asyncio
+async def test_payload_names_the_next_stop_of_each_route_and_the_closest_one(
+    setup: Any, factory: async_sessionmaker[AsyncSession]
+) -> None:
+    client, _, _ = setup
+    a = await _seed_route(factory, "Ana", (1.2000, -77.3000), A_STOPS)
+    b = await _seed_route(factory, "Beto", (1.2000, -77.2500), B_STOPS)
+    body = (await _live(client)).json()
+    nexts = {item["routeId"]: item for item in body["nextStops"]}
+    assert set(nexts) == {str(a), str(b)}
+    assert sum(1 for item in nexts.values() if item["focus"]) == 1
+    focus = next(item for item in nexts.values() if item["focus"])
+    assert body["focusRouteId"] == focus["routeId"]
+    assert all(focus["etaMinutes"] <= item["etaMinutes"] for item in nexts.values())
+    kinds = {item["kind"] for item in body["explanations"]}
+    assert {"next", "move"} <= kinds
+    assert body["explanationSource"] == "deterministic"  # no AI configured in tests
+    move = next(item for item in body["explanations"] if item["kind"] == "move")
+    assert "{stop}" in move["text"] and "Ana" not in move["text"] and "Beto" not in move["text"]
