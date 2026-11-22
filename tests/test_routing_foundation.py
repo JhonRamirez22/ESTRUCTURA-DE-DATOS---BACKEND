@@ -263,3 +263,37 @@ def test_property_proposal_preserves_stops_and_never_worsens_the_objective(seed:
         locked = [s.stop_id for s in originals[p.route_id].stops if s.locked]
         assert list(p.proposed_order[: len(locked)]) == locked
         assert len(p.proposed_order) >= 1
+
+
+# ---- benchmark ---------------------------------------------------------------------------
+
+
+def test_benchmark_battery_has_thirty_deterministic_scenarios() -> None:
+    from app.routing.benchmark import ScenarioGenerator
+
+    first = ScenarioGenerator().battery()
+    second = ScenarioGenerator().battery()
+    assert len(first) == 30 and [s.name for s in first] == [s.name for s in second]
+    assert first[0].couriers == second[0].couriers and first[7].stops == second[7].stops
+    assert len({s.name for s in first}) == 30
+    different = ScenarioGenerator(seed=1).scenario(4, 14, "uniform")
+    assert different.stops != ScenarioGenerator().scenario(4, 14, "uniform").stops
+    for scenario in first:
+        assert all(1.19 <= p.lat <= 1.24 and -77.31 <= p.lng <= -77.25 for p in scenario.stops)
+
+
+def test_benchmark_runner_never_worsens_the_baseline_and_assigns_every_stop() -> None:
+    from app.routing.benchmark import BaselinePlanner, BenchmarkRunner, ScenarioGenerator
+
+    generator = ScenarioGenerator()
+    scenarios = [generator.scenario(4, 25, "uniform"), generator.scenario(6, 14, "clustered")]
+    for scenario in scenarios:
+        fleet, matrix = BaselinePlanner().plan(scenario)
+        assigned = sorted(stop for route in fleet.routes for stop in route.stop_ids)
+        assert assigned == sorted(f"s{i}" for i in range(len(scenario.stops)))
+        assert matrix.size == len(fleet.index().points)
+    rows = BenchmarkRunner().run(scenarios)
+    assert all(row.objective_gain >= -1e-6 for row in rows)
+    summary = BenchmarkRunner.summarize(rows)
+    assert summary["scenarios"] == 2 and summary["neverWorse"] == 1.0
+    assert BenchmarkRunner.summarize([])["scenarios"] == 0
