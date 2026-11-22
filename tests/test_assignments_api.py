@@ -635,3 +635,48 @@ async def test_dispatch_reports_the_first_failing_assignment_and_saves_nothing(
     assert response.status_code == 409
     async with session_factory() as session:
         assert await session.scalar(select(func.count()).select_from(Route)) == 0
+
+
+class NoSegmentMatrixProvider(FakeMatrixProvider):
+    """Behaves like OSRM when one coordinate is farther than 50 m from any road."""
+
+    def __init__(self, bad: tuple[float, float]) -> None:
+        self._bad = bad
+
+    async def get_duration_matrix(self, coordinates: Sequence[Coordinate]) -> dict[str, Any]:
+        from app.core.routing.routing_errors import RoutingClientError
+
+        for index, coordinate in enumerate(coordinates):
+            if (round(coordinate[0], 4), round(coordinate[1], 4)) == self._bad:
+                message = f"Could not find a matching segment for coordinate {index}"
+                body = f'{{"message":"{message}","code":"NoSegment"}}'
+                raise RoutingClientError("OSRM request failed (HTTP 400)", 400, body)
+        return await super().get_duration_matrix(coordinates)
+
+
+@pytest.mark.asyncio
+async def test_a_point_without_a_nearby_road_is_left_out_not_fatal(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    courier = await _create_courier(session_factory, latitude=1.2136, longitude=-77.2811)
+    good = await _create_point(session_factory, latitude=1.214, longitude=-77.28)
+    off_road = await _create_point(session_factory, latitude=1.2005, longitude=-77.277)
+    app.dependency_overrides[get_routing_providers] = lambda: (
+        NoSegmentMatrixProvider((-77.277, 1.2005)),
+        FakeRouteProvider(),
+    )
+
+    response = await client.post(
+        "/api/asignaciones",
+        headers={"Cookie": _dispatcher_cookie()},
+        json={"courierIds": [str(courier.id)],
+              "deliveryPointIds": [str(good.id), str(off_road.id)]},
+    )
+
+    payload = response.json()
+    assert response.status_code == 200, payload
+    assert payload["assignments"] == [
+        {"courierId": str(courier.id), "deliveryPointIds": [str(good.id)]}
+    ]
+    assert payload["unassignedDeliveryPointIds"] == [str(off_road.id)]
